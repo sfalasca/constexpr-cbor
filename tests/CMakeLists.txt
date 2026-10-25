@@ -36,11 +36,17 @@ set(positive_test_sources
     arena_no_alloc_tests.cpp
 )
 
-# Sources that don't use compile_time_ut: Arena::decode_value takes its
-# NodePool by non-const reference, so its result can never be a constexpr
-# input the way compile_time_ut's expect_eq<> NTTP form requires -- every
-# check in these two uses the plain if/return idiom instead.
-set(no_ctut_sources test_arena.cpp arena_no_alloc_tests.cpp)
+# arena_no_alloc_tests.cpp is the one source that doesn't use
+# compile_time_ut: it specifically proves Arena::decode_value/encode_value
+# work at genuine runtime (plain, non-constexpr functions, run by ctest
+# like any other test binary), which is a different concern from
+# compile-time assertions. test_arena.cpp itself IS fully compile_time_ut
+# based: Arena::decode_value takes its NodePool by non-const reference, so
+# the pool can never itself be a constexpr input the way sibling files'
+# plain byte vectors are, but a small constexpr helper with its own pool
+# declared and consumed entirely inside its own body is a self-contained
+# expression, usable directly as an expect_eq<>()/expect_true<>() argument.
+set(no_ctut_sources arena_no_alloc_tests.cpp)
 
 foreach(src ${positive_test_sources})
     get_filename_component(name ${src} NAME_WE)
