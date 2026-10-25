@@ -1,0 +1,19 @@
+---
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  modernize-*,
+  misc-*,
+  cppcoreguidelines-slicing,
+  cppcoreguidelines-pro-type-static-cast-downcast,
+  -bugprone-easily-swappable-parameters,
+  -misc-non-private-member-variables-in-classes,
+  -modernize-use-trailing-return-type,
+  -readability-identifier-length,
+  -readability-named-parameter
+WarningsAsErrors: ''
+HeaderFilterRegex: 'include/constexpr_cbor\.hpp$'
+FormatStyle: none
