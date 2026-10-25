@@ -11,7 +11,14 @@ FROM gcc:10
 # project's cmake_minimum_required(3.20); install a current one via pip
 # instead. --break-system-packages is needed on newer (PEP 668) pip and
 # unrecognized by older pip, hence the fallback.
-RUN apt-get update && apt-get install -y --no-install-recommends git python3-pip ninja-build \
+# This base image is on Debian bullseye, whose deb.debian.org mirror
+# has aged out of the regular archive (404s on every package as of
+# late 2026). Point apt at the frozen snapshot.debian.org mirror
+# instead, with the expiry check disabled since that snapshot is
+# necessarily older than "now" by design.
+RUN sed -i 's|^deb http://deb.debian.org|# deb http://deb.debian.org|; s|^# deb http://snapshot.debian.org|deb http://snapshot.debian.org|' /etc/apt/sources.list
+
+RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends git python3-pip ninja-build \
     && rm -rf /var/lib/apt/lists/* \
     && (pip3 install --no-cache-dir --break-system-packages cmake \
         || pip3 install --no-cache-dir cmake)

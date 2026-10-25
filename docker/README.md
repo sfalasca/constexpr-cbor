@@ -28,6 +28,30 @@ Clang images build against `-stdlib=libc++` rather than the distro's
 system libstdc++, because the latter's version is tied to the base
 Debian release rather than the Clang version under test.
 
+**Real minimum: GCC 13+ or Clang 19+, verified by actually running every
+version, not assumed.** Older versions in this matrix are kept and expected
+to fail, each for a distinct, checked reason, not left as noise:
+
+- **GCC 10, 11, 12 and Clang 13-18** fail. GCC 10 and Clang 13 don't have
+  `std::bit_cast` at all (added later in each implementation); GCC 11/12
+  and Clang 14-18 have it, but their standard library's C++20 constexpr
+  container support (`std::vector`/`std::variant`/`std::optional`) isn't
+  complete enough yet for `CborValue` (which holds a recursive
+  `std::variant<..., std::vector<CborValue>, ...>`) to count as a literal
+  type — the exact error is "`constexpr function's ... parameter type
+  'CborValue' is not a literal type`". GCC 12 specifically also hits a
+  distinct, real bug of its own: "`use of allocated storage after
+  deallocation in a constant expression`" inside `std::vector`'s own
+  `_M_range_insert`, on code that GCC 13+ and Clang 19+ both accept —
+  an early-implementation defect in that version's constexpr-vector
+  support, not a defect in this library's code.
+- **GCC 10, 11 and Clang 13, 14's base images are additionally on Debian
+  bullseye**, whose `deb.debian.org` mirror has aged out of the regular
+  archive entirely (every package 404s as of late 2026). Those four
+  Dockerfiles repoint `apt` at the frozen `snapshot.debian.org` mirror
+  first so the build reaches the real compiler error above instead of
+  stalling on an unrelated, confusing package-fetch failure.
+
 ## Embedded / bare-metal targets
 
 These compile-check `tests/noexcept_tests.cpp` (proves the decoder/encoder
