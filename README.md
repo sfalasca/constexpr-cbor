@@ -138,6 +138,99 @@ UTF-8 policy above:
 - `KeepFirstDuplicateKey` — first occurrence wins.
 - `KeepLastDuplicateKey` — last occurrence wins (overwrite semantics).
 
+## No-malloc decoding/encoding (`ConstexprCbor::Arena`)
+
+`decode_value`/`encode_value` above rely on `std::vector<CborValue>` permitting
+an incomplete element type, which is exactly what makes a recursive value type
+possible without a heap pointer indirection of some kind — but it does mean a
+heap. For environments without one at all, `ConstexprCbor::Arena` is the
+no-malloc counterpart: every decoded value lives in a caller-sized
+`NodePool<MaxNodes, MaxBytes>` (a flat `std::array<Node, MaxNodes>` plus a flat
+byte arena for string/bignum content) instead of on the heap.
+
+```cpp
+#include "constexpr_cbor.hpp"
+
+using namespace ConstexprCbor;
+
+constexpr std::uint8_t bytes[] = {0x83, 0x01, 0x02, 0x03};  // [1, 2, 3]
+
+consteval bool round_trips() {
+    Arena::NodePool<16, 16> pool;               // 16 nodes, 16 content bytes -- sized by the caller
+    const auto decoded = Arena::decode_value(pool, bytes);
+    if (!decoded) return false;
+    const auto& items = std::get<Arena::ArrayRef>(pool.nodes[decoded->node_index].data);
+    if (items.count != 3) return false;
+    std::array<std::uint8_t, 16> out{};
+    const auto written = Arena::encode_value(pool, decoded->node_index, out);
+    return written && std::equal(out.begin(), out.begin() + *written, bytes);
+}
+
+static_assert(round_trips());
+```
+
+What's structurally different from the heap-based API, and why:
+
+- **`std::array<T, N>` can't hold an incomplete `T`.** `std::vector<T>` explicitly
+  permits an incomplete element type (internal pointer indirection); a fixed-size
+  array cannot, so a self-referential value type needs *some* indirection no
+  matter how it's declared. Here that's an index into the pool rather than a
+  heap pointer: a `Node` never contains another `Node` by value, only by index
+  (`ArrayRef`/`MapRef`/`TagRef` hold indices, not nested values).
+- **Arrays and maps need their N children as a contiguous run of slots**, so a
+  child can be reached by `first_child + i` instead of being, say, a
+  singly-linked chain. But contiguity has to be reserved *before* any child is
+  decoded, and a child's own node count isn't known until it's actually decoded
+  (a nested array needs however many nodes its own subtree needs). The fix is
+  one level of indirection per slot (`IndexCell`, resolved transparently by
+  `NodePool::child`/`map_key`/`map_value`): the slot always holds a cheap,
+  fixed-size index, and the child's real (possibly far-away, possibly
+  many-node) subtree lives wherever it was actually decoded.
+- **Indefinite-length arrays/maps don't know their count upfront at all** (no
+  length marker, just items until a `0xFF` break), yet still need that same
+  contiguous reservation before decoding any child. `Arena::skip_item` is a
+  non-allocating structural walker that pre-counts them in a first pass, so
+  the real decode can reserve the right-sized block before its second pass.
+  This is a genuine extra cost indefinite-length forms pay here that they
+  don't in the heap-based decoder (which just appends to a `std::vector`):
+  **O(n) extra structural work**, not a second allocation pass — `skip_item`
+  never calls into `NodePool` at all.
+- **Chunked (indefinite-length) byte/text strings** still work: each chunk is
+  appended directly into the pool's flat byte arena via repeated
+  `allocate_bytes` calls, the same incremental-append discipline the
+  heap-based decoder's `content.insert()` uses, just writing into a
+  fixed-capacity array instead of growing a `std::vector`.
+- **No duplicate-map-key policy support (yet).** The heap-based `KeyPolicy`
+  mechanism re-scans a flat `std::vector<pair<CborValue, CborValue>>` of
+  entries seen so far; an arena map's keys/values are scattered across
+  whatever subtrees their own recursive decode needed, not stored as a flat
+  comparable sequence, so that re-scan doesn't carry over cheaply. This is a
+  documented scope limit, not a silent gap: `Arena::decode_value` currently
+  preserves duplicate keys as-is regardless of the (otherwise-still-required)
+  `KeyPolicy` template argument.
+- **Running out of `MaxNodes` or `MaxBytes` is a refusal** (`std::nullopt`),
+  exactly like a malformed-input refusal elsewhere in this library — never a
+  crash or a silent truncation. Sizing either pool is the caller's job, the
+  same way sizing an output buffer for `Arena::encode_value` is.
+- **`Arena::encode_value` writes into a caller-supplied `std::span<std::uint8_t>`**
+  instead of returning a `std::vector`, returning how many bytes it used or
+  `std::nullopt` if the buffer was too small — never a truncated or
+  out-of-bounds write. Like the heap-based encoder, it always emits the
+  canonical (shortest) form: an indefinite-length input decodes fine but
+  re-encodes to its definite-length equivalent, not byte-for-byte back to the
+  original bytes.
+
+See `tests/test_arena.cpp` for the full suite (round-trips against the same
+official vectors `tests/test_array.cpp`/`test_map.cpp`/`test_tag.cpp` use for
+the heap-based decoder, plus pool-exhaustion and buffer-too-small refusal
+cases). It doesn't use `compile_time_ut`'s `expect_eq<A, B>()` NTTP form the
+way sibling test files do: that form requires every operand to be a freshly
+formed constant expression with no named variable carried in from an earlier
+statement, and `NodePool` can never itself be `constexpr` (it's mutated by
+`decode_value` through a non-const reference) — so every check in that file
+uses the plain if/return idiom instead, proved by `static_assert` same as
+everywhere else in this codebase.
+
 ## Caller-tunable nesting depth
 
 Unbounded recursive nesting in arrays, maps, and tags is the single most common

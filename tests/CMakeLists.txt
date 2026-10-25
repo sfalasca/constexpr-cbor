@@ -32,12 +32,21 @@ set(positive_test_sources
     test_indefinite_length.cpp
     test_nesting_depth.cpp
     test_malformed_input.cpp
+    test_arena.cpp
 )
 
 foreach(src ${positive_test_sources})
     get_filename_component(name ${src} NAME_WE)
     add_executable(${name} ${src})
-    target_link_libraries(${name} PRIVATE constexpr_cbor compile_time_ut cbor_warnings)
+    target_link_libraries(${name} PRIVATE constexpr_cbor cbor_warnings)
+    if(NOT src STREQUAL "test_arena.cpp")
+        # test_arena.cpp doesn't use compile_time_ut: Arena::decode_value
+        # takes its NodePool by non-const reference, so its result can
+        # never be a constexpr input the way compile_time_ut's expect_eq<>
+        # NTTP form requires -- every check here uses the plain if/return
+        # idiom instead.
+        target_link_libraries(${name} PRIVATE compile_time_ut)
+    endif()
     add_test(NAME ${name} COMMAND ${name})
 endforeach()
 
