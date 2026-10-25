@@ -87,6 +87,22 @@ consteval bool test_utf8_policies_accept_the_official_vectors() {
 }
 static_assert(test_utf8_policies_accept_the_official_vectors());
 
+// AsciiOnlyValidation is a different thing than the three UTF-8 policies
+// above, not a fourth strictness level of the same thing: ASCII is a
+// subset of UTF-8, so every one of the other policies accepts "IETF", but
+// a perfectly valid, non-overlong 2-byte UTF-8 sequence ("ü") that
+// CompleteUtf8Validation accepts still fails this one.
+consteval bool test_ascii_only_policy_rejects_valid_non_ascii_utf8() {
+  using namespace CompileTimeUnitTesting;
+  constexpr std::uint8_t vec_ietf[] = {0x64, 0x49, 0x45, 0x54, 0x46};
+  constexpr std::uint8_t vec_u_umlaut[] = {0x62, 0xc3, 0xbc};
+  expect_eq<decode_text_string<AsciiOnlyValidation>(vec_ietf).has_value(), true>();
+  expect_eq<decode_text_string<CompleteUtf8Validation>(vec_u_umlaut).has_value(), true>();
+  expect_eq<decode_text_string<AsciiOnlyValidation>(vec_u_umlaut).has_value(), false>();
+  return true;
+}
+static_assert(test_ascii_only_policy_rejects_valid_non_ascii_utf8());
+
 consteval bool test_encode_text_string_matches_official_vectors() {
   using namespace CompileTimeUnitTesting;
   constexpr std::array<char, 4> ietf{'I', 'E', 'T', 'F'};

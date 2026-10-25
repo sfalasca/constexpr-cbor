@@ -116,6 +116,12 @@ takes that choice as a template parameter rather than hard-coding one answer:
 - `CompleteUtf8Validation` — full RFC 3629 conformance: also rejects overlong
   encodings (RFC 8949's own example of well-formed-but-invalid CBOR, `0x62c0ae`,
   fails this one), lone surrogate-half code points, and anything past U+10FFFF.
+- `AsciiOnlyValidation` — a different thing than the three above, not a fourth
+  strictness level of the same thing: ASCII is a subset of UTF-8 (every one of
+  the other policies accepts it), but the reverse isn't true. A string like
+  `"café"` is perfectly valid UTF-8 and still fails this one. For systems or
+  protocol fields that can't handle multi-byte sequences at all, not for
+  deciding how strictly to check UTF-8 itself.
 
 Each policy is checked against a real `<type_traits>`-based interface contract
 (`is_utf8_validation_policy_v`), not just a naming convention — a policy with the

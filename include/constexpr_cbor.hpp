@@ -209,6 +209,23 @@ struct CompleteUtf8Validation {
   }
 };
 
+// Stricter than valid UTF-8, not another strictness level of it: ASCII is
+// a subset of UTF-8 (any byte 0x00-0x7F is already a complete, single-byte
+// UTF-8 code point), but the reverse isn't true -- "café" is
+// perfectly valid UTF-8 and still fails this policy. For systems or
+// protocol fields that can't handle multi-byte sequences at all, not for
+// deciding how strictly to check UTF-8 itself.
+struct AsciiOnlyValidation {
+  static constexpr bool is_valid(std::span<const std::uint8_t> bytes) {
+    for (const std::uint8_t b : bytes) {
+      if (b > 0x7f) {
+        return false;
+      }
+    }
+    return true;
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Major types 2 and 3: byte strings and text strings. Both are a length
 // (decoded via decode_length) followed by that many raw bytes; text strings
