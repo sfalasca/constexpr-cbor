@@ -111,5 +111,9 @@ add_compile_failure_test_with_values(wrong_shape_duplicate_key_policy
     expected_failures/wrong_shape_duplicate_key_policy.cpp LABELS policy
     EXPECT "KeyPolicy must provide static bool on_duplicate")
 
+add_compile_failure_test_with_values(wrong_shape_duplicate_key_policy_arena
+    expected_failures/wrong_shape_duplicate_key_policy_arena.cpp LABELS policy
+    EXPECT "KeyPolicy must provide static bool on_duplicate")
+
 add_compile_failure_test(expect_eq_wrong_decoded_value
     expected_failures/expect_eq_wrong_decoded_value.cpp LABELS sanity)

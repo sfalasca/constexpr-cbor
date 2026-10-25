@@ -143,13 +143,29 @@ UTF-8 policy above:
 `decode_value`/`encode_value` above rely on `std::vector<CborValue>` permitting
 an incomplete element type, which is exactly what makes a recursive value type
 possible without a heap pointer indirection of some kind — but it does mean a
-heap. For environments without one at all, `ConstexprCbor::Arena` is the
-no-malloc counterpart: every decoded value lives in a caller-sized
-`NodePool<MaxNodes, MaxBytes>` (a flat `std::array<Node, MaxNodes>` plus a flat
-byte arena for string/bignum content) instead of on the heap.
+heap. For environments without one at all, `ConstexprCbor::Arena` (in its own
+header, `include/constexpr_cbor_arena.hpp`) is the no-malloc counterpart: every
+decoded value lives in a caller-sized `NodePool<MaxNodes, MaxBytes>` (a flat
+`std::array<Node, MaxNodes>` plus a flat byte arena for string/bignum content)
+instead of on the heap.
+
+The two headers are independently usable: a project that only wants the
+heap-based API includes just `constexpr_cbor.hpp`, and a project that only
+wants the no-malloc API includes just `constexpr_cbor_arena.hpp` (which pulls
+in `constexpr_cbor.hpp` itself, for the primitives both share — `decode_length`,
+the UTF-8 policies, `decode_byte_string`/`decode_text_string`, `decode_simple` —
+none of which allocate). Since every symbol in both headers is a template,
+including one and never touching the other costs nothing: unused templates
+generate no code. A project that wants both just includes both (or includes
+only `constexpr_cbor_arena.hpp`, since that already gets both) — doing so is
+exactly how `RejectDuplicateKeys`/`KeepFirstDuplicateKey`/`KeepLastDuplicateKey`
+end up usable with *both* `decode_value` and `Arena::decode_value`: each is
+the same type in both headers (see "Pluggable duplicate-map-key policies" above
+for the Arena-shaped overload each one also provides), not a parallel
+Arena-only copy of each.
 
 ```cpp
-#include "constexpr_cbor.hpp"
+#include "constexpr_cbor_arena.hpp"
 
 using namespace ConstexprCbor;
 
@@ -200,14 +216,19 @@ What's structurally different from the heap-based API, and why:
   `allocate_bytes` calls, the same incremental-append discipline the
   heap-based decoder's `content.insert()` uses, just writing into a
   fixed-capacity array instead of growing a `std::vector`.
-- **No duplicate-map-key policy support (yet).** The heap-based `KeyPolicy`
-  mechanism re-scans a flat `std::vector<pair<CborValue, CborValue>>` of
-  entries seen so far; an arena map's keys/values are scattered across
-  whatever subtrees their own recursive decode needed, not stored as a flat
-  comparable sequence, so that re-scan doesn't carry over cheaply. This is a
-  documented scope limit, not a silent gap: `Arena::decode_value` currently
-  preserves duplicate keys as-is regardless of the (otherwise-still-required)
-  `KeyPolicy` template argument.
+- **Duplicate-map-key policies work here too, via a different mechanism.** The
+  heap-based `KeyPolicy` re-scans a flat `std::vector<pair<CborValue, CborValue>>`
+  of entries seen so far; an arena map has no such flat, directly-comparable
+  container (keys/values are scattered across whatever subtrees their own
+  recursive decode needed), so `Arena::decode_value` instead compares each new
+  key structurally (`Arena::node_equal`, a recursive by-index equality covering
+  every alternative, including composite Array/Map/Tag keys) against the keys
+  already written, and calls the same `KeyPolicy::on_duplicate` — through its
+  Arena-shaped overload — on a match. `KeepFirstDuplicateKey` simply doesn't
+  advance the write cursor for the dropped pair; `KeepLastDuplicateKey`
+  overwrites the earlier pair's value slot in place. Reserved-but-unused
+  trailing slots from dropped pairs are harmless (`MapRef.count` only ever
+  covers the pairs actually written).
 - **Running out of `MaxNodes` or `MaxBytes` is a refusal** (`std::nullopt`),
   exactly like a malformed-input refusal elsewhere in this library — never a
   crash or a silent truncation. Sizing either pool is the caller's job, the
@@ -219,6 +240,17 @@ What's structurally different from the heap-based API, and why:
   canonical (shortest) form: an indefinite-length input decodes fine but
   re-encodes to its definite-length equivalent, not byte-for-byte back to the
   original bytes.
+- **A CBOR length field is checked before it's ever cast to `std::size_t`.**
+  The wire format allows an array/map to claim up to 2^64-1 items, but
+  `NodePool` indexes with `std::size_t`, which can be narrower than 64 bits
+  (32 on common embedded targets). `Arena::decode_value` reserves node slots
+  for a whole array/map's children *before* decoding any of them, so a
+  silently-truncating cast there would be the exact shape of libcbor PR #387's
+  bug: a huge count wraps to a small one, the reservation "succeeds" against
+  that undersized number, and the loop — which still iterates the real,
+  untruncated count — writes past it. `Arena::detail::checked_node_count`
+  refuses (`std::nullopt`) instead, the same contract every other refusal in
+  this codec uses; it also guards the `*2` a map's key+value slot pairs need.
 
 See `tests/test_arena.cpp` for the full suite (round-trips against the same
 official vectors `tests/test_array.cpp`/`test_map.cpp`/`test_tag.cpp` use for

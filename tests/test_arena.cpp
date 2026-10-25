@@ -1,4 +1,4 @@
-#include "constexpr_cbor.hpp"
+#include "constexpr_cbor_arena.hpp"
 
 using namespace ConstexprCbor;
 using namespace ConstexprCbor::Arena;
@@ -292,5 +292,107 @@ constexpr bool test_encode_refuses_when_output_buffer_too_small() {
   return !encode_value(pool, decoded->node_index, too_small).has_value();
 }
 static_assert(test_encode_refuses_when_output_buffer_too_small());
+
+// --- Duplicate-key policy: RejectDuplicateKeys/KeepFirstDuplicateKey/
+// KeepLastDuplicateKey are the exact same types usable with
+// ConstexprCbor::decode_value (see constexpr_cbor.hpp), not a parallel
+// Arena-only copy of each -- each one's Arena-shaped on_duplicate overload
+// works over NodePool indices instead of a std::vector<pair<...>>, since
+// an arena map has no flat, directly-comparable entries container to
+// search or mutate.
+
+// {1: 2, 1: 3} -> 0xa2 0102 0103 (two entries, same key 1, values 2 then 3).
+constexpr std::uint8_t duplicate_key_vec[] = {0xa2, 0x01, 0x02, 0x01, 0x03};
+
+constexpr bool test_reject_duplicate_keys_refuses() {
+  NodePool<16, 16> pool;
+  return !decode_value<32, NoUtf8Validation, RejectDuplicateKeys>(pool, duplicate_key_vec).has_value();
+}
+static_assert(test_reject_duplicate_keys_refuses());
+
+constexpr bool test_keep_first_duplicate_key_keeps_first_value() {
+  NodePool<16, 16> pool;
+  const auto result = decode_value<32, NoUtf8Validation, KeepFirstDuplicateKey>(pool, duplicate_key_vec);
+  if (!result) return false;
+  const auto& m = std::get<MapRef>(pool.nodes[result->node_index].data);
+  return m.count == 1 && std::get<std::uint64_t>(pool.map_key(m, 0).data) == 1 &&
+         std::get<std::uint64_t>(pool.map_value(m, 0).data) == 2;
+}
+static_assert(test_keep_first_duplicate_key_keeps_first_value());
+
+constexpr bool test_keep_last_duplicate_key_keeps_last_value() {
+  NodePool<16, 16> pool;
+  const auto result = decode_value<32, NoUtf8Validation, KeepLastDuplicateKey>(pool, duplicate_key_vec);
+  if (!result) return false;
+  const auto& m = std::get<MapRef>(pool.nodes[result->node_index].data);
+  return m.count == 1 && std::get<std::uint64_t>(pool.map_key(m, 0).data) == 1 &&
+         std::get<std::uint64_t>(pool.map_value(m, 0).data) == 3;
+}
+static_assert(test_keep_last_duplicate_key_keeps_last_value());
+
+// A map with no actual duplicates decodes identically regardless of which
+// policy is selected -- the policy only changes behavior when it actually
+// matters.
+constexpr bool test_no_duplicates_same_result_under_every_policy() {
+  constexpr std::uint8_t vec[] = {0xa2, 0x01, 0x02, 0x03, 0x04};
+  NodePool<16, 16> pool_reject, pool_first, pool_last;
+  const auto r = decode_value<32, NoUtf8Validation, RejectDuplicateKeys>(pool_reject, vec);
+  const auto f = decode_value<32, NoUtf8Validation, KeepFirstDuplicateKey>(pool_first, vec);
+  const auto l = decode_value<32, NoUtf8Validation, KeepLastDuplicateKey>(pool_last, vec);
+  if (!r || !f || !l) return false;
+  return std::get<MapRef>(pool_reject.nodes[r->node_index].data).count == 2 &&
+         std::get<MapRef>(pool_first.nodes[f->node_index].data).count == 2 &&
+         std::get<MapRef>(pool_last.nodes[l->node_index].data).count == 2;
+}
+static_assert(test_no_duplicates_same_result_under_every_policy());
+
+// Structural (non-scalar) duplicate key: {[1,2]: "a", [1,2]: "b"} under
+// KeepLastDuplicateKey -- proves node_equal's recursive comparison runs
+// for composite keys too, not just scalar ==.
+constexpr bool test_structural_key_duplicate_detection() {
+  // [1,2] -> 0x820102 (3 bytes); the map wraps two (key, value) pairs.
+  constexpr std::uint8_t vec[] = {0xa2, 0x82, 0x01, 0x02, 0x61, 0x61, 0x82, 0x01, 0x02, 0x61, 0x62};
+  NodePool<32, 32> pool;
+  const auto result = decode_value<32, NoUtf8Validation, KeepLastDuplicateKey>(pool, vec);
+  if (!result) return false;
+  const auto& m = std::get<MapRef>(pool.nodes[result->node_index].data);
+  if (m.count != 1) return false;
+  const auto& val = std::get<StringRef>(pool.map_value(m, 0).data);
+  return pool.bytes_of(val)[0] == 'b';
+}
+static_assert(test_structural_key_duplicate_detection());
+
+// --- Overflow-then-undersized-buffer guard: a CBOR length field can claim
+// up to 2^64-1 items, but NodePool indexes with std::size_t (which can be
+// narrower, e.g. 32 bits on common embedded targets). Arena::decode_value
+// reserves node slots for a whole array/map's children *before* decoding
+// any of them, so a silently-truncating uint64_t->size_t cast there would
+// be the libcbor PR #387 shape of bug: a huge count wraps to a small one,
+// the reservation "succeeds" against that undersized number, and the loop
+// -- which still iterates the real, untruncated count -- writes past it.
+// These don't depend on size_t's actual width to be meaningful: on a
+// 64-bit target the claimed count simply exceeds MaxNodes long before any
+// wraparound, which is refused by the ordinary pool-exhaustion path; on a
+// 32-bit target it would be the wraparound itself. Either way the
+// contract is the same: refuse cleanly, never an out-of-bounds write.
+
+// Array claiming 2^64-1 elements (major type 4, additional info 27).
+constexpr std::uint8_t huge_array_count_vec[] = {0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+constexpr bool test_huge_array_count_is_refused_not_truncated() {
+  NodePool<16, 16> pool;
+  return !decode_value(pool, huge_array_count_vec).has_value();
+}
+static_assert(test_huge_array_count_is_refused_not_truncated());
+
+// Map claiming 2^64-1 pairs (major type 5, additional info 27) -- also
+// exercises the *2 (key+value slots per pair) overflow check specifically.
+constexpr std::uint8_t huge_map_count_vec[] = {0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+constexpr bool test_huge_map_count_is_refused_not_truncated() {
+  NodePool<16, 16> pool;
+  return !decode_value(pool, huge_map_count_vec).has_value();
+}
+static_assert(test_huge_map_count_is_refused_not_truncated());
 
 int main() { return 0; }
