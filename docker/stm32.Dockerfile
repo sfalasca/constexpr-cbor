@@ -26,22 +26,38 @@
 # that purpose here, just an untested assumption carried over from "this
 # is what firmware does."
 #
+# Compiles every test file in tests/ (not just noexcept_tests.cpp), the
+# same scope as the desktop matrix's default `cmake --build` step --
+# excluding tests/expected_failures/ (those are *supposed* to fail; a
+# glob over tests/*.cpp doesn't descend into that subdirectory, so they're
+# excluded structurally, not by an extra filter). Needs compile_time_ut,
+# which the desktop matrix gets via CMake FetchContent; this image clones
+# it directly at the same pinned tag CMakeLists.txt uses, since there's
+# no CMake here.
+#
 # Build: `docker build -f docker/stm32.Dockerfile -t cbor-stm32 .`
 FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc-arm-none-eabi libnewlib-arm-none-eabi libnewlib-dev \
+        ca-certificates git gcc-arm-none-eabi libnewlib-arm-none-eabi libnewlib-dev \
         libstdc++-arm-none-eabi-dev libstdc++-arm-none-eabi-newlib \
     && rm -rf /var/lib/apt/lists/*
 
+RUN git clone --depth 1 --branch v1.0.1 \
+    https://github.com/sfalasca/compile-time-unit-testing.git /tmp/ctut
+
 WORKDIR /src
 COPY include/ include/
-COPY tests/noexcept_tests.cpp tests/noexcept_tests.cpp
+COPY tests/ tests/
 
 # cortex-m4/hard-float/fpv4-sp-d16: the common STM32F4 configuration.
 RUN arm-none-eabi-g++ --version \
-    && arm-none-eabi-g++ -std=c++23 \
-         -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 \
-         -fno-exceptions -fno-rtti \
-         -Wall -Wextra -Wpedantic \
-         -Iinclude -c tests/noexcept_tests.cpp -o /tmp/noexcept_tests.stm32.o
+    && for f in tests/*.cpp; do \
+         echo "=== compiling $f ==="; \
+         arm-none-eabi-g++ -std=c++23 \
+             -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 \
+             -fno-exceptions -fno-rtti \
+             -Wall -Wextra -Wpedantic \
+             -Iinclude -I/tmp/ctut/include \
+             -c "$f" -o "/tmp/$(basename "$f" .cpp).stm32.o" || exit 1; \
+       done

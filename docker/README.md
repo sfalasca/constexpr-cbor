@@ -54,13 +54,16 @@ to fail, each for a distinct, checked reason, not left as noise:
 
 ## Embedded / bare-metal targets
 
-These compile-check `tests/noexcept_tests.cpp` (proves the decoder/encoder
-surface compiles under `-fno-exceptions`) with `-c`: object file only,
-**no link**. Producing a flashable image needs a linker script, startup
-code, and a vendor HAL/BSP/project structure (ESP-IDF project, STM32Cube,
-etc.), none of which is this header-only library's concern. `-c` against
-the real cross-compiler is the standard way to validate portability
-without that machinery.
+These compile-check every file in `tests/` (the same scope as the desktop
+matrix's default `cmake --build` step, minus `tests/expected_failures/`,
+which are *supposed* to fail) with `-c`: object files only, **no link**.
+Producing a flashable image needs a linker script, startup code, and a
+vendor HAL/BSP/project structure (ESP-IDF project, STM32Cube, etc.), none
+of which is this header-only library's concern. `-c` against the real
+cross-compiler is the standard way to validate portability without that
+machinery. None of these images use CMake, so each one clones
+`compile_time_ut` directly at the same pinned tag `CMakeLists.txt` uses,
+rather than vendoring it or assuming it's reachable some other way.
 
 | File | Target | Toolchain | Notes |
 |---|---|---|---|
