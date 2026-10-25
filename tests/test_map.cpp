@@ -112,7 +112,12 @@ constexpr bool test_decode_map_matches_negative_zero_key_vector() {
   const auto& entries = std::get<std::vector<std::pair<CborValue, CborValue>>>(d->first.data);
   if (entries.size() != 1) return false;
   const double key = std::get<double>(entries[0].first.data);
-  return key == 0.0 && std::signbit(key) && d->second == sizeof(vec);
+  // std::signbit isn't constexpr on every standard library (libc++ 19
+  // doesn't make it one, even though libstdc++ does) -- the same
+  // bit-level sign check used throughout this codebase's float handling
+  // is the portable option.
+  const bool is_negative = (std::bit_cast<std::uint64_t>(key) >> 63) != 0;
+  return key == 0.0 && is_negative && d->second == sizeof(vec);
 }
 static_assert(test_decode_map_matches_negative_zero_key_vector());
 
