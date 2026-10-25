@@ -326,7 +326,9 @@ constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_
       const auto value_bytes = bytes.subspan(1, 4);
       const auto bits = std::accumulate(value_bytes.begin(), value_bytes.end(), std::uint32_t{0},
                                          [](std::uint32_t a, std::uint8_t b) { return (a << 8) | b; });
-      return DecodedSimple{.kind = DecodedSimple::Kind::Float, .as_double = std::bit_cast<float>(bits), .bytes_consumed = 5};
+      return DecodedSimple{.kind = DecodedSimple::Kind::Float,
+                            .as_double = static_cast<double>(std::bit_cast<float>(bits)),
+                            .bytes_consumed = 5};
     }
     case 27: {
       if (bytes.size() < 9) return std::nullopt;
@@ -686,7 +688,13 @@ constexpr std::optional<std::uint16_t> try_encode_half_float(double value) {
     candidate = 0x7e00;  // canonical NaN
   } else {
     const std::uint64_t bits64 = std::bit_cast<std::uint64_t>(value);
-    const std::uint16_t sign = static_cast<std::uint16_t>(bits64 >> 63);
+    // Kept as uint64_t (not narrowed to uint16_t) so every `sign << 15`
+    // below stays in an unsigned type at least as wide as int, the same
+    // discipline used throughout this header: a narrower unsigned type
+    // promotes to a signed int before shifting, which is where the
+    // genuinely subtle (if ultimately harmless here) sign-conversion
+    // warnings further down came from.
+    const std::uint64_t sign = bits64 >> 63;
     if (value == 0.0) {
       candidate = static_cast<std::uint16_t>(sign << 15);
     } else if (std::isinf(value)) {

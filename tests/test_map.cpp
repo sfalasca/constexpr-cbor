@@ -103,4 +103,50 @@ constexpr bool test_map_roundtrips() {
 }
 static_assert(test_map_roundtrips());
 
+// From cbor-wg/cbor-test-vectors (tests/rfc8949/good.edn): a map keyed by
+// the half-float -0.0 -> 0xa1f9800080 ({-0.0: []}).
+constexpr bool test_decode_map_matches_negative_zero_key_vector() {
+  constexpr std::uint8_t vec[] = {0xa1, 0xf9, 0x80, 0x00, 0x80};
+  const auto d = decode_value(vec);
+  if (!d) return false;
+  const auto& entries = std::get<std::vector<std::pair<CborValue, CborValue>>>(d->first.data);
+  if (entries.size() != 1) return false;
+  const double key = std::get<double>(entries[0].first.data);
+  return key == 0.0 && std::signbit(key) && d->second == sizeof(vec);
+}
+static_assert(test_decode_map_matches_negative_zero_key_vector());
+
+// A documented scope decision, not a bug: canonical CBOR says -0.0 and 0
+// should compare equal as map keys (same real "-0 key" test vector's own
+// description flags this as a cross-implementation divergence point).
+// This library's duplicate-key detection compares CborValue::data, a
+// std::variant, whose own equality requires both sides to hold the *same
+// alternative* before comparing values at all -- a float -0.0 and an
+// unsigned 0 are different alternatives, so they're never treated as
+// duplicates here, regardless of their numeric equality.
+constexpr bool test_negative_zero_and_integer_zero_keys_do_not_collide() {
+  // {-0.0: 1, 0: 2} -> 0xa2f98000010002
+  constexpr std::uint8_t vec[] = {0xa2, 0xf9, 0x80, 0x00, 0x01, 0x00, 0x02};
+  const auto d = decode_value(vec);
+  if (!d) return false;
+  const auto& entries = std::get<std::vector<std::pair<CborValue, CborValue>>>(d->first.data);
+  return entries.size() == 2;  // RejectDuplicateKeys would have failed this if they collided
+}
+static_assert(test_negative_zero_and_integer_zero_keys_do_not_collide());
+
+// From cbor-wg/cbor-test-vectors: a map with the literal key "__proto__"
+// -> 0xa1695f5f70726f746f5f5f00 ({"__proto__": 0}), a real-world-motivated
+// test (relevant to anyone wrapping this in a dynamic-language binding).
+constexpr bool test_decode_map_matches_proto_key_vector() {
+  constexpr std::uint8_t vec[] = {0xa1, 0x69, 0x5f, 0x5f, 0x70, 0x72, 0x6f,
+                                   0x74, 0x6f, 0x5f, 0x5f, 0x00};
+  const auto d = decode_value(vec);
+  if (!d) return false;
+  const auto& entries = std::get<std::vector<std::pair<CborValue, CborValue>>>(d->first.data);
+  if (entries.size() != 1) return false;
+  const auto& key = std::get<CborValue::OwnedString>(entries[0].first.data);
+  return key.content.size() == 9 && d->second == sizeof(vec);
+}
+static_assert(test_decode_map_matches_proto_key_vector());
+
 int main() { return 0; }

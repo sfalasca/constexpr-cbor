@@ -13,7 +13,9 @@ compile errors rather than runtime bugs.
 ## Requirements
 
 - **C++20 minimum.** `target_compile_features(constexpr_cbor INTERFACE cxx_std_20)` in this repo's `CMakeLists.txt`.
+- **GCC 13+ or Clang 19+.** `CborValue` holds a recursive `std::variant`/`std::vector`, and that's only usable as a literal type (a `constexpr` function parameter/return type) once a standard library actually implements full C++20 constexpr container support. Checked directly, not assumed: GCC 13 (libstdc++) passes; Clang 15 through 18 (libc++) fail with "`CborValue` is not a literal type"; Clang 19 passes cleanly. The `docker/` matrix is the source of truth for this, not this line — run it yourself if a toolchain combination isn't listed here.
 - Depends on [`compile_time_ut`](https://github.com/sfalasca/compile-time-unit-testing) for its compile-time test assertions.
+- Proving a very deeply nested structure at compile time can hit the compiler's own `-fconstexpr-depth`/`-fconstexpr-steps` limit before this library's own `MaxDepth` bound does — a real, separate ceiling from a different axis (every level of CBOR nesting costs several `std::variant`/`std::vector` constructor frames, not one). Raise the compiler flag explicitly if you need to prove a deeper structure at compile time than the default allows; this isn't something the library can paper over.
 
 ## Adding this to your project
 
@@ -75,6 +77,31 @@ worked examples, fetched directly from the RFC text rather than reconstructed by
 hand. Each one decodes inside a `consteval` function and is asserted against the
 exact documented value; most are also re-encoded and compared byte-for-byte against
 the original vector, since Appendix A's examples are already in canonical form.
+All 81 distinct vectors in Appendix A's Table 6 are covered. A handful of rows are
+deliberately non-preferred alternates (e.g. `Infinity`/`NaN` shown at all three
+float widths, when the preferred encoding always picks the shortest): those assert
+the decoded value is correct and that this library's own encoder picks the
+canonical width, not that re-encoding reproduces that particular row's own bytes.
+
+Beyond the RFC's own examples, `tests/test_malformed_input.cpp` and a handful of
+cases folded into the per-type test files come from
+[`cbor-wg/cbor-test-vectors`](https://github.com/cbor-wg/cbor-test-vectors) (an
+actively maintained corpus beyond Appendix A that several real CBOR libraries
+vendor), plus QCBOR's own `not_well_formed_cbor.h` matrix — the exact bytes are
+hard-coded with a provenance comment at each use site, the same way RFC 8949's
+own vectors are, rather than vendoring either source wholesale.
+
+Two deliberate scope decisions worth stating rather than leaving implicit:
+this library checks CBOR **well-formedness** (the byte structure), not **tag
+content validity** (e.g. it does not check that a tag-0 item's nested value is
+actually a valid date-time string) — a real divergence point between CBOR
+implementations, and this one picks the structural-only side of it. And a
+decoded `NaN`'s specific payload bits aren't guaranteed to survive a decode/
+re-encode round-trip (this library always canonicalizes `NaN` to its shortest
+form, discarding any signaling-vs-quiet distinction or payload bits the
+original encoding carried) — some platforms' FPUs quiet a signaling NaN on
+load regardless, so this isn't a portable guarantee to make anyway.
+
 See `tests/` for the full suite, one file per major type.
 
 ## Pluggable UTF-8 validation policies
@@ -125,7 +152,7 @@ ctest --test-dir build --output-on-failure
 whatever the compiler actually supports (down to GCC 10, which gets
 silently capped to `gnu++2a`).
 
-Static analysis: `cmake -DCBOR_ENABLE_CLANG_TIDY=ON -DCBOR_ENABLE_CPPCHECK=ON ..` (both opt-in, auto-skip with a warning if the tool isn't installed), plus an always-registered `cmake --build build --target static_analysis` running the Clang Static Analyzer (`scan-build`) over the whole build.
+Static analysis: `cmake -DCBOR_ENABLE_CLANG_TIDY=ON -DCBOR_ENABLE_CPPCHECK=ON ..` (both opt-in, auto-skip with a warning if the tool isn't installed), plus an always-registered `cmake --build build --target cbor_static_analysis` running the Clang Static Analyzer (`scan-build`) over the whole build.
 
 Compiler/platform matrix: see [`docker/README.md`](docker/README.md). `docker/build-matrix.sh` builds every Dockerfile in `docker/` and reports pass/fail.
 

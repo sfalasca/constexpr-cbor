@@ -31,6 +31,7 @@ set(positive_test_sources
     test_tag.cpp
     test_indefinite_length.cpp
     test_nesting_depth.cpp
+    test_malformed_input.cpp
 )
 
 foreach(src ${positive_test_sources})

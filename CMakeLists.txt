@@ -49,12 +49,16 @@ endif()
 # this only needs clang itself (not the separate clang-tidy/cppcheck
 # packages), so it's registered whenever scan-build is found rather than
 # gated behind an option. Run it explicitly: cmake --build . --target
-# static_analysis.
+# cbor_static_analysis. Named cbor_static_analysis rather than
+# static_analysis (compile_time_ut's own name for this exact target) to
+# avoid an add_custom_target collision: both targets get registered in
+# the same build once compile_time_ut is fetched as a dependency, and
+# CMake does not allow two same-named targets even across subdirectories.
 find_program(CBOR_SCAN_BUILD_EXE
     NAMES scan-build-21 scan-build-20 scan-build-19 scan-build
     HINTS /usr/lib/llvm-21/bin /usr/lib/llvm-20/bin /usr/lib/llvm-19/bin)
 if(CBOR_SCAN_BUILD_EXE)
-    add_custom_target(static_analysis
+    add_custom_target(cbor_static_analysis
         COMMAND ${CBOR_SCAN_BUILD_EXE} --status-bugs
             ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target all --clean-first
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}

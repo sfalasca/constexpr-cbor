@@ -108,4 +108,25 @@ consteval bool test_textstring_roundtrips() {
 }
 static_assert(test_textstring_roundtrips());
 
+// From cbor-wg/cbor-test-vectors (tests/rfc8949/good.edn): two Unicode
+// edge cases beyond RFC 8949's own umlaut/water/supplementary-plane
+// examples. "string: BOM" embeds a byte-order mark (U+FEFF) as ordinary
+// payload content, not a stream prefix -- a decoder that special-cases
+// BOM detection anywhere would mishandle this. "string: combining" is "u"
+// (U+0075) followed by a combining diaeresis (U+0308), which renders
+// identically to the precomposed "ü" this file already tests but is
+// a completely different byte sequence -- canonical-equivalence is a
+// semantic question this library deliberately doesn't resolve (bytes are
+// bytes), which this test documents rather than silently assumes.
+consteval bool test_decode_text_string_matches_cbor_test_vectors_unicode_cases() {
+  using namespace CompileTimeUnitTesting;
+  constexpr std::uint8_t vec_bom[] = {0x66, 0xef, 0xbb, 0xbf, 0x42, 0x4f, 0x4d};
+  constexpr std::uint8_t vec_combining[] = {0x63, 0x75, 0xcc, 0x88};
+  expect_eq<decode_text_string(vec_bom)->bytes.size(), std::size_t{6}>();
+  expect_eq<decode_text_string(vec_combining)->bytes.size(), std::size_t{3}>();
+  expect_eq<decode_text_string(vec_combining)->bytes[0], std::uint8_t{0x75}>();
+  return true;
+}
+static_assert(test_decode_text_string_matches_cbor_test_vectors_unicode_cases());
+
 int main() { return 0; }
