@@ -27,13 +27,14 @@
 # is what firmware does."
 #
 # Compiles every test file in tests/ (not just noexcept_tests.cpp), the
-# same scope as the desktop matrix's default `cmake --build` step --
-# excluding tests/expected_failures/ (those are *supposed* to fail; a
-# glob over tests/*.cpp doesn't descend into that subdirectory, so they're
-# excluded structurally, not by an extra filter). Needs compile_time_ut,
-# which the desktop matrix gets via CMake FetchContent; this image clones
-# it directly at the same pinned tag CMakeLists.txt uses, since there's
-# no CMake here.
+# same scope as the desktop matrix's default `cmake --build` step, and
+# additionally checks that every tests/expected_failures/*.cpp file still
+# fails to compile here with the right diagnostic -- the no-CMake
+# equivalent of what ctest's try_compile.cmake/try_compile_grep.cmake do
+# on the desktop matrix (see docker/compile-all-tests.sh). Needs
+# compile_time_ut, which the desktop matrix gets via CMake FetchContent;
+# this image clones it directly at the same pinned tag CMakeLists.txt
+# uses, since there's no CMake here.
 #
 # Build: `docker build -f docker/stm32.Dockerfile -t cbor-stm32 .`
 FROM ubuntu:24.04
@@ -49,15 +50,11 @@ RUN git clone --depth 1 --branch v1.0.1 \
 WORKDIR /src
 COPY include/ include/
 COPY tests/ tests/
+COPY docker/compile-all-tests.sh compile-all-tests.sh
 
 # cortex-m4/hard-float/fpv4-sp-d16: the common STM32F4 configuration.
 RUN arm-none-eabi-g++ --version \
-    && for f in tests/*.cpp; do \
-         echo "=== compiling $f ==="; \
-         arm-none-eabi-g++ -std=c++23 \
-             -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 \
-             -fno-exceptions -fno-rtti \
-             -Wall -Wextra -Wpedantic \
-             -Iinclude -I/tmp/ctut/include \
-             -c "$f" -o "/tmp/$(basename "$f" .cpp).stm32.o" || exit 1; \
-       done
+    && sh compile-all-tests.sh stm32 arm-none-eabi-g++ \
+         -std=c++23 -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 \
+         -fno-exceptions -fno-rtti -Wall -Wextra -Wpedantic \
+         -Iinclude -I/tmp/ctut/include

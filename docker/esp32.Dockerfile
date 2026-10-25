@@ -9,13 +9,14 @@
 # validate a header against a cross-compiler.
 #
 # Compiles every test file in tests/ (not just noexcept_tests.cpp), the
-# same scope as the desktop matrix's default `cmake --build` step --
-# excluding tests/expected_failures/ (those are *supposed* to fail; a
-# glob over tests/*.cpp doesn't descend into that subdirectory, so they're
-# excluded structurally, not by an extra filter). Needs compile_time_ut,
-# which the desktop matrix gets via CMake FetchContent; this image clones
-# it directly at the same pinned tag CMakeLists.txt uses, since there's
-# no CMake here.
+# same scope as the desktop matrix's default `cmake --build` step, and
+# additionally checks that every tests/expected_failures/*.cpp file still
+# fails to compile here with the right diagnostic -- the no-CMake
+# equivalent of what ctest's try_compile.cmake/try_compile_grep.cmake do
+# on the desktop matrix (see docker/compile-all-tests.sh). Needs
+# compile_time_ut, which the desktop matrix gets via CMake FetchContent;
+# this image clones it directly at the same pinned tag CMakeLists.txt
+# uses, since there's no CMake here.
 #
 # ESP-IDF firmware conventionally disables C++ exceptions
 # (CONFIG_COMPILER_CXX_EXCEPTIONS is off by default) to save flash, so
@@ -29,16 +30,13 @@ SHELL ["/bin/bash", "-c"]
 WORKDIR /src
 COPY include/ include/
 COPY tests/ tests/
+COPY docker/compile-all-tests.sh compile-all-tests.sh
 
 RUN git clone --depth 1 --branch v1.0.1 \
     https://github.com/sfalasca/compile-time-unit-testing.git /tmp/ctut
 
 RUN . /opt/esp/idf/export.sh > /dev/null \
     && xtensa-esp32-elf-g++ --version \
-    && for f in tests/*.cpp; do \
-         echo "=== compiling $f ==="; \
-         xtensa-esp32-elf-g++ -std=c++23 -fno-exceptions -fno-rtti \
-             -Wall -Wextra -Wpedantic \
-             -Iinclude -I/tmp/ctut/include \
-             -c "$f" -o "/tmp/$(basename "$f" .cpp).esp32.o" || exit 1; \
-       done
+    && sh compile-all-tests.sh esp32 xtensa-esp32-elf-g++ \
+         -std=c++23 -fno-exceptions -fno-rtti -Wall -Wextra -Wpedantic \
+         -Iinclude -I/tmp/ctut/include

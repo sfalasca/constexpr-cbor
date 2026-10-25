@@ -3,3 +3,4 @@ build*/
 *.o
 *.swp
 docker/
+!docker/compile-all-tests.sh

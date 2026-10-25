@@ -14,13 +14,14 @@
 # is the standard way to validate a header against a cross-compiler.
 #
 # Compiles every test file in tests/ (not just noexcept_tests.cpp), the
-# same scope as the desktop matrix's default `cmake --build` step --
-# excluding tests/expected_failures/ (those are *supposed* to fail; a
-# glob over tests/*.cpp doesn't descend into that subdirectory, so they're
-# excluded structurally, not by an extra filter). Needs compile_time_ut,
-# which the desktop matrix gets via CMake FetchContent; this image clones
-# it directly at the same pinned tag CMakeLists.txt uses, since there's
-# no CMake here.
+# same scope as the desktop matrix's default `cmake --build` step, and
+# additionally checks that every tests/expected_failures/*.cpp file still
+# fails to compile here with the right diagnostic -- the no-CMake
+# equivalent of what ctest's try_compile.cmake/try_compile_grep.cmake do
+# on the desktop matrix (see docker/compile-all-tests.sh). Needs
+# compile_time_ut, which the desktop matrix gets via CMake FetchContent;
+# this image clones it directly at the same pinned tag CMakeLists.txt
+# uses, since there's no CMake here.
 #
 # Build: `docker build -f docker/riscv32.Dockerfile -t cbor-riscv32 .`
 FROM ubuntu:24.04
@@ -44,14 +45,12 @@ ENV PATH="/opt/riscv-none-elf-gcc/bin:${PATH}"
 WORKDIR /src
 COPY include/ include/
 COPY tests/ tests/
+COPY docker/compile-all-tests.sh compile-all-tests.sh
 
 # rv32imac/ilp32: base integer + multiply/divide + atomics + compressed
 # instructions, the common baseline for real rv32 MCUs.
 RUN riscv-none-elf-g++ --version \
-    && for f in tests/*.cpp; do \
-         echo "=== compiling $f ==="; \
-         riscv-none-elf-g++ -std=c++23 -march=rv32imac -mabi=ilp32 \
-             -fno-exceptions -fno-rtti -Wall -Wextra -Wpedantic \
-             -Iinclude -I/tmp/ctut/include \
-             -c "$f" -o "/tmp/$(basename "$f" .cpp).riscv32.o" || exit 1; \
-       done
+    && sh compile-all-tests.sh riscv32 riscv-none-elf-g++ \
+         -std=c++23 -march=rv32imac -mabi=ilp32 \
+         -fno-exceptions -fno-rtti -Wall -Wextra -Wpedantic \
+         -Iinclude -I/tmp/ctut/include
