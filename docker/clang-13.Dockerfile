@@ -11,7 +11,7 @@
 # entirely; CMake falls back to "c++2b" or lower as needed).
 FROM silkeh/clang:13
 
-RUN apt-get update && apt-get install -y --no-install-recommends python3-pip ninja-build libc++-13-dev libc++abi-13-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends git python3-pip ninja-build libc++-13-dev libc++abi-13-dev \
     && rm -rf /var/lib/apt/lists/* \
     && (pip3 install --no-cache-dir --break-system-packages cmake \
         || pip3 install --no-cache-dir cmake)

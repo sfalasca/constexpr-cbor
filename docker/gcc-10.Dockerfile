@@ -11,7 +11,7 @@ FROM gcc:10
 # project's cmake_minimum_required(3.20); install a current one via pip
 # instead. --break-system-packages is needed on newer (PEP 668) pip and
 # unrecognized by older pip, hence the fallback.
-RUN apt-get update && apt-get install -y --no-install-recommends python3-pip ninja-build \
+RUN apt-get update && apt-get install -y --no-install-recommends git python3-pip ninja-build \
     && rm -rf /var/lib/apt/lists/* \
     && (pip3 install --no-cache-dir --break-system-packages cmake \
         || pip3 install --no-cache-dir cmake)

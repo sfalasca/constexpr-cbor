@@ -48,6 +48,17 @@ constexpr bool test_indefinite_array_mixes_definite_and_indefinite_nesting() {
 }
 static_assert(test_indefinite_array_mixes_definite_and_indefinite_nesting());
 
+// [_ 1, [2, 3], [4, 5]] -> 0x9f01820203820405ff (indefinite outer, both
+// nested arrays definite -- the complement of the mixed case above).
+constexpr bool test_indefinite_outer_with_definite_nested_arrays() {
+  constexpr std::uint8_t vec[] = {0x9f, 0x01, 0x82, 0x02, 0x03, 0x82, 0x04, 0x05, 0xff};
+  const auto d = decode_value(vec);
+  if (!d) return false;
+  const auto& outer = std::get<std::vector<CborValue>>(d->first.data);
+  return outer.size() == 3 && d->second == sizeof(vec);
+}
+static_assert(test_indefinite_outer_with_definite_nested_arrays());
+
 // [1, [2, 3], [_ 4, 5]] -> 0x83018202039f0405ff (definite outer, indefinite inner)
 constexpr bool test_definite_array_containing_indefinite_nested_array() {
   constexpr std::uint8_t vec[] = {0x83, 0x01, 0x82, 0x02, 0x03, 0x9f, 0x04, 0x05, 0xff};
@@ -58,6 +69,20 @@ constexpr bool test_definite_array_containing_indefinite_nested_array() {
   return outer.size() == 3 && indefinite_inner.size() == 2 && d->second == 9;
 }
 static_assert(test_definite_array_containing_indefinite_nested_array());
+
+// [1, [_ 2, 3], [4, 5]] -> 0x83019f0203ff820405 (definite outer, the
+// *middle* element indefinite -- distinct from the "last element
+// indefinite" case above).
+constexpr bool test_definite_array_with_indefinite_middle_element() {
+  constexpr std::uint8_t vec[] = {0x83, 0x01, 0x9f, 0x02, 0x03, 0xff, 0x82, 0x04, 0x05};
+  const auto d = decode_value(vec);
+  if (!d) return false;
+  const auto& outer = std::get<std::vector<CborValue>>(d->first.data);
+  if (outer.size() != 3) return false;
+  const auto& middle = std::get<std::vector<CborValue>>(outer[1].data);
+  return middle.size() == 2 && d->second == sizeof(vec);
+}
+static_assert(test_definite_array_with_indefinite_middle_element());
 
 // The 25-element indefinite array: [_ 1, 2, ..., 25] ->
 // 0x9f0102030405060708090a0b0c0d0e0f101112131415161718181819ff
@@ -96,5 +121,18 @@ constexpr bool test_definite_array_containing_indefinite_map() {
   return map_entries.size() == 1 && d->second == sizeof(vec);
 }
 static_assert(test_definite_array_containing_indefinite_map());
+
+// RFC 8949 Appendix A: {_ "Fun": true, "Amt": -2} -> 0xbf6346756ef563416d7421ff
+// -- an indefinite map with mixed-type values (bool, negative int).
+constexpr bool test_indefinite_map_with_mixed_value_types() {
+  constexpr std::uint8_t vec[] = {0xbf, 0x63, 0x46, 0x75, 0x6e, 0xf5, 0x63, 0x41, 0x6d, 0x74, 0x21, 0xff};
+  const auto d = decode_value(vec);
+  if (!d) return false;
+  const auto& entries = std::get<std::vector<std::pair<CborValue, CborValue>>>(d->first.data);
+  if (entries.size() != 2) return false;
+  return std::get<bool>(entries[0].second.data) == true &&
+         std::get<NegativeInt>(entries[1].second.data).to_int64() == -2 && d->second == sizeof(vec);
+}
+static_assert(test_indefinite_map_with_mixed_value_types());
 
 int main() { return 0; }

@@ -33,6 +33,9 @@ consteval bool test_decode_simple_matches_official_half_float_vectors() {
   constexpr std::uint8_t vec_smallest_subnormal[] = {0xf9, 0x00, 0x01};
   constexpr std::uint8_t vec_infinity[] = {0xf9, 0x7c, 0x00};
   constexpr std::uint8_t vec_neg_infinity[] = {0xf9, 0xfc, 0x00};
+  constexpr std::uint8_t vec_another_subnormal[] = {0xf9, 0x04, 0x00};  // 0.00006103515625
+  constexpr std::uint8_t vec_neg_4[] = {0xf9, 0xc4, 0x00};              // -4.0
+  constexpr std::uint8_t vec_nan[] = {0xf9, 0x7e, 0x00};
 
   expect_eq<decode_simple(vec_zero)->as_double, 0.0>();
   expect_eq<decode_simple(vec_neg_zero)->as_double, -0.0>();
@@ -40,8 +43,11 @@ consteval bool test_decode_simple_matches_official_half_float_vectors() {
   expect_eq<decode_simple(vec_1_5)->as_double, 1.5>();
   expect_eq<decode_simple(vec_largest_normal)->as_double, 65504.0>();
   expect_eq<decode_simple(vec_smallest_subnormal)->as_double, 5.960464477539063e-8>();
+  expect_eq<decode_simple(vec_another_subnormal)->as_double, 0.00006103515625>();
+  expect_eq<decode_simple(vec_neg_4)->as_double, -4.0>();
   expect_eq<decode_simple(vec_infinity)->as_double, std::numeric_limits<double>::infinity()>();
   expect_eq<decode_simple(vec_neg_infinity)->as_double, -std::numeric_limits<double>::infinity()>();
+  expect_eq<std::isnan(decode_simple(vec_nan)->as_double), true>();
   return true;
 }
 static_assert(test_decode_simple_matches_official_half_float_vectors());
@@ -55,11 +61,13 @@ consteval bool test_decode_simple_matches_official_single_float_vectors() {
   constexpr std::uint8_t vec_largest_finite[] = {0xfa, 0x7f, 0x7f, 0xff, 0xff};
   constexpr std::uint8_t vec_infinity[] = {0xfa, 0x7f, 0x80, 0x00, 0x00};
   constexpr std::uint8_t vec_neg_infinity[] = {0xfa, 0xff, 0x80, 0x00, 0x00};
+  constexpr std::uint8_t vec_nan[] = {0xfa, 0x7f, 0xc0, 0x00, 0x00};
 
   expect_eq<decode_simple(vec_100000)->as_double, 100000.0>();
   expect_eq<decode_simple(vec_largest_finite)->as_double, 3.4028234663852886e+38>();
   expect_eq<decode_simple(vec_infinity)->as_double, std::numeric_limits<double>::infinity()>();
   expect_eq<decode_simple(vec_neg_infinity)->as_double, -std::numeric_limits<double>::infinity()>();
+  expect_eq<std::isnan(decode_simple(vec_nan)->as_double), true>();
   return true;
 }
 static_assert(test_decode_simple_matches_official_single_float_vectors());
@@ -73,14 +81,57 @@ consteval bool test_decode_simple_matches_official_double_float_vectors() {
   constexpr std::uint8_t vec_1e300[] = {0xfb, 0x7e, 0x37, 0xe4, 0x3c, 0x88, 0x00, 0x75, 0x9c};
   constexpr std::uint8_t vec_neg_4_1[] = {0xfb, 0xc0, 0x10, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66};
   constexpr std::uint8_t vec_infinity[] = {0xfb, 0x7f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  constexpr std::uint8_t vec_neg_infinity[] = {0xfb, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  constexpr std::uint8_t vec_nan[] = {0xfb, 0x7f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
   expect_eq<decode_simple(vec_1_1)->as_double, 1.1>();
   expect_eq<decode_simple(vec_1e300)->as_double, 1.0e+300>();
   expect_eq<decode_simple(vec_neg_4_1)->as_double, -4.1>();
   expect_eq<decode_simple(vec_infinity)->as_double, std::numeric_limits<double>::infinity()>();
+  expect_eq<decode_simple(vec_neg_infinity)->as_double, -std::numeric_limits<double>::infinity()>();
+  expect_eq<std::isnan(decode_simple(vec_nan)->as_double), true>();
   return true;
 }
 static_assert(test_decode_simple_matches_official_double_float_vectors());
+
+// RFC 8949 Appendix A: simple(16) -> 0xf0, simple(255) -> 0xf8ff. Additional
+// info 0-19 is "unassigned" but still well-formed and decodable; 24 is the
+// one-byte form for values 32-255.
+consteval bool test_decode_simple_matches_official_simple_value_vectors() {
+  using namespace CompileTimeUnitTesting;
+  constexpr std::uint8_t vec_16[] = {0xf0};
+  constexpr std::uint8_t vec_255[] = {0xf8, 0xff};
+  expect_eq<decode_simple(vec_16)->kind, DecodedSimple::Kind::Simple>();
+  expect_eq<decode_simple(vec_16)->simple_value, std::uint8_t{16}>();
+  expect_eq<decode_simple(vec_255)->simple_value, std::uint8_t{255}>();
+  expect_eq<decode_simple(vec_255)->bytes_consumed, std::size_t{2}>();
+  return true;
+}
+static_assert(test_decode_simple_matches_official_simple_value_vectors());
+
+consteval bool test_decode_simple_rejects_reserved_and_break() {
+  using namespace CompileTimeUnitTesting;
+  constexpr std::uint8_t vec_28[] = {0xfc};  // additional info 28, reserved
+  constexpr std::uint8_t vec_31[] = {0xff};  // additional info 31, "break"
+  expect_eq<decode_simple(vec_28).has_value(), false>();
+  expect_eq<decode_simple(vec_31).has_value(), false>();
+  return true;
+}
+static_assert(test_decode_simple_rejects_reserved_and_break());
+
+consteval bool test_encode_simple_matches_official_vectors() {
+  using namespace CompileTimeUnitTesting;
+  constexpr std::array<std::uint8_t, 1> expected_16{0xf0};
+  constexpr std::array<std::uint8_t, 2> expected_255{0xf8, 0xff};
+  const CborValue v16{.data = CborValue::SimpleValue{.number = 16}};
+  const CborValue v255{.data = CborValue::SimpleValue{.number = 255}};
+  const auto e16 = encode_value(v16);
+  const auto e255 = encode_value(v255);
+  expect_eq(std::span<const std::uint8_t>(e16), std::span<const std::uint8_t>(expected_16));
+  expect_eq(std::span<const std::uint8_t>(e255), std::span<const std::uint8_t>(expected_255));
+  return true;
+}
+static_assert(test_encode_simple_matches_official_vectors());
 
 consteval bool test_decode_simple_rejects_wrong_major_type() {
   using namespace CompileTimeUnitTesting;

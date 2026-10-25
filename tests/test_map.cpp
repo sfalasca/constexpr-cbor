@@ -34,6 +34,21 @@ constexpr bool test_decode_map_handles_string_keys_and_nested_array() {
 }
 static_assert(test_decode_map_handles_string_keys_and_nested_array());
 
+// RFC 8949 Appendix A: {"a": "A", "b": "B", "c": "C", "d": "D", "e": "E"} ->
+// 0xa5616161416162614261636143616461446165614 5 -- a larger map, string keys
+// AND string values.
+constexpr bool test_decode_map_matches_five_key_vector() {
+  constexpr std::uint8_t vec[] = {0xa5, 0x61, 0x61, 0x61, 0x41, 0x61, 0x62, 0x61, 0x42, 0x61, 0x63,
+                                   0x61, 0x43, 0x61, 0x64, 0x61, 0x44, 0x61, 0x65, 0x61, 0x45};
+  const auto d = decode_value(vec);
+  if (!d) return false;
+  const auto& entries = std::get<std::vector<std::pair<CborValue, CborValue>>>(d->first.data);
+  if (entries.size() != 5) return false;
+  const auto& last_value = std::get<CborValue::OwnedString>(entries[4].second.data);
+  return last_value.content.size() == 1 && last_value.content[0] == 'E' && d->second == sizeof(vec);
+}
+static_assert(test_decode_map_matches_five_key_vector());
+
 // RejectDuplicateKeys (the default) must fail the whole map's decode.
 consteval bool test_decode_map_default_policy_rejects_duplicate_keys() {
   using namespace CompileTimeUnitTesting;

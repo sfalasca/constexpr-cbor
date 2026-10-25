@@ -260,9 +260,13 @@ constexpr std::optional<DecodedBytes> decode_text_string(std::span<const std::ui
 // ---------------------------------------------------------------------------
 // Major type 7: floats, booleans, null, undefined.
 struct DecodedSimple {
-  enum class Kind { False, True, Null, Undefined, Float };
+  // Simple covers additional info 0-19 (unassigned simple values, still
+  // well-formed and decodable per RFC 8949, just with no defined meaning)
+  // and the one-byte form (additional info 24, for simple values 32-255).
+  enum class Kind { False, True, Null, Undefined, Float, Simple };
   Kind kind;
   double as_double = 0.0;
+  std::uint8_t simple_value = 0;
   std::size_t bytes_consumed = 0;
 };
 
@@ -294,6 +298,9 @@ constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_
     return std::nullopt;
   }
   const std::uint8_t additional_info = bytes[0] & 0x1f;
+  if (additional_info <= 19) {
+    return DecodedSimple{.kind = DecodedSimple::Kind::Simple, .simple_value = additional_info, .bytes_consumed = 1};
+  }
   switch (additional_info) {
     case 20:
       return DecodedSimple{.kind = DecodedSimple::Kind::False, .bytes_consumed = 1};
@@ -303,6 +310,10 @@ constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_
       return DecodedSimple{.kind = DecodedSimple::Kind::Null, .bytes_consumed = 1};
     case 23:
       return DecodedSimple{.kind = DecodedSimple::Kind::Undefined, .bytes_consumed = 1};
+    case 24: {
+      if (bytes.size() < 2) return std::nullopt;
+      return DecodedSimple{.kind = DecodedSimple::Kind::Simple, .simple_value = bytes[1], .bytes_consumed = 2};
+    }
     case 25: {
       if (bytes.size() < 3) return std::nullopt;
       const auto value_bytes = bytes.subspan(1, 2);
@@ -325,7 +336,7 @@ constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_
       return DecodedSimple{.kind = DecodedSimple::Kind::Float, .as_double = std::bit_cast<double>(bits), .bytes_consumed = 9};
     }
     default:
-      return std::nullopt;  // unassigned simples (0-19), simple(n) in next byte (24), reserved (28-30), break (31)
+      return std::nullopt;  // reserved (28-30), break (31): not well-formed outside an indefinite-length context
   }
 }
 
@@ -349,6 +360,25 @@ struct CborValue {
     std::vector<CborValue> value;  // always exactly one element
     friend constexpr bool operator==(const Tag&, const Tag&) = default;
   };
+  // Tags 2 and 3 (positive/negative bignum, RFC 8949 Section 3.4.3) are
+  // recognized automatically rather than left as an opaque Tag wrapping a
+  // byte string: major types 0/1 are wire-format-limited to 64-bit
+  // magnitude (no length marker wider than 8 bytes exists), and this is
+  // CBOR's actual mechanism for integers past that ceiling, not a detail
+  // worth hiding behind a generic tag number a caller has to know to
+  // interpret. value == magnitude (tag 2) or -1 - magnitude (tag 3),
+  // mirroring NegativeInt's own -1-n convention.
+  struct BigNum {
+    bool negative;
+    std::vector<std::uint8_t> magnitude;  // big-endian
+    friend constexpr bool operator==(const BigNum&, const BigNum&) = default;
+  };
+  // additional info 0-19 (unassigned, still well-formed) or 24 (one-byte
+  // form, for 32-255): a simple value with no defined meaning of its own.
+  struct SimpleValue {
+    std::uint8_t number;
+    friend constexpr bool operator==(const SimpleValue&, const SimpleValue&) = default;
+  };
 
   std::variant<std::monostate,              // Undefined
                std::nullptr_t,               // Null
@@ -356,6 +386,8 @@ struct CborValue {
                std::uint64_t,                // UnsignedInt
                NegativeInt,                  // NegativeInt
                OwnedString,                  // ByteString or TextString
+               BigNum,                       // Tag 2/3: integer magnitude beyond 64 bits
+               SimpleValue,                  // Unassigned/extended simple value
                double,                       // Float
                std::vector<CborValue>,       // Array
                std::vector<std::pair<CborValue, CborValue>>,  // Map
@@ -545,6 +577,14 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
       if (!len) return std::nullopt;
       const auto nested = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(bytes.subspan(len->bytes_consumed), depth + 1);
       if (!nested) return std::nullopt;
+      if (len->value == 2 || len->value == 3) {
+        if (const auto* bytes_value = std::get_if<CborValue::OwnedString>(&nested->first.data);
+            bytes_value && bytes_value->kind == CborValue::StringKind::Bytes) {
+          return std::pair{CborValue{.data = CborValue::BigNum{.negative = (len->value == 3),
+                                                                 .magnitude = bytes_value->content}},
+                            len->bytes_consumed + nested->second};
+        }
+      }
       std::vector<CborValue> wrapped;
       wrapped.push_back(std::move(nested->first));
       return std::pair{CborValue{.data = CborValue::Tag{.number = len->value, .value = std::move(wrapped)}},
@@ -565,6 +605,8 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
           return std::pair{CborValue{.data = std::monostate{}}, s->bytes_consumed};
         case K::Float:
           return std::pair{CborValue{.data = s->as_double}, s->bytes_consumed};
+        case K::Simple:
+          return std::pair{CborValue{.data = CborValue::SimpleValue{.number = s->simple_value}}, s->bytes_consumed};
       }
       return std::nullopt;
     }
@@ -723,6 +765,17 @@ constexpr std::vector<std::uint8_t> encode_value(const CborValue& value) {
         } else if constexpr (std::is_same_v<T, CborValue::OwnedString>) {
           return (v.kind == CborValue::StringKind::Bytes) ? encode_byte_string(v.content)
                                                             : encode_text_string(v.content);
+        } else if constexpr (std::is_same_v<T, CborValue::SimpleValue>) {
+          if (v.number <= 23) {
+            return std::vector<std::uint8_t>{static_cast<std::uint8_t>(0xe0 | v.number)};
+          }
+          return std::vector<std::uint8_t>{0xf8, v.number};
+        } else if constexpr (std::is_same_v<T, CborValue::BigNum>) {
+          std::vector<std::uint8_t> out;
+          append_header(out, 6, v.negative ? std::uint64_t{3} : std::uint64_t{2});
+          const auto bignum_bytes = encode_byte_string(v.magnitude);
+          out.insert(out.end(), bignum_bytes.begin(), bignum_bytes.end());
+          return out;
         } else if constexpr (std::is_same_v<T, double>) {
           return encode_float(v);
         } else if constexpr (std::is_same_v<T, std::vector<CborValue>>) {

@@ -40,6 +40,16 @@ foreach(src ${positive_test_sources})
     add_test(NAME ${name} COMMAND ${name})
 endforeach()
 
+# noexcept_tests.cpp: proves the decoder/encoder surface compiles under
+# -fno-exceptions -fno-rtti (several embedded toolchains, ESP-IDF's default
+# among them, build this way). Compile-only, like the sibling library's own
+# convention: standalone (no compile_time_ut dependency), so it matches
+# exactly what the bare-metal docker images build.
+add_library(noexcept_tests OBJECT noexcept_tests.cpp)
+target_link_libraries(noexcept_tests PRIVATE constexpr_cbor cbor_warnings)
+target_compile_options(noexcept_tests PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-fno-exceptions -fno-rtti>)
+
 # --- Expected-compile-failure test helpers (copied from compile_time_ut's
 # own tests/CMakeLists.txt convention) ---
 

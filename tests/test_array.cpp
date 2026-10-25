@@ -57,6 +57,18 @@ constexpr bool test_decode_array_matches_25_element_vector() {
 }
 static_assert(test_decode_array_matches_25_element_vector());
 
+// RFC 8949 Appendix A: ["a", {"b": "c"}] -> 0x826161a161626163
+constexpr bool test_decode_array_holding_a_map() {
+  constexpr std::uint8_t vec[] = {0x82, 0x61, 0x61, 0xa1, 0x61, 0x62, 0x61, 0x63};
+  const auto d = decode_value(vec);
+  if (!d) return false;
+  const auto& items = std::get<std::vector<CborValue>>(d->first.data);
+  if (items.size() != 2) return false;
+  const auto& map_entries = std::get<std::vector<std::pair<CborValue, CborValue>>>(items[1].data);
+  return map_entries.size() == 1 && d->second == sizeof(vec);
+}
+static_assert(test_decode_array_holding_a_map());
+
 consteval bool test_decode_array_refuses_truncated_input() {
   using namespace CompileTimeUnitTesting;
   constexpr std::uint8_t truncated[] = {0x83, 0x01, 0x02};  // declares 3 items, only 2 present
