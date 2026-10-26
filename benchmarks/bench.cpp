@@ -12,12 +12,15 @@
 // that only a separate translation unit avoids; see that adapter's own
 // comment.
 #include <malloc.h>
+#include <sched.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -297,10 +300,28 @@ struct Payload {
   int iterations;
 };
 
+// A single timed pass is vulnerable to exactly the kind of noise this is
+// meant to guard against: anything that preempts this process mid-loop
+// (another process stealing the core, a page fault, a scheduler
+// migration) can only ever make a pass *slower*, never faster, so one
+// bad pass silently inflates a single-sample average with no way to
+// detect it. kRounds independent timed passes per library, each
+// reporting {min, max}, fixes this the standard way (the same technique
+// hyperfine/criterion/google-benchmark use): the *minimum* across many
+// independent passes estimates the undisturbed cost, since a disturbance
+// can only push a given pass's time up, and as long as it doesn't hit
+// every single pass, the minimum is unaffected by it. {min, max} is
+// reported, not just min, so a suspiciously wide spread is visible
+// instead of hidden behind a falsely precise-looking single number.
+struct TimingStats {
+  double min_ns;
+  double max_ns;
+};
+
+constexpr int kRounds = 9;
+
 template <typename F>
-double time_ns_per_call(F&& f, int iterations) {
-  // Warm up (page faults, branch predictor, etc.) before timing.
-  for (int i = 0; i < 5; ++i) f();
+double time_one_round_ns_per_call(F&& f, int iterations) {
   const auto start = std::chrono::steady_clock::now();
   for (int i = 0; i < iterations; ++i) f();
   const auto end = std::chrono::steady_clock::now();
@@ -338,22 +359,83 @@ void run_payload(const Payload& p) {
   std::printf("  qcbor bytes allocated/decode:    %lld\n", qcbor_r.bytes_allocated);
   std::printf("  libcbor bytes allocated/decode:  %lld\n", libcbor_r.bytes_allocated);
 
-  const double heap_ns = time_ns_per_call([&] { (void)decode_heap(bytes); }, p.iterations);
-  const double arena_ns = time_ns_per_call([&] { (void)decode_arena(pool, bytes); }, p.iterations);
-  const double tiny_ns = time_ns_per_call([&] { (void)decode_tinycbor(bytes); }, p.iterations);
-  const double qcbor_ns = time_ns_per_call([&] { (void)decode_qcbor(bytes); }, p.iterations);
-  const double libcbor_ns = time_ns_per_call([&] { (void)decode_libcbor_checksum(bytes); }, p.iterations);
+  // iterations/kRounds per round, same total work as one pass at
+  // p.iterations would have done, just split across kRounds independent
+  // passes so a transient disturbance can only spoil whichever round it
+  // happens to land in, not the one-and-only measurement.
+  const int iters = std::max(200, p.iterations / kRounds);
 
-  std::printf("  ns/decode: heap=%.0f arena=%.0f tinycbor=%.0f qcbor=%.0f libcbor=%.0f\n", heap_ns, arena_ns, tiny_ns,
-              qcbor_ns, libcbor_ns);
-  std::printf("  MB/s:      heap=%.1f arena=%.1f tinycbor=%.1f qcbor=%.1f libcbor=%.1f\n", p.len / (heap_ns * 1e-3),
-              p.len / (arena_ns * 1e-3), p.len / (tiny_ns * 1e-3), p.len / (qcbor_ns * 1e-3),
-              p.len / (libcbor_ns * 1e-3));
+  TimingStats heap_t{std::numeric_limits<double>::infinity(), 0.0};
+  TimingStats arena_t = heap_t, tiny_t = heap_t, qcbor_t = heap_t, libcbor_t = heap_t;
+
+  // A few untimed warmup calls per library first (page faults, branch
+  // predictor, icache) -- done once, outside any of the timed rounds,
+  // rather than re-warming inside every round.
+  for (int i = 0; i < 5; ++i) {
+    (void)decode_heap(bytes);
+    (void)decode_arena(pool, bytes);
+    (void)decode_tinycbor(bytes);
+    (void)decode_qcbor(bytes);
+    (void)decode_libcbor_checksum(bytes);
+  }
+
+  for (int round = 0; round < kRounds; ++round) {
+    // Interleaved within each round (heap, then arena, then tinycbor,
+    // ...) rather than running all kRounds for one library before moving
+    // to the next: that way a disturbance during round N affects every
+    // library's round-N measurement roughly equally, instead of being
+    // concentrated entirely onto whichever single library happened to be
+    // running for its own, uninterrupted, exclusively-timed block.
+    const double h = time_one_round_ns_per_call([&] { (void)decode_heap(bytes); }, iters);
+    heap_t.min_ns = std::min(heap_t.min_ns, h);
+    heap_t.max_ns = std::max(heap_t.max_ns, h);
+    const double a = time_one_round_ns_per_call([&] { (void)decode_arena(pool, bytes); }, iters);
+    arena_t.min_ns = std::min(arena_t.min_ns, a);
+    arena_t.max_ns = std::max(arena_t.max_ns, a);
+    const double t = time_one_round_ns_per_call([&] { (void)decode_tinycbor(bytes); }, iters);
+    tiny_t.min_ns = std::min(tiny_t.min_ns, t);
+    tiny_t.max_ns = std::max(tiny_t.max_ns, t);
+    const double q = time_one_round_ns_per_call([&] { (void)decode_qcbor(bytes); }, iters);
+    qcbor_t.min_ns = std::min(qcbor_t.min_ns, q);
+    qcbor_t.max_ns = std::max(qcbor_t.max_ns, q);
+    const double l = time_one_round_ns_per_call([&] { (void)decode_libcbor_checksum(bytes); }, iters);
+    libcbor_t.min_ns = std::min(libcbor_t.min_ns, l);
+    libcbor_t.max_ns = std::max(libcbor_t.max_ns, l);
+  }
+
+  // Reported as min (the trustworthy, least-disturbed estimate) with the
+  // max alongside it so a wide min-max spread -- a sign this particular
+  // run was noisy -- is visible instead of hidden behind one falsely
+  // precise-looking number.
+  std::printf("  ns/decode (min, over %d rounds of %d calls): heap=%.0f arena=%.0f tinycbor=%.0f qcbor=%.0f "
+              "libcbor=%.0f\n",
+              kRounds, iters, heap_t.min_ns, arena_t.min_ns, tiny_t.min_ns, qcbor_t.min_ns, libcbor_t.min_ns);
+  std::printf("  ns/decode (max, same rounds -- spread vs. min is this run's noise):"
+              " heap=%.0f arena=%.0f tinycbor=%.0f qcbor=%.0f libcbor=%.0f\n",
+              heap_t.max_ns, arena_t.max_ns, tiny_t.max_ns, qcbor_t.max_ns, libcbor_t.max_ns);
+  std::printf("  MB/s (from min): heap=%.1f arena=%.1f tinycbor=%.1f qcbor=%.1f libcbor=%.1f\n",
+              p.len / (heap_t.min_ns * 1e-3), p.len / (arena_t.min_ns * 1e-3), p.len / (tiny_t.min_ns * 1e-3),
+              p.len / (qcbor_t.min_ns * 1e-3), p.len / (libcbor_t.min_ns * 1e-3));
 }
 
 }  // namespace
 
 int main() {
+  // Pin this process to a single core before any timing happens, so the
+  // scheduler can't migrate it mid-measurement (a migration mid-round
+  // shows up as pure noise indistinguishable from CPU load, and this
+  // benchmark is Linux-only already via the Docker image, so this is a
+  // real fix, not a best-effort one, in the environment that matters
+  // here -- it does nothing to protect against *other* processes
+  // contending for that same core, which the min-of-kRounds timing
+  // approach is what actually guards against).
+  cpu_set_t cpu_set;
+  CPU_ZERO(&cpu_set);
+  CPU_SET(0, &cpu_set);
+  if (sched_setaffinity(0, sizeof(cpu_set), &cpu_set) != 0) {
+    std::printf("(note: sched_setaffinity failed, continuing unpinned -- timing noise may be higher)\n");
+  }
+
   const Payload payloads[] = {
       {"small", small_bytes, small_len, 200000},
       {"medium", medium_bytes, medium_len, 5000},

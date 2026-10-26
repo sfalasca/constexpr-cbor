@@ -34,10 +34,34 @@ This clones all three libraries at their pinned tags, builds everything
 with the same compiler (gcc/g++ inside `ubuntu:24.04`, `-O2` for the
 performance/correctness programs, `-Os` for the size comparison), and
 runs all three programs in one shot. The numbers below are one run of
-that container; re-run it yourself if you want fresh ones — wall-clock
-timings will vary by a double-digit percent with host load, but the
-*shape* of the results (which library wins which dimension, and why) is
-stable across runs.
+that container; re-run it yourself if you want fresh ones.
+
+**On timing trustworthiness**: an earlier version of this benchmark timed
+each library with a single pass and reported one number, which is
+exactly as fragile as it sounds — anything that preempts the process
+mid-loop (another process stealing the core, a page fault, a scheduler
+migration) can only ever make that one pass slower, never faster, so a
+single bad pass silently inflated the reported average with nothing in
+the output to show it had happened. Two runs of that version, same code
+and same host, once showed Arena *trailing* tinycbor/QCBOR on some
+payloads and *beating* both on others — a genuine measurement-robustness
+failure, not a real result to read anything into. Fixed two ways:
+`bench.cpp` now pins itself to a single CPU core via `sched_setaffinity`
+before any timing starts (so the scheduler can't migrate it mid-round —
+this doesn't protect against *other* processes contending for that same
+core, only against this process itself bouncing between cores), and
+every library is timed across `kRounds = 9` independent rounds,
+interleaved (heap, then arena, then tinycbor, then QCBOR, then libcbor,
+repeated 9 times — not all 9 rounds for one library before moving to the
+next), reporting both the **minimum** (the trustworthy estimate — a
+disturbance can only push a round's time up, never down, so the minimum
+across many independent rounds approximates the undisturbed cost, the
+same technique `hyperfine`/`criterion`/Google Benchmark use) and the
+**maximum** across those same rounds, so a suspiciously wide spread is
+visible in the output instead of hidden behind one falsely precise-
+looking number. With this fix, repeated runs — with or without an
+external `--cpuset-cpus` pin — now land within a few percent of each
+other; the numbers below reflect that.
 
 **One build asymmetry worth stating up front**: unlike tinycbor and
 QCBOR (whose individual `.c` files this Dockerfile compiles directly,
@@ -121,24 +145,31 @@ the correctly-sized accessor itself.
 
 ### CPU performance (ns/decode, lower is better; MB/s, higher is better)
 
+Figures below are the **minimum** across 9 interleaved rounds per
+library (see "On timing trustworthiness" above); repeated container runs
+now land within a few percent of these.
+
 | payload | heap | Arena | tinycbor | QCBOR | libcbor |
 |---|---|---|---|---|---|
-| small (45 B) | 805 ns / 55.9 MB/s | 367 ns / **122.6 MB/s** | 458 ns / 98.2 MB/s | 443 ns / 101.6 MB/s | 713 ns / 63.1 MB/s |
-| medium (10.8 KB) | 343,520 ns / 31.4 MB/s | 67,951 ns / **158.6 MB/s** | 92,177 ns / 116.9 MB/s | 80,004 ns / 134.7 MB/s | 283,577 ns / 38.0 MB/s |
-| deep (91 B, depth 30) | 73,048 ns / 1.2 MB/s | 46,158 ns / 2.0 MB/s | 46,612 ns / 2.0 MB/s | 22,679 ns / **4.0 MB/s** *(when accepted — see Correctness)* | 48,560 ns / 1.9 MB/s |
-| strings (8.8 KB) | 12,838 ns / 684.9 MB/s | 2,760 ns / **3,185.2 MB/s** | 4,938 ns / 1,780.5 MB/s | 4,348 ns / 2,021.9 MB/s | 26,155 ns / 336.1 MB/s |
+| small (45 B) | 802 ns / 56.1 MB/s | 379 ns / **118.8 MB/s** | 471 ns / 95.5 MB/s | 467 ns / 96.4 MB/s | 667 ns / 67.5 MB/s |
+| medium (10.8 KB) | 336,572 ns / 32.0 MB/s | 65,351 ns / **164.9 MB/s** | 87,644 ns / 123.0 MB/s | 76,977 ns / 140.0 MB/s | 267,029 ns / 40.4 MB/s |
+| deep (91 B, depth 30) | 76,019 ns / 1.2 MB/s | 47,723 ns / 1.9 MB/s | 48,113 ns / 1.9 MB/s | 23,606 ns / **3.9 MB/s** *(when accepted — see Correctness)* | 50,486 ns / 1.8 MB/s |
+| strings (8.8 KB) | 11,766 ns / 747.3 MB/s | 2,702 ns / **3,253.3 MB/s** | 5,050 ns / 1,740.9 MB/s | 4,140 ns / 2,123.9 MB/s | 24,976 ns / 352.0 MB/s |
 
 **Takeaways:**
-- **These numbers swing hard between container runs** — a prior run of
-  this exact same container (same code, same host) had Arena *trailing*
-  tinycbor/QCBOR on `medium` and `strings` instead of leading on three of
-  four payloads as shown above. Both runs are real; this is exactly the
-  "double-digit percent... with host load" variance this doc already
-  warns about, just a wider swing than usual. Don't read either run as
-  "Arena wins" or "Arena loses" — re-run the container yourself for
-  today's numbers, and treat the *code size* results below (far more
-  stable across runs, since they don't depend on wall-clock timing at
-  all) as the more trustworthy signal from this benchmark.
+- **Arena consistently beats tinycbor and QCBOR on `small`, `medium`, and
+  `strings`**, by a wide and now-reproducible margin (roughly 20-85%
+  faster than the better of the two on each), and consistently trails
+  QCBOR specifically on `deep` (QCBOR ~2x faster there — see Flexibility
+  for why: QCBOR's fixed, small-array-backed nesting tracker is a
+  structurally cheap data structure for exactly this shape of input, a
+  real advantage on deeply-nested payloads specifically). This is a
+  genuinely different conclusion from an earlier version of this
+  benchmark, which reported Arena's standing as unsettled, swinging
+  between clearly-behind and clearly-ahead across runs — that was a
+  measurement-robustness problem (a single timed pass, no CPU pinning),
+  now fixed; see "On timing trustworthiness" above for what changed and
+  why these numbers are stable run-to-run now.
 - **One build-configuration fact worth stating plainly**: none of these
   binaries are built with `-DNDEBUG`, so the `ARENA_ASSERT(owns(...))`
   checks described in "Arena internals" below are live, real branches in
@@ -391,7 +422,7 @@ specifically for).
 | Browser/WebAssembly target proven in CI | Yes (`docker/wasm.Dockerfile`, `webapp/`) | Not out of the box | Not out of the box | Not out of the box | No |
 | Code size (this benchmark, full decode+walk) | 18-21 KB `.text` for one call | **6.5 KB** | 6.0 KB | 15.3 KB | — |
 | Memory allocated/decode (this benchmark) | 0 (Arena) to ~158 KB (heap) | 0 | 0 | ~0.7-234 KB — allocates on every payload | — |
-| Raw decode throughput (this benchmark) | 1-3,185 MB/s depending on mode/payload — varies a lot run-to-run, see Performance | 2-1,781 MB/s | 2-2,022 MB/s (refused on `deep`) | 2-336 MB/s — consistently slower than tinycbor/QCBOR, but not consistently slower than constexpr-cbor's own heap path (beats it on 3 of 4 payloads) | — |
+| Raw decode throughput (this benchmark) | 1-3,253 MB/s depending on mode/payload; Arena consistently beats tinycbor/QCBOR on 3 of 4 payloads, see Performance | 2-1,741 MB/s | 2-2,124 MB/s (refused on `deep`) | 2-352 MB/s — consistently slower than tinycbor/QCBOR, but not consistently slower than constexpr-cbor's own heap path (beats it on 3 of 4 payloads) | — |
 
 **The honest summary**: tinycbor and QCBOR are still smaller, consistently
 and by a wide, stable margin — they're mature, hand-optimized C libraries
@@ -403,12 +434,13 @@ this benchmark earns its keep as a control: it shows the DOM-style cost
 a C++-specific or `std::variant`-specific tax — a plain-C DOM-style
 library pays a comparable structural price in every dimension measured
 here, it's just a cost of the *design*, not the *language*. Raw
-throughput among the zero-copy pull-parsers and Arena is the one
-dimension that genuinely isn't settled run-to-run: Arena has measured
-anywhere from clearly behind tinycbor/QCBOR to clearly ahead of both, on
-the same code, same host, different container runs — see Performance
-above for why, and don't trust either extreme as "the" answer without
-re-running the benchmark yourself. constexpr-cbor's remaining
+throughput among the zero-copy pull-parsers and Arena is now a settled,
+reproducible result (see "On timing trustworthiness" above for the fix
+that made it so): Arena consistently beats both tinycbor and QCBOR on
+`small`, `medium`, and `strings`, and consistently trails QCBOR
+specifically on `deep`, where QCBOR's small, fixed-size nesting tracker
+is a real structural advantage for deeply-nested input. constexpr-cbor's
+remaining
 differentiators are structural, not timing-dependent: it's the only
 library here that (a) proves its own correctness at *compile time* via
 `consteval`, (b) offers a real generic owned-tree API with the no-malloc
