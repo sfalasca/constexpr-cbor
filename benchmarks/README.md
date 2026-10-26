@@ -151,19 +151,24 @@ the correctly-sized accessor itself.
   real regardless of which way a given run's wall-clock numbers lean. This
   isn't something constexpr-cbor is trying to beat across the board; see
   Flexibility, below, for what it's trading that speed for.
-- **libcbor is consistently the slowest of the three C libraries, and
-  often slower than constexpr-cbor's own heap path** — on `strings` it's
-  roughly 2x slower than heap and ~10x slower than Arena. This lines up
-  with it being the one C library here that's also DOM-style: it pays for
-  real heap allocation per node (see Memory usage below) *and* reference
-  counting (`cbor_incref`/`cbor_decref` bookkeeping on every item) on top
-  of that, neither of which tinycbor/QCBOR's pull-parsing or Arena's
-  no-malloc design ever pays.
-- The **heap path is consistently among the slowest** — real heap
-  allocation per node, not just per string, plus `std::vector` growth —
-  though libcbor's own allocation-plus-refcounting overhead means it
-  isn't always strictly the slowest of all five anymore now that libcbor
-  is in the comparison (see `strings` above).
+- **libcbor is consistently slower than tinycbor and QCBOR specifically,
+  on every payload** — but it is *not* consistently slower than
+  constexpr-cbor's own heap path: it actually beats heap on `small`,
+  `medium`, and `deep`, and only trails it on `strings` (roughly 2x
+  slower than heap there, ~10x slower than Arena). The consistent
+  pattern is against the two pull-parsers, not against every other path
+  in this benchmark. This lines up with libcbor being the one C library
+  here that's also DOM-style: it pays for real heap allocation per node
+  (see Memory usage below) *and* reference counting
+  (`cbor_incref`/`cbor_decref` bookkeeping on every item) on top of that,
+  neither of which tinycbor/QCBOR's pull-parsing or Arena's no-malloc
+  design ever pays.
+- The **heap path is often among the slowest, but not on every
+  payload now that libcbor is in the comparison** — real heap allocation
+  per node, not just per string, plus `std::vector` growth, usually costs
+  more than libcbor's own allocation-plus-refcounting overhead, except on
+  `strings`, where libcbor's per-item refcounting evidently scales worse
+  than heap's allocation pattern does.
 
 ### Arena internals: from index-based to pointer-based
 
@@ -386,7 +391,7 @@ specifically for).
 | Browser/WebAssembly target proven in CI | Yes (`docker/wasm.Dockerfile`, `webapp/`) | Not out of the box | Not out of the box | Not out of the box | No |
 | Code size (this benchmark, full decode+walk) | 18-21 KB `.text` for one call | **6.5 KB** | 6.0 KB | 15.3 KB | — |
 | Memory allocated/decode (this benchmark) | 0 (Arena) to ~158 KB (heap) | 0 | 0 | ~0.7-234 KB — allocates on every payload | — |
-| Raw decode throughput (this benchmark) | 1-3,185 MB/s depending on mode/payload — varies a lot run-to-run, see Performance | 2-1,781 MB/s | 2-2,022 MB/s (nothing on `deep`, refused) | 2-336 MB/s — consistently slowest of the four libraries | — |
+| Raw decode throughput (this benchmark) | 1-3,185 MB/s depending on mode/payload — varies a lot run-to-run, see Performance | 2-1,781 MB/s | 2-2,022 MB/s (refused on `deep`) | 2-336 MB/s — consistently slower than tinycbor/QCBOR, but not consistently slower than constexpr-cbor's own heap path (beats it on 3 of 4 payloads) | — |
 
 **The honest summary**: tinycbor and QCBOR are still smaller, consistently
 and by a wide, stable margin — they're mature, hand-optimized C libraries

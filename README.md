@@ -461,8 +461,10 @@ state machines, no dynamic dispatch); raw decode throughput among the
 pull-parsers and Arena is the one dimension that swings hard between runs
 on the same host — the no-malloc Arena mode has measured anywhere from
 clearly behind both to clearly ahead of both, while libcbor is
-consistently the slowest of the four libraries, line for line with it
-being the one other library here that also allocates. constexpr-cbor's
+consistently slower than tinycbor/QCBOR specifically (it being the one
+other library here that also allocates), though not consistently slower
+than constexpr-cbor's own heap path — it beats heap on three of the four
+payloads, only trailing it on the string-heavy one. constexpr-cbor's
 case is compile-time-proven correctness, a real zero-malloc mode *and* a
 generic owned-tree mode as equally first-class options, and
 caller-tunable nesting depth/UTF-8 validation/duplicate-key policy where
