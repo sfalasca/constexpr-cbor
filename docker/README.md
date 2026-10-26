@@ -74,3 +74,29 @@ rather than vendoring it or assuming it's reachable some other way.
 | `esp32.Dockerfile` | ESP32 (Xtensa) | `xtensa-esp32-elf-g++` (GCC 14.2.0) via official `espressif/idf` image | `-fno-exceptions` matches ESP-IDF's own default (`CONFIG_COMPILER_CXX_EXCEPTIONS` off) |
 | `stm32.Dockerfile` | Cortex-M4 (STM32F4-class) | `arm-none-eabi-g++` 13.2.1 (apt) | Needs `libstdc++-arm-none-eabi-newlib`/`libnewlib-dev` explicitly; they're apt `Recommends`, not `Depends`, of `gcc-arm-none-eabi` |
 | `riscv32.Dockerfile` | rv32imac/ilp32 (CH32V/GD32VF103-class) | xPack prebuilt `riscv-none-elf-gcc` 15.2.0 | Ubuntu's `gcc-riscv64-unknown-elf` apt package ships **no libstdc++ at all** (not even `<cstddef>` resolves), which is why this uses xPack's prebuilt tarball instead |
+
+## WebAssembly (`wasm.Dockerfile`)
+
+Not a compile-check-only target like the three above: WASM is a fully
+capable target that can link and run, so this one builds via `emcmake`/
+`emmake` and runs the **full ctest suite** under Node
+(`CMAKE_CROSSCOMPILING_EMULATOR=node`) through `emscripten/emsdk`'s
+bundled Clang -- the same end-to-end proof the desktop gcc-*/clang-*
+images give, not just a compile-check.
+
+This is also the target that first caught a real, pre-existing
+portability bug: `std::size_t` is 32 bits wide on `wasm32` while
+`std::uint64_t` stays 64, and a few spots in the decoder were doing a
+plain, uncast `uint64_t -> size_t` initialization of an
+already-bounds-checked value -- deliberately uncast so GCC's
+`-Wuseless-cast` wouldn't fire on a 64-bit target, where the two types
+are identical. None of GCC's own `-Wconversion` output, across the
+entire embedded matrix above (all three of which are also 32-bit
+targets), ever flagged this, because it's specifically Clang's
+`-Wshorten-64-to-32` (folded into `-Wconversion` there) that catches it
+-- this was the first 32-bit *Clang* target in the matrix. Fixed with a
+small `ConstexprCbor::detail::narrow<To>(From)` helper (in
+`constexpr_cbor.hpp`) that only emits a `static_cast` when `To` and
+`From` genuinely differ, so it's silent on both sides: a no-op copy
+when they're the same type, a real, intentional narrowing cast when
+they're not.

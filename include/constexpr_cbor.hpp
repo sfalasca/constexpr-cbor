@@ -39,6 +39,28 @@ struct NegativeInt {
   }
 };
 
+namespace detail {
+// Narrows an already-bounds-checked value from `From` to `To`, without
+// ever writing a cast that's a no-op on some target and a real narrowing
+// on another. size_t and uint64_t are the identical type on a 64-bit
+// target (where a static_cast between them is a literal no-op GCC's
+// -Wuseless-cast flags), but genuinely different widths on a 32-bit one
+// (wasm32 via Emscripten, or a 32-bit embedded target) -- there, the
+// static_cast is the correct, intentional way to perform a value that's
+// already been proven in-range, not an accident -Wshorten-64-to-32 (part
+// of Clang's -Wconversion) should flag. if constexpr picks whichever of
+// those two is actually true for the target at hand, so only one of the
+// two ever exists in the compiled output.
+template <typename To, typename From>
+constexpr To narrow(From v) {
+  if constexpr (std::is_same_v<To, From>) {
+    return v;
+  } else {
+    return static_cast<To>(v);
+  }
+}
+}  // namespace detail
+
 // ---------------------------------------------------------------------------
 // The shared length-encoding primitive. additional_info 0-23 is a direct
 // value; 24/25/26/27 mean "the value is in the following 1/2/4/8 bytes."
@@ -248,7 +270,7 @@ constexpr std::optional<DecodedBytes> decode_byte_string(std::span<const std::ui
     return std::nullopt;
   }
   const std::size_t header_size = length_result->bytes_consumed;
-  const std::size_t length = length_result->value;
+  const std::size_t length = detail::narrow<std::size_t>(length_result->value);
   if (bytes.size() < header_size + length) {
     return std::nullopt;
   }
@@ -267,7 +289,7 @@ constexpr std::optional<DecodedBytes> decode_text_string(std::span<const std::ui
     return std::nullopt;
   }
   const std::size_t header_size = length_result->bytes_consumed;
-  const std::size_t length = length_result->value;
+  const std::size_t length = detail::narrow<std::size_t>(length_result->value);
   if (bytes.size() < header_size + length) {
     return std::nullopt;
   }

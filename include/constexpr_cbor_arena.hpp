@@ -307,20 +307,18 @@ constexpr std::optional<std::uint64_t> count_indefinite_map_pairs(std::span<cons
 // (the same refusal every other contract violation in this codec uses)
 // instead of truncating.
 constexpr std::optional<std::size_t> checked_node_count(std::uint64_t count, std::size_t multiplier = 1) {
-  // No explicit casts between uint64_t and size_t here, matching this
-  // header's own established style (decode_byte_string/decode_text_string
-  // do the same implicit-narrowing-init for an already-bounds-checked
-  // value): size_t and uint64_t are the identical type on a 64-bit
-  // target, which makes an explicit static_cast between them a literal
-  // no-op flagged by -Wuseless-cast, while on a 32-bit target the
-  // implicit conversion is exactly the narrowing this function exists to
-  // guard, not hide.
   const std::uint64_t size_max = std::numeric_limits<std::size_t>::max();
   const std::uint64_t wide_multiplier = multiplier;
   if (multiplier > 1 && count > size_max / wide_multiplier) return std::nullopt;
   if (count > size_max) return std::nullopt;
-  const std::size_t result = count * wide_multiplier;
-  return result;
+  // ConstexprCbor::detail::narrow, not a plain copy-init: size_t and
+  // uint64_t are the identical type on a 64-bit target (where an explicit
+  // static_cast between them is a literal no-op GCC's -Wuseless-cast
+  // flags), but genuinely different widths on a 32-bit one (wasm32 via
+  // Emscripten, or a 32-bit embedded target), where this is exactly the
+  // narrowing this function exists to guard, not hide -- narrow<>() picks
+  // whichever of those two is actually true for the target at hand.
+  return ConstexprCbor::detail::narrow<std::size_t>(count * wide_multiplier);
 }
 
 }  // namespace detail
@@ -491,12 +489,17 @@ constexpr std::optional<DecodedNode> decode_value(NodePool<MaxNodes, MaxBytes>& 
       if (!safe_count) return std::nullopt;
       const auto first_slot = pool.reserve_nodes(*safe_count);
       if (!first_slot) return std::nullopt;
-      for (std::uint64_t i = 0; i < count; ++i) {
+      // size_t loop counter, not uint64_t: count == *safe_count numerically
+      // (checked_node_count already proved count fits in size_t), so
+      // iterating directly in size_t avoids ever narrowing a uint64_t loop
+      // index into item_index -- the narrowing itself, not just the value,
+      // is what a 32-bit size_t target (e.g. wasm32 via Emscripten) flags,
+      // even though the value was always in range.
+      for (std::size_t i = 0; i < *safe_count; ++i) {
         if (consumed > bytes.size()) return std::nullopt;
         const auto item = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(pool, bytes.subspan(consumed), depth + 1);
         if (!item) return std::nullopt;
-        const std::size_t item_index = i;  // safe: i < count <= *safe_count, already size_t-bounds-checked
-        pool.nodes[*first_slot + item_index] = Node{.data = IndexCell{.actual_index = item->node_index}};
+        pool.nodes[*first_slot + i] = Node{.data = IndexCell{.actual_index = item->node_index}};
         consumed += item->bytes_consumed;
       }
       if (is_indefinite_or_break(bytes)) {

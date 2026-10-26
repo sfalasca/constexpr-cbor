@@ -83,6 +83,7 @@ jobs:
           - esp32
           - stm32
           - riscv32
+          - wasm
         # Kept building (not deleted) and intentionally allowed to fail,
         # each for its own distinct, checked reason documented in
         # docker/README.md -- this is this project's own
