@@ -9,3 +9,9 @@ Testing/
 *.swp
 compile_commands.json
 webapp/dist/
+benchmarks/tinycbor/
+benchmarks/qcbor/
+benchmarks/*.o
+benchmarks/bench
+benchmarks/correctness
+benchmarks/exe_*

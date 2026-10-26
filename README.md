@@ -401,6 +401,19 @@ server-side component: `docker build -t cbor-webapp -f webapp/Dockerfile .
 and exactly how CBOR concepts with no JSON equivalent (byte strings,
 bignums, tags, non-string map keys) are rendered.
 
+## Benchmarks
+
+`benchmarks/` compares this library against tinycbor and QCBOR on CPU
+performance, memory usage, correctness, and flexibility, with real
+numbers from a reproducible Docker build (`docker build -t cbor-bench -f
+benchmarks/Dockerfile . && docker run --rm cbor-bench`). Short version:
+tinycbor/QCBOR are faster and smaller (hand-tuned C state machines);
+constexpr-cbor's case is compile-time-proven correctness, a real
+zero-malloc mode *and* a generic owned-tree mode as equally first-class
+options, and caller-tunable nesting depth/UTF-8 validation/duplicate-key
+policy where the others hard-code one behavior. See `benchmarks/README.md`
+for the full numbers and methodology.
+
 ## Building and testing this library
 
 ```sh
