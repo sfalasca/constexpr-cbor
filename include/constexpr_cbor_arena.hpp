@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include "constexpr_cbor.hpp"
 
 // ---------------------------------------------------------------------------
@@ -112,7 +114,13 @@ struct NodePool {
   constexpr std::optional<std::size_t> allocate_bytes(std::span<const std::uint8_t> src) {
     if (src.size() > MaxBytes - byte_count) return std::nullopt;
     const std::size_t offset = byte_count;
-    for (const auto b : src) byte_arena[byte_count++] = b;
+    // std::copy over a contiguous range of a trivial type lowers to
+    // memmove at -O2 (unlike the equivalent index-and-increment loop,
+    // which a compiler is free to but isn't guaranteed to recognize the
+    // same way); std::copy is constexpr since C++20, so this stays valid
+    // in the consteval decode paths too.
+    std::copy(src.begin(), src.end(), byte_arena.begin() + static_cast<std::ptrdiff_t>(offset));
+    byte_count += src.size();
     return offset;
   }
 
