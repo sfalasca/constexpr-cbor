@@ -15,8 +15,8 @@ mkdir -p dist
 
 em++ -std=c++23 -O2 -I ../include \
     -sMODULARIZE=1 -sEXPORT_NAME=CborModule \
-    -sEXPORTED_FUNCTIONS=_cbor_to_json,_cbor_free_string,_malloc,_free \
-    -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,UTF8ToString \
+    -sEXPORTED_FUNCTIONS=_cbor_to_json,_cbor_free_string,_cbor_from_json,_cbor_free_bytes,_malloc,_free \
+    -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAPU32,UTF8ToString \
     -sALLOW_MEMORY_GROWTH=1 \
     -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Werror \
     bridge.cpp -o dist/cbor.js

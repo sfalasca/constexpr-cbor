@@ -72,21 +72,56 @@
       margin-top: 20px;
       display: none;
     }
+    #result-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
     #result h2 {
       font-size: 0.85rem;
       color: var(--muted);
       font-weight: 500;
-      margin: 0 0 8px;
+      margin: 0;
     }
-    pre#json {
+    #download-btn {
+      font-family: inherit;
+      font-size: 0.8rem;
+      color: var(--fg);
+      background: color-mix(in srgb, var(--fg) 8%, var(--bg));
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 12px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #download-btn:hover { border-color: var(--accent); }
+    #download-btn:disabled { opacity: 0.5; cursor: default; }
+    textarea#json {
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
       background: color-mix(in srgb, var(--fg) 5%, var(--bg));
+      color: var(--fg);
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 16px;
       overflow: auto;
+      font-family: inherit;
       font-size: 0.85rem;
       line-height: 1.5;
       white-space: pre;
+      resize: vertical;
+      min-height: 200px;
+    }
+    textarea#json:focus { outline: none; border-color: var(--accent); }
+    #encode-error {
+      margin-top: 8px;
+      color: var(--error);
+      white-space: pre-wrap;
+      font-size: 0.85rem;
+      display: none;
     }
     footer {
       margin-top: 32px;
@@ -100,7 +135,8 @@
   <main>
     <h1>constexpr-cbor viewer</h1>
     <p class="sub">
-      Open a .cbor file, see it decoded as JSON. Decoding runs entirely in
+      Open a .cbor file, see it decoded as JSON, edit it, and download the
+      edited JSON back as CBOR. Decoding and encoding both run entirely in
       your browser via WebAssembly &mdash; the file never leaves this page.
     </p>
 
@@ -114,8 +150,12 @@
     <div id="error"></div>
 
     <div id="result">
-      <h2 id="result-meta"></h2>
-      <pre id="json"></pre>
+      <div id="result-header">
+        <h2 id="result-meta"></h2>
+        <button id="download-btn" type="button">Download as CBOR</button>
+      </div>
+      <textarea id="json" spellcheck="false"></textarea>
+      <div id="encode-error"></div>
     </div>
 
     <footer>

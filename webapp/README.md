@@ -1,10 +1,11 @@
 # constexpr-cbor viewer
 
 A single static page: open a `.cbor` file (drag-and-drop or the file
-picker), see it decoded as pretty-printed JSON. Decoding runs entirely in
-the browser, via this library compiled to WebAssembly (`bridge.cpp` →
-`dist/cbor.{js,wasm}`) — the file you open never leaves the page, there is
-no server-side component once the page is loaded.
+picker), see it decoded as pretty-printed, **editable** JSON, and
+download your edits back out as CBOR. Decoding and encoding both run
+entirely in the browser, via this library compiled to WebAssembly
+(`bridge.cpp` → `dist/cbor.{js,wasm}`) — the file you open never leaves
+the page, there is no server-side component once the page is loaded.
 
 ## Running it
 
@@ -51,15 +52,38 @@ limits (e.g. nesting depth), is refused with a visible error — the same
 "refuse, don't crash" contract `decode_value` itself follows, not
 something layered on top by the viewer.
 
+## Editing and downloading as CBOR
+
+The decoded JSON is shown in an editable text area. Clicking **Download
+as CBOR** parses the current text and re-encodes it to canonical CBOR via
+`encode_value`, then downloads the result as `<original-name>-edited.cbor`.
+
+This reverses the conventions in the table above, with one asymmetry
+worth knowing about: a quoted digit string (`"18446744073709551616"`) is
+only read back as a bignum if its magnitude actually overflows 64 bits —
+a quoted string that happens to look like a small number (e.g. `"42"`)
+is read back as plain text, since that's what `to_json` itself would have
+produced for a real `42`. Map keys are always written back as text-string
+keys; round-tripping a non-string key isn't supported (editing in place
+after a decode that had one will silently turn it into a string key).
+Text matching neither a recognized convention nor plain JSON (unbalanced
+braces, trailing commas, etc.) is refused with a visible error, same
+"refuse, don't crash" contract as decoding.
+
 ## Files
 
-- `bridge.cpp` — the only C++ in this directory: one `extern "C"` function,
-  `cbor_to_json(const uint8_t* data, size_t len) -> char*`, decoding via
-  `ConstexprCbor::decode_value` and rendering the result as the JSON
-  described above. Returns `nullptr` on refusal; the caller owns the
-  returned string and must free it via the paired `cbor_free_string`.
+- `bridge.cpp` — the only C++ in this directory: `cbor_to_json(const
+  uint8_t* data, size_t len) -> char*` decodes via
+  `ConstexprCbor::decode_value` and renders the JSON described above
+  (`nullptr` on refusal; caller frees via `cbor_free_string`).
+  `cbor_from_json(const char* text, size_t len, size_t* out_len) ->
+  uint8_t*` reverses it — a small hand-written JSON parser (just enough to
+  invert the conventions above, not a general-purpose JSON library) feeds
+  `ConstexprCbor::encode_value` (`nullptr`/`*out_len == 0` on refusal;
+  caller frees via `cbor_free_bytes`).
 - `index.html` / `app.js` — the page itself: drag-and-drop/file-picker
-  wiring, no framework, no build step of their own.
+  wiring, the editable text area, the download button, no framework, no
+  build step of their own.
 - `build.sh` — the single source of truth for the `em++` invocation (also
   used by `Dockerfile`).
 - `Dockerfile` — builds `dist/` via `build.sh` in one stage, serves the
