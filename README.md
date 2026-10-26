@@ -445,19 +445,28 @@ bignums, tags, non-string map keys) are rendered.
 
 ## Benchmarks
 
-`benchmarks/` compares this library against tinycbor and QCBOR on CPU
-performance, memory usage, correctness, and flexibility, with real
+`benchmarks/` compares this library against tinycbor, QCBOR, and libcbor
+on CPU performance, memory usage, correctness, and flexibility, with real
 numbers from a reproducible Docker build (`docker build -t cbor-bench -f
-benchmarks/Dockerfile . && docker run --rm cbor-bench`). Short version:
-tinycbor/QCBOR are still smaller in code size, consistently and by a wide
-margin (hand-tuned C state machines, no `std::variant` dispatch); raw
-decode throughput is the one dimension that swings hard between runs on
-the same host — the no-malloc Arena mode has measured anywhere from
-clearly behind both to clearly ahead of both. constexpr-cbor's case is
-compile-time-proven correctness, a real zero-malloc mode *and* a generic
-owned-tree mode as equally first-class options, and caller-tunable
-nesting depth/UTF-8 validation/duplicate-key policy where the others
-hard-code one behavior. See
+benchmarks/Dockerfile . && docker run --rm cbor-bench`). tinycbor/QCBOR
+are pull-parsers, like this library's own no-malloc Arena mode; libcbor
+was added specifically because it's a DOM-style C library — the same
+owned-tree shape as this library's heap `CborValue` path — which turns
+out to be a useful control: libcbor pays a real, measured cost in every
+dimension (allocation, code size, speed) for that DOM-style shape, in
+plain C, confirming it's a cost of the *design*, not of C++ or
+`std::variant` specifically. Short version: tinycbor/QCBOR are still
+smaller in code size, consistently and by a wide margin (hand-tuned C
+state machines, no dynamic dispatch); raw decode throughput among the
+pull-parsers and Arena is the one dimension that swings hard between runs
+on the same host — the no-malloc Arena mode has measured anywhere from
+clearly behind both to clearly ahead of both, while libcbor is
+consistently the slowest of the four libraries, line for line with it
+being the one other library here that also allocates. constexpr-cbor's
+case is compile-time-proven correctness, a real zero-malloc mode *and* a
+generic owned-tree mode as equally first-class options, and
+caller-tunable nesting depth/UTF-8 validation/duplicate-key policy where
+the others hard-code one behavior. See
 `benchmarks/README.md` for the full numbers and methodology, including
 how Arena's internals moved from index-based to pointer-based
 indirection and what that did to code size.

@@ -1,12 +1,12 @@
-# Reproducible benchmark environment: clones pinned versions of tinycbor
-# and QCBOR, builds all three libraries' decoders plus this project's
-# own, and runs the CPU/memory benchmark, the cross-library correctness
-# corpus, and the code-size comparison in one shot. See README.md for
-# what each program actually measures and why.
+# Reproducible benchmark environment: clones pinned versions of tinycbor,
+# QCBOR, and libcbor, builds all four libraries' decoders plus this
+# project's own, and runs the CPU/memory benchmark, the cross-library
+# correctness corpus, and the code-size comparison in one shot. See
+# README.md for what each program actually measures and why.
 FROM ubuntu:24.04
 
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-    build-essential binutils ca-certificates git \
+    build-essential binutils ca-certificates git cmake \
     && rm -rf /var/lib/apt/lists/*
 
 COPY include /work/include
@@ -17,16 +17,38 @@ WORKDIR /work/benchmarks
 # happens to be the day someone rebuilds this image.
 RUN git clone --quiet --depth 1 --branch v0.6.1 https://github.com/intel/tinycbor.git tinycbor
 RUN git clone --quiet --depth 1 --branch v1.5.1 https://github.com/laurencelundblade/QCBOR.git qcbor
+RUN git clone --quiet --depth 1 --branch v0.14.0 https://github.com/PJK/libcbor.git libcbor
+
+# libcbor, unlike tinycbor/QCBOR, needs a real build step: its CMakeLists
+# generates a configuration.h and an export-macro header that don't exist
+# in the raw source tree. Static lib only, no examples/tests -- this one
+# build is reused for both the CPU/memory/correctness programs below and
+# the code-size comparison (unlike tinycbor/QCBOR, which get a *second*,
+# -Os-specific compile of their .c files for the size comparison -- see
+# benchmarks/README.md's "Arena internals"-adjacent methodology notes for
+# why libcbor's size number carries this one asymmetry honestly rather
+# than silently matching the others' rebuild-at--Os treatment).
+RUN cmake -S libcbor -B libcbor/build -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=OFF -DWITH_EXAMPLES=OFF >/dev/null && \
+    cmake --build libcbor/build --target cbor -j
 
 RUN gcc -std=c11 -O2 -Itinycbor/src -c tinycbor/src/cborparser.c -o tinycbor_parser.o && \
     gcc -std=c11 -O2 -Iqcbor/inc -c qcbor/src/qcbor_decode.c -o qcbor_decode.o && \
     gcc -std=c11 -O2 -Iqcbor/inc -c qcbor/src/UsefulBuf.c -o usefulbuf.o && \
     gcc -std=c11 -O2 -Iqcbor/inc -c qcbor/src/ieee754.c -o ieee754.o
 
+# libcbor_adapter.cpp is the *only* translation unit that includes
+# libcbor's own header -- it declares several C functions under the same
+# names tinycbor uses for different purposes (cbor_encode_uint and
+# friends), a genuine extern "C" symbol collision if both ever appear in
+# one TU. bench.cpp/correctness.cpp only ever see libcbor_adapter.hpp.
+RUN g++ -std=c++20 -O2 -Ilibcbor/src -Ilibcbor/build/src -Ilibcbor/build \
+    -c libcbor_adapter.cpp -o libcbor_adapter.o
+
 RUN g++ -std=c++20 -O2 -I../include -Itinycbor/src -Iqcbor/inc \
-    bench.cpp tinycbor_parser.o qcbor_decode.o usefulbuf.o ieee754.o -o bench
+    bench.cpp tinycbor_parser.o qcbor_decode.o usefulbuf.o ieee754.o libcbor_adapter.o libcbor/build/src/libcbor.a -o bench
 RUN g++ -std=c++20 -O2 -I../include -Itinycbor/src -Iqcbor/inc \
-    correctness.cpp tinycbor_parser.o qcbor_decode.o usefulbuf.o ieee754.o -o correctness
+    correctness.cpp tinycbor_parser.o qcbor_decode.o usefulbuf.o ieee754.o libcbor_adapter.o libcbor/build/src/libcbor.a -o correctness
 
 # Code-size comparison: dead-code-eliminated (-ffunction-sections +
 # --gc-sections) single-entry-point executable per library, so each
@@ -40,10 +62,13 @@ RUN g++ -std=c++20 -Os -ffunction-sections -fdata-sections -I../include -c size/
     gcc -std=c11 -Os -ffunction-sections -fdata-sections -Iqcbor/inc -c qcbor/src/qcbor_decode.c -o qd_gc.o && \
     gcc -std=c11 -Os -ffunction-sections -fdata-sections -Iqcbor/inc -c qcbor/src/UsefulBuf.c -o ub_gc.o && \
     gcc -std=c11 -Os -ffunction-sections -fdata-sections -Iqcbor/inc -c qcbor/src/ieee754.c -o ie_gc.o && \
+    gcc -std=c11 -Os -ffunction-sections -fdata-sections -Ilibcbor/src -Ilibcbor/build/src -Ilibcbor/build \
+        -c size/size_libcbor.c -o size_libcbor.o && \
     gcc -std=c11 -Os -ffunction-sections -fdata-sections -c size/size_main.c -o size_main.o && \
     g++ -Os -Wl,--gc-sections size_main.o size_cc.o -o exe_cc && \
     g++ -Os -Wl,--gc-sections size_main.o size_arena.o -o exe_arena && \
     gcc -Os -Wl,--gc-sections size_main.o size_tc.o tp_gc.o -o exe_tc && \
-    gcc -Os -Wl,--gc-sections size_main.o size_qc.o qd_gc.o ub_gc.o ie_gc.o -o exe_qc -lm
+    gcc -Os -Wl,--gc-sections size_main.o size_qc.o qd_gc.o ub_gc.o ie_gc.o -o exe_qc -lm && \
+    gcc -Os -Wl,--gc-sections size_main.o size_libcbor.o libcbor/build/src/libcbor.a -o exe_libcbor -lm
 
-CMD ["bash", "-c", "echo '=== CPU performance + memory ===' && ./bench && echo && echo '=== correctness corpus ===' && ./correctness && echo && echo '=== code size (single decode entry point, dead-code-eliminated) ===' && echo constexpr-cbor_heap: && size exe_cc && echo constexpr-cbor_arena: && size exe_arena && echo tinycbor: && size exe_tc && echo qcbor: && size exe_qc"]
+CMD ["bash", "-c", "echo '=== CPU performance + memory ===' && ./bench && echo && echo '=== correctness corpus ===' && ./correctness && echo && echo '=== code size (single decode entry point, dead-code-eliminated) ===' && echo constexpr-cbor_heap: && size exe_cc && echo constexpr-cbor_arena: && size exe_arena && echo tinycbor: && size exe_tc && echo qcbor: && size exe_qc && echo libcbor: && size exe_libcbor"]

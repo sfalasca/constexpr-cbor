@@ -1,13 +1,13 @@
 // Cross-library correctness corpus: feeds the exact same byte vectors to
-// constexpr-cbor, tinycbor, and QCBOR, and reports accept/reject per
-// library against the RFC-correct expected answer. Most "reject" vectors
-// are lifted directly from tests/test_malformed_input.cpp (which already
-// cites tinycbor's not_well_formed_cbor.h and QCBOR's own test suite as
-// sources for several of them) -- this file asks the complementary
-// question: when constexpr-cbor refuses something per that file's own
-// static_asserts, do the other two libraries actually refuse it too, or
-// is "refuse, don't crash" a claim constexpr-cbor backs up more strictly
-// than its peers?
+// constexpr-cbor, tinycbor, QCBOR, and libcbor, and reports accept/reject
+// per library against the RFC-correct expected answer. Most "reject"
+// vectors are lifted directly from tests/test_malformed_input.cpp (which
+// already cites tinycbor's not_well_formed_cbor.h and QCBOR's own test
+// suite as sources for several of them) -- this file asks the
+// complementary question: when constexpr-cbor refuses something per that
+// file's own static_asserts, do the other libraries actually refuse it
+// too, or is "refuse, don't crash" a claim constexpr-cbor backs up more
+// strictly than its peers?
 #include <cstdio>
 #include <cstdint>
 #include <span>
@@ -20,6 +20,8 @@ extern "C" {
 #include <cbor.h>  // tinycbor
 }
 #include "qcbor/qcbor_decode.h"  // QCBOR
+
+#include "libcbor_adapter.hpp"  // libcbor, via its own TU -- see that header's comment
 
 namespace {
 
@@ -80,6 +82,10 @@ bool accepted_by_qcbor(const std::vector<std::uint8_t>& bytes) {
   return QCBORDecode_Finish(&ctx) == QCBOR_SUCCESS;
 }
 
+// libcbor's own accept/reject check (::accepted_by_libcbor) lives in
+// libcbor_adapter.cpp -- see libcbor_adapter.hpp's comment for why it
+// can't be included directly here.
+
 }  // namespace
 
 int main() {
@@ -135,11 +141,12 @@ int main() {
   };
 
   int mismatches = 0;
-  std::printf("%-42s %-8s %-10s %-10s %-10s\n", "vector", "expect", "cbor", "tinycbor", "qcbor");
+  std::printf("%-42s %-8s %-10s %-10s %-10s %-10s\n", "vector", "expect", "cbor", "tinycbor", "qcbor", "libcbor");
   for (const auto& v : corpus) {
     const bool cc = accepted_by_constexpr_cbor(v.bytes);
     const bool tc = accepted_by_tinycbor(v.bytes);
     const bool qc = accepted_by_qcbor(v.bytes);
+    const bool lc = accepted_by_libcbor(std::span<const std::uint8_t>(v.bytes));
     // constexpr-cbor's *default* decode_value<32, NoUtf8Validation,
     // RejectDuplicateKeys> intentionally refuses the duplicate-key
     // vector even though it's structurally well-formed CBOR -- that's a
@@ -148,10 +155,10 @@ int main() {
     // special-cased out of the plain accept/reject diff below.
     const bool is_dup_key_policy_case = std::string(v.name) == "duplicate_keys_1_1";
     const bool cc_matches = is_dup_key_policy_case || (cc == v.should_accept);
-    if (!cc_matches || tc != v.should_accept || qc != v.should_accept) ++mismatches;
-    std::printf("%-42s %-8s %-10s %-10s %-10s%s\n", v.name, v.should_accept ? "accept" : "reject",
+    if (!cc_matches || tc != v.should_accept || qc != v.should_accept || lc != v.should_accept) ++mismatches;
+    std::printf("%-42s %-8s %-10s %-10s %-10s %-10s%s\n", v.name, v.should_accept ? "accept" : "reject",
                 cc ? "accept" : "reject", tc ? "accept" : "reject", qc ? "accept" : "reject",
-                is_dup_key_policy_case ? "  (policy choice, see note)" : "");
+                lc ? "accept" : "reject", is_dup_key_policy_case ? "  (policy choice, see note)" : "");
   }
   std::printf("\n%d / %zu vectors disagree with the RFC-correct expectation (excluding the policy-choice case)\n",
               mismatches, corpus.size());

@@ -1,10 +1,16 @@
 // Benchmarks constexpr-cbor (heap CborValue, and the no-malloc Arena)
-// against tinycbor and QCBOR on the *same* encoded bytes (benchmarks/data,
-// embedded via payloads.h). Every library's decode function does the same
-// amount of work: fully walk the decoded structure and fold every scalar
-// into a checksum. If two libraries disagree on a payload's checksum,
-// that's a correctness signal worth knowing about, not just a timing
-// data point -- see README.md's "cross-check" column.
+// against tinycbor, QCBOR, and libcbor on the *same* encoded bytes
+// (benchmarks/data, embedded via payloads.h). Every library's decode
+// function does the same amount of work: fully walk the decoded structure
+// and fold every scalar into a checksum. If two libraries disagree on a
+// payload's checksum, that's a correctness signal worth knowing about,
+// not just a timing data point -- see README.md's "cross-check" column.
+//
+// libcbor is reached through libcbor_adapter.hpp/.cpp, not included
+// directly here -- its own header declares C functions under the same
+// names tinycbor uses for different purposes, a genuine symbol collision
+// that only a separate translation unit avoids; see that adapter's own
+// comment.
 #include <malloc.h>
 
 #include <chrono>
@@ -18,6 +24,7 @@
 
 #include "constexpr_cbor.hpp"
 #include "constexpr_cbor_arena.hpp"
+#include "libcbor_adapter.hpp"
 #include "payloads.h"
 
 extern "C" {
@@ -264,6 +271,22 @@ QcborResult decode_qcbor(std::span<const std::uint8_t> bytes) {
 }
 
 // ---------------------------------------------------------------------
+// libcbor -- the DOM-style C competitor (cbor_load builds an owned,
+// ref-counted cbor_item_t tree, the same shape of thing constexpr-cbor's
+// heap CborValue path builds, unlike tinycbor/QCBOR's pull-parsing).
+// decode_libcbor() itself lives in libcbor_adapter.cpp, the only
+// translation unit that includes libcbor's own header -- here we just
+// convert its result into this file's own Checksum/HeapResult shape.
+// ---------------------------------------------------------------------
+
+HeapResult decode_libcbor_checksum(std::span<const std::uint8_t> bytes) {
+  const LibcborDecodeResult r = decode_libcbor(bytes);
+  if (!r.ok) return {false, {}, 0};
+  Checksum sum{r.items, r.isum, r.fsum, r.strbytes};
+  return {true, sum, r.bytes_allocated};
+}
+
+// ---------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------
 
@@ -298,12 +321,14 @@ void run_payload(const Payload& p) {
   const auto tiny_r = decode_tinycbor(bytes);
   const auto qcbor_full = decode_qcbor(bytes);
   const auto& qcbor_r = qcbor_full.r;
+  const auto libcbor_r = decode_libcbor_checksum(bytes);
 
   std::printf("\n== %s (%zu bytes) ==\n", p.name, p.len);
-  std::printf("  decode ok:  heap=%d arena=%d tinycbor=%d qcbor=%d (qcbor error=%d)\n", heap_r.ok, arena_r.ok,
-              tiny_r.ok, qcbor_r.ok, qcbor_full.error);
-  std::printf("  checksum match: heap==arena=%d heap==tinycbor=%d heap==qcbor=%d\n", heap_r.sum == arena_r.sum,
-              heap_r.sum == tiny_r.sum, heap_r.sum == qcbor_r.sum);
+  std::printf("  decode ok:  heap=%d arena=%d tinycbor=%d qcbor=%d (qcbor error=%d) libcbor=%d\n", heap_r.ok,
+              arena_r.ok, tiny_r.ok, qcbor_r.ok, qcbor_full.error, libcbor_r.ok);
+  std::printf("  checksum match: heap==arena=%d heap==tinycbor=%d heap==qcbor=%d heap==libcbor=%d\n",
+              heap_r.sum == arena_r.sum, heap_r.sum == tiny_r.sum, heap_r.sum == qcbor_r.sum,
+              heap_r.sum == libcbor_r.sum);
   std::printf("  items=%llu isum=%lld fsum=%.3f strbytes=%llu\n",
               static_cast<unsigned long long>(heap_r.sum.items), static_cast<long long>(heap_r.sum.isum),
               heap_r.sum.fsum, static_cast<unsigned long long>(heap_r.sum.strbytes));
@@ -311,15 +336,19 @@ void run_payload(const Payload& p) {
   std::printf("  arena bytes allocated/decode:   %lld\n", arena_r.bytes_allocated);
   std::printf("  tinycbor bytes allocated/decode: %lld\n", tiny_r.bytes_allocated);
   std::printf("  qcbor bytes allocated/decode:    %lld\n", qcbor_r.bytes_allocated);
+  std::printf("  libcbor bytes allocated/decode:  %lld\n", libcbor_r.bytes_allocated);
 
   const double heap_ns = time_ns_per_call([&] { (void)decode_heap(bytes); }, p.iterations);
   const double arena_ns = time_ns_per_call([&] { (void)decode_arena(pool, bytes); }, p.iterations);
   const double tiny_ns = time_ns_per_call([&] { (void)decode_tinycbor(bytes); }, p.iterations);
   const double qcbor_ns = time_ns_per_call([&] { (void)decode_qcbor(bytes); }, p.iterations);
+  const double libcbor_ns = time_ns_per_call([&] { (void)decode_libcbor_checksum(bytes); }, p.iterations);
 
-  std::printf("  ns/decode: heap=%.0f arena=%.0f tinycbor=%.0f qcbor=%.0f\n", heap_ns, arena_ns, tiny_ns, qcbor_ns);
-  std::printf("  MB/s:      heap=%.1f arena=%.1f tinycbor=%.1f qcbor=%.1f\n", p.len / (heap_ns * 1e-3),
-              p.len / (arena_ns * 1e-3), p.len / (tiny_ns * 1e-3), p.len / (qcbor_ns * 1e-3));
+  std::printf("  ns/decode: heap=%.0f arena=%.0f tinycbor=%.0f qcbor=%.0f libcbor=%.0f\n", heap_ns, arena_ns, tiny_ns,
+              qcbor_ns, libcbor_ns);
+  std::printf("  MB/s:      heap=%.1f arena=%.1f tinycbor=%.1f qcbor=%.1f libcbor=%.1f\n", p.len / (heap_ns * 1e-3),
+              p.len / (arena_ns * 1e-3), p.len / (tiny_ns * 1e-3), p.len / (qcbor_ns * 1e-3),
+              p.len / (libcbor_ns * 1e-3));
 }
 
 }  // namespace

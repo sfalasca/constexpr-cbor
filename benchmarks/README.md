@@ -1,14 +1,27 @@
-# constexpr-cbor vs. tinycbor vs. QCBOR
+# constexpr-cbor vs. tinycbor vs. QCBOR vs. libcbor
 
-A reproducible benchmark comparing constexpr-cbor against two widely-used
-C CBOR libraries — [tinycbor](https://github.com/intel/tinycbor) (Intel,
-pinned `v0.6.1`) and [QCBOR](https://github.com/laurencelundblade/QCBOR)
-(pinned `v1.5.1`) — across four dimensions: **CPU performance**,
-**memory usage**, **correctness**, and **flexibility**. These two were
-chosen because they're the most actively maintained, widely deployed
-general-purpose C CBOR libraries (the earlier competitive research this
-project's README cites also covered libcbor, zcbor, and NanoCBOR, but
-those are either less actively maintained or narrower in scope).
+A reproducible benchmark comparing constexpr-cbor against three
+widely-used C CBOR libraries — [tinycbor](https://github.com/intel/tinycbor)
+(Intel, pinned `v0.6.1`), [QCBOR](https://github.com/laurencelundblade/QCBOR)
+(pinned `v1.5.1`), and [libcbor](https://github.com/PJK/libcbor) (pinned
+`v0.14.0`) — across four dimensions: **CPU performance**, **memory
+usage**, **correctness**, and **flexibility**. tinycbor and QCBOR were
+chosen first as the most actively maintained, widely deployed
+general-purpose *pull-parsing* C CBOR libraries; libcbor was added
+because it's the one general-purpose C library in this space that's
+**DOM-style** — `cbor_load()` builds an owned, ref-counted `cbor_item_t`
+tree, the same shape of thing constexpr-cbor's heap `CborValue` path
+builds, rather than pull-parsing — making it the more apples-to-apples
+comparison for that path specifically. (The earlier competitive research
+this project's top-level README cites also covered zcbor and NanoCBOR;
+both are narrower-scope, embedded-targeted pull-parsers like tinycbor/QCBOR,
+not DOM-style, so they weren't added here.) Other-language CBOR libraries
+(Python's `cbor2`, Rust's `serde_cbor`/`ciborium`, Go's `fxamacker/cbor`,
+JavaScript's `cbor-x`, ...) are deliberately out of scope for this specific
+benchmark: a cross-language throughput number would mostly measure
+interpreter/runtime overhead rather than library design, which would break
+the "same work, same compiler, isolate the library" premise everything
+below depends on.
 
 ## Running it
 
@@ -17,14 +30,29 @@ docker build -t cbor-bench -f benchmarks/Dockerfile .
 docker run --rm cbor-bench
 ```
 
-This clones both libraries at their pinned tags, builds everything with
-the same compiler (gcc/g++ inside `ubuntu:24.04`, `-O2` for the
+This clones all three libraries at their pinned tags, builds everything
+with the same compiler (gcc/g++ inside `ubuntu:24.04`, `-O2` for the
 performance/correctness programs, `-Os` for the size comparison), and
 runs all three programs in one shot. The numbers below are one run of
 that container; re-run it yourself if you want fresh ones — wall-clock
 timings will vary by a double-digit percent with host load, but the
 *shape* of the results (which library wins which dimension, and why) is
 stable across runs.
+
+**One build asymmetry worth stating up front**: unlike tinycbor and
+QCBOR (whose individual `.c` files this Dockerfile compiles directly,
+with no build-system step at all), libcbor needs a real build step —
+its CMakeLists generates a `configuration.h` and an export-macro header
+that don't exist in the raw source tree, so it's built once via CMake
+(`-DCMAKE_BUILD_TYPE=Release`, static lib only) and that one build is
+reused for *all three* programs, including the size comparison. tinycbor
+and QCBOR, by contrast, get a *second*, separate `-Os
+-ffunction-sections` compile of their `.c` files specifically for the
+size comparison. libcbor's size number therefore reflects whatever
+optimization level its own CMakeLists chooses for a Release build (which
+turned out to include LTO, per its own build output), not a `-Os`-matched
+rebuild like the other two get — an asymmetry in libcbor's favor or
+against it that this doc isn't trying to resolve, just disclose.
 
 ## Methodology
 
@@ -43,14 +71,17 @@ amount of work**: fully walk the decoded structure and fold every scalar
 (integers, floats, string byte-lengths) into a checksum. This matters
 because tinycbor and QCBOR are streaming pull-parsers (they don't build
 a generic tree unless you ask them to), while constexpr-cbor's heap
-`CborValue` path *does* build one — "decode" means different things by
-default, so the comparison is deliberately "parse this buffer and visit
-every value," which is well-defined for all three and is also what the
-cross-library **checksum equality** doubles as a correctness check: if
-two libraries disagree on a payload's checksum, that's a bug worth
-knowing about, not just a timing footnote.
+`CborValue` path and libcbor *do* build one — "decode" means different
+things by default, so the comparison is deliberately "parse this buffer
+and visit every value," which is well-defined for all of them and is
+also what the cross-library **checksum equality** doubles as a
+correctness check: if two libraries disagree on a payload's checksum,
+that's a bug worth knowing about, not just a timing footnote. This isn't
+hypothetical — building this exact comparison caught a real bug in this
+benchmark's own libcbor adapter (see "A bug this methodology actually
+caught" below).
 
-Four decode paths are measured:
+Five decode paths are measured:
 - **constexpr-cbor, heap** (`ConstexprCbor::decode_value`) — builds an
   owned `CborValue` tree, like `nlohmann::json`.
 - **constexpr-cbor, Arena** (`ConstexprCbor::Arena::decode_value`) — the
@@ -59,17 +90,43 @@ Four decode paths are measured:
 - **tinycbor** — `cbor_parser_init` + recursive
   `cbor_value_enter_container`/`advance` walk.
 - **QCBOR** — `QCBORDecode_Init` + a `QCBORDecode_GetNext` loop.
+- **libcbor** — `cbor_load()` (builds the full tree in one call) +
+  recursive `cbor_typeof`/`cbor_array_handle`/`cbor_map_handle` walk,
+  `cbor_decref`'d after measurement. Isolated in its own translation unit
+  (`benchmarks/libcbor_adapter.cpp`) rather than included directly in
+  `bench.cpp`/`correctness.cpp`: libcbor's header declares several C
+  functions under the same names tinycbor uses for unrelated purposes
+  (`cbor_encode_uint`, `cbor_encode_tag`, ...) — a genuine `extern "C"`
+  symbol collision, not just an include-path ambiguity, that only a
+  separate translation unit avoids.
+
+### A bug this methodology actually caught
+
+The first version of the libcbor adapter used `cbor_get_uint64(item)` for
+every `CBOR_TYPE_UINT` item. libcbor's own source shows why that's wrong:
+`cbor_get_uint64` is `*(uint64_t*)item->data` behind a `CBOR_ASSERT` that's
+a no-op in a release build — it requires the item to actually be stored
+at `CBOR_INT_64` width internally, and silently reads past a narrower
+buffer (picking up adjacent heap memory as the high bytes) for anything
+stored more compactly, which is most real-world small integers. This
+didn't show up on the `small`/`deep`/`strings` payloads — apparently by
+luck of width-matching for those particular values — but surfaced
+immediately as a wildly wrong `isum` on `medium` (200 records' worth of
+mixed-width integers), caught by exactly the cross-library checksum
+comparison this benchmark exists to run. Fixed by switching to
+`cbor_get_int(item)`, which switches on `cbor_int_get_width()` and calls
+the correctly-sized accessor itself.
 
 ## Results (one container run, after the pointer-based Arena redesign below)
 
 ### CPU performance (ns/decode, lower is better; MB/s, higher is better)
 
-| payload | heap | Arena | tinycbor | QCBOR |
-|---|---|---|---|---|
-| small (45 B) | 780 ns / 57.7 MB/s | 355 ns / **126.6 MB/s** | 454 ns / 99.2 MB/s | 462 ns / 97.4 MB/s |
-| medium (10.8 KB) | 317,522 ns / 33.9 MB/s | 60,962 ns / **176.8 MB/s** | 81,942 ns / 131.5 MB/s | 76,963 ns / 140.0 MB/s |
-| deep (91 B, depth 30) | 42,394 ns / 2.1 MB/s | 15,192 ns / 6.0 MB/s | 15,426 ns / 5.9 MB/s | 7,469 ns / **12.2 MB/s** *(when accepted — see Correctness)* |
-| strings (8.8 KB) | 10,603 ns / 829.2 MB/s | 2,345 ns / **3,750.0 MB/s** | 4,200 ns / 2,093.3 MB/s | 3,517 ns / 2,500.2 MB/s |
+| payload | heap | Arena | tinycbor | QCBOR | libcbor |
+|---|---|---|---|---|---|
+| small (45 B) | 805 ns / 55.9 MB/s | 367 ns / **122.6 MB/s** | 458 ns / 98.2 MB/s | 443 ns / 101.6 MB/s | 713 ns / 63.1 MB/s |
+| medium (10.8 KB) | 343,520 ns / 31.4 MB/s | 67,951 ns / **158.6 MB/s** | 92,177 ns / 116.9 MB/s | 80,004 ns / 134.7 MB/s | 283,577 ns / 38.0 MB/s |
+| deep (91 B, depth 30) | 73,048 ns / 1.2 MB/s | 46,158 ns / 2.0 MB/s | 46,612 ns / 2.0 MB/s | 22,679 ns / **4.0 MB/s** *(when accepted — see Correctness)* | 48,560 ns / 1.9 MB/s |
+| strings (8.8 KB) | 12,838 ns / 684.9 MB/s | 2,760 ns / **3,185.2 MB/s** | 4,938 ns / 1,780.5 MB/s | 4,348 ns / 2,021.9 MB/s | 26,155 ns / 336.1 MB/s |
 
 **Takeaways:**
 - **These numbers swing hard between container runs** — a prior run of
@@ -94,10 +151,19 @@ Four decode paths are measured:
   real regardless of which way a given run's wall-clock numbers lean. This
   isn't something constexpr-cbor is trying to beat across the board; see
   Flexibility, below, for what it's trading that speed for.
-- The **heap path is the slowest of the four everywhere, consistently
-  across every run** — the one result here that hasn't varied — which is
-  expected: real heap allocation per node, not just per string, plus
-  `std::vector` growth.
+- **libcbor is consistently the slowest of the three C libraries, and
+  often slower than constexpr-cbor's own heap path** — on `strings` it's
+  roughly 2x slower than heap and ~10x slower than Arena. This lines up
+  with it being the one C library here that's also DOM-style: it pays for
+  real heap allocation per node (see Memory usage below) *and* reference
+  counting (`cbor_incref`/`cbor_decref` bookkeeping on every item) on top
+  of that, neither of which tinycbor/QCBOR's pull-parsing or Arena's
+  no-malloc design ever pays.
+- The **heap path is consistently among the slowest** — real heap
+  allocation per node, not just per string, plus `std::vector` growth —
+  though libcbor's own allocation-plus-refcounting overhead means it
+  isn't always strictly the slowest of all five anymore now that libcbor
+  is in the comparison (see `strings` above).
 
 ### Arena internals: from index-based to pointer-based
 
@@ -147,12 +213,12 @@ the pool's own bookkeeping, would be equally stale.
 
 ### Memory usage (bytes allocated per decode, measured via `mallinfo2()`)
 
-| payload | heap | Arena | tinycbor | QCBOR |
-|---|---|---|---|---|
-| small | 800 | 0 | 0 | 0 |
-| medium | 157,760 | 0 | 0 | 0 |
-| deep | 3,712 | 0 | 0 | *refused — see Correctness* |
-| strings | 14,160 | 0 | 0 | 0 |
+| payload | heap | Arena | tinycbor | QCBOR | libcbor |
+|---|---|---|---|---|---|
+| small | 800 | 0 | 0 | 0 | 656 |
+| medium | 157,760 | 0 | 0 | 0 | 234,032 |
+| deep | 3,712 | 0 | 0 | *refused — see Correctness* | 5,376 |
+| strings | 14,192 | 0 | 0 | 0 | 15,776 |
 
 **Takeaways:**
 - **Arena, tinycbor, and QCBOR all allocate exactly zero heap bytes
@@ -162,16 +228,27 @@ the pool's own bookkeeping, would be equally stale.
   that property (`NodePool` is a fixed-capacity, caller-provisioned
   `std::array`-backed object — decoding into it is "running out of
   space," never "allocating more").
-- **Only constexpr-cbor's heap `CborValue` path allocates at all**, and
-  it scales with payload size (`medium`'s 200-record array costs ~158 KB
-  for ~2,500 total tree nodes). This is the cost of the ergonomic,
-  generic, owned-tree API (think `nlohmann::json`'s `json` object) —
-  tinycbor and QCBOR don't offer an equivalent "build me a generic
-  value tree" mode at all, so there's nothing to compare the heap path's
-  allocation *against* in those libraries; the fairer statement is
-  "constexpr-cbor is the only one of the three with both a zero-alloc
-  mode and an ergonomic owned-tree mode, and the owned-tree mode's
-  allocation cost is the price of that convenience."
+- **libcbor allocates on every payload, and noticeably *more* than
+  constexpr-cbor's own heap path does** for the same data (234,032 vs.
+  157,760 bytes on `medium`; 15,776 vs. 14,192 on `strings`) — confirming
+  directly what "libcbor is DOM-style" predicts: `cbor_load()` builds a
+  real, independently-owned `cbor_item_t` tree, with per-item reference
+  counting on top. This is the expected, validating result for adding
+  libcbor to this benchmark in the first place: a true DOM-style C
+  library pays a real, measurable allocation cost for the same
+  convenience constexpr-cbor's heap path offers, it isn't something only
+  a `std::variant`-based or C++ design pays for.
+- **Only constexpr-cbor's heap `CborValue` path and libcbor allocate at
+  all**, and both scale with payload size. This is the cost of the
+  ergonomic, generic, owned-tree API (think `nlohmann::json`'s `json`
+  object) — tinycbor and QCBOR don't offer an equivalent "build me a
+  generic value tree" mode at all, so there's nothing to compare the
+  heap path's allocation *against* in those two; the fairer statement is
+  "constexpr-cbor is the only library here with both a zero-alloc mode
+  and an ergonomic owned-tree mode as equally first-class options, and
+  the owned-tree mode's allocation cost is the price of that
+  convenience — a price libcbor, the other owned-tree option, pays too,
+  and currently pays more of."
 
 ### Code size (single decode-entry-point executable, `-Os`, dead-code-eliminated)
 
@@ -186,7 +263,7 @@ only one `QCBORDecode_GetNext()` (never recursing into the array it
 returned) — while constexpr-cbor's `decode_value` always fully decodes
 *and* walks the whole structure in one call, by design. That made
 tinycbor look 6x smaller than it really is for equivalent work. Fixed:
-all four entry points below now fully decode **and** recursively walk
+all five entry points below now fully decode **and** recursively walk
 the same 45-byte `small` payload (a 4-field map), summing every scalar
 and string length into a `volatile` sink so the walk itself can't be
 optimized away.
@@ -197,8 +274,17 @@ optimized away.
 | constexpr-cbor (Arena) | 20,665 | 2,056 | 3,112 | 25,833 |
 | tinycbor | 6,517 | 600 | 16 | 7,133 |
 | QCBOR | 6,013 | 616 | 16 | 6,645 |
+| libcbor | 15,317 | 640 | 16 | 15,973 |
 
 **Takeaways:**
+- **libcbor lands between the two extremes, as expected for a DOM-style C
+  library**: 15,317 B — smaller than constexpr-cbor's heap path (18,133 B,
+  no `std::variant`/template instantiation overhead, it's plain C), but
+  more than double tinycbor/QCBOR's size, since it still needs to build
+  and tear down (`cbor_decref`) a real tree with reference counting,
+  unlike their pull-parsing. This is consistent with the Memory usage and
+  CPU performance results above: being DOM-style costs something in every
+  dimension, in both C and C++, not just in C++'s case.
 - **The gap against tinycbor/QCBOR is ~2.8-3.2x**, real and structural,
   not a measurement artifact: `std::variant`-based recursive descent
   through a tagged union generates meaningfully more machine code per
@@ -230,7 +316,7 @@ optimized away.
 
 ## Correctness
 
-`correctness.cpp` feeds 32 byte vectors to all three libraries: 24
+`correctness.cpp` feeds 32 byte vectors to all four libraries: 24
 malformed/adversarial vectors (truncated length fields, reserved
 additional-info values, underfilled definite containers, break-byte
 misuse, mismatched indefinite-length string chunks, unclosed indefinite
@@ -241,13 +327,13 @@ policy-difference case. Most of the malformed vectors are lifted
 directly from `tests/test_malformed_input.cpp`, which already cites
 tinycbor's `not_well_formed_cbor.h` and QCBOR's own test suite as sources
 for several of them — this corpus asks the complementary question: when
-constexpr-cbor refuses something, do tinycbor and QCBOR actually refuse
-it too?
+constexpr-cbor refuses something, do tinycbor, QCBOR, and libcbor
+actually refuse it too?
 
 **Result: 0 / 32 disagreements with the RFC-correct expectation**
-(excluding the one deliberate policy case below) — all three libraries
+(excluding the one deliberate policy case below) — all four libraries
 correctly reject every malformed vector and correctly accept every valid
-one. Two things surfaced while building this corpus that are worth
+one. A few things surfaced while building this corpus that are worth
 documenting on their own:
 
 - **QCBOR's `QCBORDecode_GetNext()` loop alone cannot detect an
@@ -256,51 +342,74 @@ documenting on their own:
   `QCBORDecode_Finish()`, which QCBOR's own documentation says a caller
   must call — this isn't a bug in QCBOR, just a sharper edge in its API
   contract than constexpr-cbor's (where `decode_value` catches this
-  itself, with no second call required) or tinycbor's (same).
+  itself, with no second call required), tinycbor's, or libcbor's (same
+  for both: `cbor_load()` alone already catches it).
 - **The one deliberate disagreement**: `{0xa2, 0x01, 0x02, 0x01, 0x03}`
   (a structurally well-formed map with a duplicate key, `{1:2, 1:3}`).
   constexpr-cbor's *default* policy (`RejectDuplicateKeys`) refuses it;
-  tinycbor and QCBOR both accept it (neither checks for duplicate keys
-  at all, by default or otherwise). This is intentional on
-  constexpr-cbor's side — see the README's "Pluggable
+  tinycbor, QCBOR, and libcbor all accept it (none of the three checks
+  for duplicate keys at all, by default or otherwise). This is
+  intentional on constexpr-cbor's side — see the README's "Pluggable
   duplicate-map-key policies" section — not a structural-decode
   disagreement.
+- **Getting libcbor's own checksum to agree took a real fix** — see
+  "A bug this methodology actually caught" above. The accept/reject
+  corpus here never actually exercised the buggy code path (none of
+  these 32 vectors' integers happened to expose the width mismatch), so
+  this particular correctness table would have shown 0 disagreements
+  either way; it was specifically the CPU/memory benchmark's checksum
+  comparison, not this corpus, that caught it. Worth noting as its own
+  small methodology point: "accept/reject agreement" and "decoded-value
+  agreement" are different, complementary checks, and this project's own
+  bug only tripped the second one.
 
 ## Flexibility
 
 A qualitative comparison, since "more flexible" isn't a single number.
 Earlier competitive research for this project (cited in the top-level
-README) also covered libcbor, zcbor, and NanoCBOR; those are included
-below from documentation only (not built/benchmarked here).
+README) also covered zcbor and NanoCBOR; those are included below from
+documentation only (neither is built/benchmarked here — both are
+narrower-scope, embedded-targeted pull-parsers, closer in spirit to
+tinycbor/QCBOR than to the DOM-style comparison libcbor's inclusion is
+specifically for).
 
-| | constexpr-cbor | tinycbor | QCBOR | libcbor / zcbor / NanoCBOR (docs only) |
-|---|---|---|---|---|
-| Compile-time (`consteval`) evaluation | **Yes** — the entire test suite runs inside `consteval` functions | No (plain C) | No (plain C) | No |
-| Zero-heap decode mode | Yes (Arena) | Yes (native) | Yes (native) | zcbor/NanoCBOR: yes; libcbor: no (always heap) |
-| Generic owned-tree decode mode | Yes (heap `CborValue`, nlohmann-style ergonomics) | No | No (spiffy-decode helpers exist but no generic tree) | libcbor: yes (always heap) |
-| Max nesting depth | Caller-tunable **per call** (`MaxDepth` NTTP, default 32) | Unbounded (recursion-stack-bound only — no built-in limit) | **Fixed at compile time** (`QCBOR_MAX_ARRAY_NESTING = 15`, a `#define`, not a per-call parameter) | varies |
-| Pluggable UTF-8 validation | Yes (`NoUtf8Validation`/`Rough`/`Complete`, policy template param) | No validation | No validation | No (industry-wide gap, per earlier research) |
-| Pluggable duplicate-key policy | Yes (`Reject`/`KeepFirst`/`KeepLast`, policy template param) | No (silently accepts) | No (silently accepts) | No |
-| Exception-free | Yes (`std::optional`, proven to compile under `-fno-exceptions`) | Yes (C) | Yes (C) | varies |
-| Bignum (tag 2/3) as a native value, not an opaque tag | Yes | No (generic tag) | Yes (`QCBOR_TYPE_POSBIGNUM`/`NEGBIGNUM`) | varies |
-| Browser/WebAssembly target proven in CI | Yes (`docker/wasm.Dockerfile`, `webapp/`) | Not out of the box | Not out of the box | No |
-| Code size (this benchmark, full decode+walk) | 18-21 KB `.text` for one call | **6.5 KB** | 6.0 KB | — |
-| Raw decode throughput (this benchmark) | 2-3,750 MB/s depending on mode/payload — varies a lot run-to-run, see Performance | 6-2,183 MB/s | 6-2,726 MB/s | — |
+| | constexpr-cbor | tinycbor | QCBOR | libcbor | zcbor / NanoCBOR (docs only) |
+|---|---|---|---|---|---|
+| Compile-time (`consteval`) evaluation | **Yes** — the entire test suite runs inside `consteval` functions | No (plain C) | No (plain C) | No (plain C) | No |
+| Zero-heap decode mode | Yes (Arena) | Yes (native) | Yes (native) | No (always heap + refcounting) | Yes |
+| Generic owned-tree decode mode | Yes (heap `CborValue`, nlohmann-style ergonomics) | No | No (spiffy-decode helpers exist but no generic tree) | Yes (`cbor_load`, always heap) | No |
+| Max nesting depth | Caller-tunable **per call** (`MaxDepth` NTTP, default 32) | Unbounded (recursion-stack-bound only — no built-in limit) | **Fixed at compile time** (`QCBOR_MAX_ARRAY_NESTING = 15`, a `#define`, not a per-call parameter) | Unbounded (recursion-stack-bound only, same as tinycbor) | varies |
+| Pluggable UTF-8 validation | Yes (`NoUtf8Validation`/`Rough`/`Complete`, policy template param) | No validation | No validation | No validation | No (industry-wide gap, per earlier research) |
+| Pluggable duplicate-key policy | Yes (`Reject`/`KeepFirst`/`KeepLast`, policy template param) | No (silently accepts) | No (silently accepts) | No (silently accepts) | No |
+| Exception-free | Yes (`std::optional`, proven to compile under `-fno-exceptions`) | Yes (C) | Yes (C) | Yes (C) | varies |
+| Bignum (tag 2/3) as a native value, not an opaque tag | Yes | No (generic tag) | Yes (`QCBOR_TYPE_POSBIGNUM`/`NEGBIGNUM`) | No (generic tag) | varies |
+| Browser/WebAssembly target proven in CI | Yes (`docker/wasm.Dockerfile`, `webapp/`) | Not out of the box | Not out of the box | Not out of the box | No |
+| Code size (this benchmark, full decode+walk) | 18-21 KB `.text` for one call | **6.5 KB** | 6.0 KB | 15.3 KB | — |
+| Memory allocated/decode (this benchmark) | 0 (Arena) to ~158 KB (heap) | 0 | 0 | ~0.7-234 KB — allocates on every payload | — |
+| Raw decode throughput (this benchmark) | 1-3,185 MB/s depending on mode/payload — varies a lot run-to-run, see Performance | 2-1,781 MB/s | 2-2,022 MB/s (nothing on `deep`, refused) | 2-336 MB/s — consistently slowest of the four libraries | — |
 
 **The honest summary**: tinycbor and QCBOR are still smaller, consistently
 and by a wide, stable margin — they're mature, hand-optimized C libraries
 doing one job well, and no amount of tuning on constexpr-cbor's side is
 going to beat a hand-written C state machine on code size while keeping a
-generic, `std::variant`-based value representation. Raw throughput is the
-one dimension that genuinely isn't settled: Arena has measured anywhere
-from clearly behind tinycbor/QCBOR to clearly ahead of both, on the same
-code, same host, different container runs — see Performance above for
-why, and don't trust either extreme as "the" answer without re-running the
-benchmark yourself. constexpr-cbor's remaining differentiators are
-structural, not timing-dependent: it's the only one of the three that (a)
-proves its own correctness at *compile time* via `consteval`, (b) offers
-a real generic owned-tree API with the no-malloc mode as an
-equally-first-class alternative rather than the only option, and (c)
+generic, `std::variant`-based value representation. libcbor's addition to
+this benchmark earns its keep as a control: it shows the DOM-style cost
+(real allocation, reference counting, more code than a pull-parser) isn't
+a C++-specific or `std::variant`-specific tax — a plain-C DOM-style
+library pays a comparable structural price in every dimension measured
+here, it's just a cost of the *design*, not the *language*. Raw
+throughput among the zero-copy pull-parsers and Arena is the one
+dimension that genuinely isn't settled run-to-run: Arena has measured
+anywhere from clearly behind tinycbor/QCBOR to clearly ahead of both, on
+the same code, same host, different container runs — see Performance
+above for why, and don't trust either extreme as "the" answer without
+re-running the benchmark yourself. constexpr-cbor's remaining
+differentiators are structural, not timing-dependent: it's the only
+library here that (a) proves its own correctness at *compile time* via
+`consteval`, (b) offers a real generic owned-tree API with the no-malloc
+mode as an equally-first-class alternative rather than the only option
+(libcbor has the owned-tree mode but no no-malloc alternative; tinycbor/
+QCBOR have the no-malloc mode but no owned-tree alternative), and (c)
 exposes nesting depth, UTF-8 validation, and duplicate-key handling as
 caller-chosen policies rather than fixed library behavior. Whether the
 remaining code-size cost (and the heap path's slower, allocation-bound
@@ -317,9 +426,12 @@ instead of a marketing claim either way.
   doesn't need Python).
 - `bench.cpp` — the CPU/memory benchmark described above.
 - `correctness.cpp` — the cross-library correctness corpus.
-- `size/` — the four minimal single-entry-point sources used for the
+- `libcbor_adapter.hpp`/`.cpp` — the only translation unit that includes
+  libcbor's own header, isolating its `extern "C"` symbol collision with
+  tinycbor from `bench.cpp`/`correctness.cpp` (see "Methodology" above).
+- `size/` — the five minimal single-entry-point sources used for the
   code-size comparison (`size_cc.cpp`/`size_arena.cpp` for
-  constexpr-cbor's two modes, `size_tc.c`/`size_qc.c` for tinycbor/QCBOR,
-  `size_main.c` the shared trivial `main()`).
-- `Dockerfile` — clones both third-party libraries at pinned tags and
-  builds/runs everything above in one `docker run`.
+  constexpr-cbor's two modes, `size_tc.c`/`size_qc.c`/`size_libcbor.c`
+  for tinycbor/QCBOR/libcbor, `size_main.c` the shared trivial `main()`).
+- `Dockerfile` — clones all three third-party libraries at pinned tags
+  and builds/runs everything above in one `docker run`.
