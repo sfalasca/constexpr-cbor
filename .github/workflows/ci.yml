@@ -117,3 +117,32 @@ jobs:
       - name: docker build -f docker/${{ matrix.target }}.Dockerfile
         continue-on-error: ${{ matrix.allow_failure == true }}
         run: docker build -f docker/${{ matrix.target }}.Dockerfile -t cbor-${{ matrix.target }} .
+
+  webapp:
+    name: webapp (build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Proves bridge.cpp still compiles clean against the real Emscripten
+      # toolchain (same warning set as the rest of this project) and that
+      # the served image actually serves index.html/app.js/dist/*. Not a
+      # browser/UI test -- that's run by hand (see webapp/README.md) --
+      # just the build-and-serve smoke test this directory's own
+      # Dockerfile is designed to make possible.
+      - name: docker build -f webapp/Dockerfile
+        run: docker build -f webapp/Dockerfile -t cbor-webapp .
+
+      - name: Run it and check every asset is served
+        run: |
+          docker run -d --rm -p 8080:8080 --name cbor-webapp-ci cbor-webapp
+          sleep 1
+          for path in / /app.js /dist/cbor.js /dist/cbor.wasm; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8080${path}")
+            echo "GET ${path} -> ${code}"
+            if [ "${code}" != "200" ]; then
+              echo "::error::${path} did not return 200"
+              exit 1
+            fi
+          done
+          docker stop cbor-webapp-ci

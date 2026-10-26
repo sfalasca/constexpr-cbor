@@ -1,0 +1,54 @@
+name: Deploy webapp to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - webapp/**
+      - include/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Builds webapp/dist/{cbor.js,cbor.wasm} with the project's own
+      # Emscripten image, the same toolchain docker/wasm.Dockerfile and
+      # the webapp CI job use -- this workflow never installs Emscripten
+      # on the runner directly.
+      - name: Build dist/ via emscripten/emsdk
+        run: >
+          docker run --rm -v ${{ github.workspace }}:/src emscripten/emsdk:latest
+          /src/webapp/build.sh
+
+      - name: Assemble Pages site (index.html, app.js, dist/, no source)
+        run: |
+          mkdir -p _site
+          cp webapp/index.html webapp/app.js _site/
+          cp -r webapp/dist _site/dist
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

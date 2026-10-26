@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>constexpr-cbor viewer</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --fg: #1a1a1a;
+      --bg: #ffffff;
+      --muted: #666666;
+      --border: #d0d0d0;
+      --accent: #2a5db0;
+      --error: #a3262b;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --fg: #e6e6e6;
+        --bg: #14161a;
+        --muted: #9aa0a6;
+        --border: #3a3f46;
+        --accent: #7aa7ff;
+        --error: #ff8a8a;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: var(--fg);
+      background: var(--bg);
+      margin: 0;
+      padding: 24px 16px;
+    }
+    main {
+      max-width: 860px;
+      margin: 0 auto;
+    }
+    h1 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin: 0 0 4px;
+    }
+    p.sub {
+      color: var(--muted);
+      margin: 0 0 20px;
+      font-size: 0.85rem;
+    }
+    #drop {
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 32px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    #drop.dragover { border-color: var(--accent); }
+    #drop p { margin: 4px 0; color: var(--muted); }
+    #file-input { display: none; }
+    #status {
+      margin-top: 12px;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+    #error {
+      margin-top: 12px;
+      color: var(--error);
+      white-space: pre-wrap;
+      display: none;
+    }
+    #result {
+      margin-top: 20px;
+      display: none;
+    }
+    #result h2 {
+      font-size: 0.85rem;
+      color: var(--muted);
+      font-weight: 500;
+      margin: 0 0 8px;
+    }
+    pre#json {
+      background: color-mix(in srgb, var(--fg) 5%, var(--bg));
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      overflow: auto;
+      font-size: 0.85rem;
+      line-height: 1.5;
+      white-space: pre;
+    }
+    footer {
+      margin-top: 32px;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+    footer a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>constexpr-cbor viewer</h1>
+    <p class="sub">
+      Open a .cbor file, see it decoded as JSON. Decoding runs entirely in
+      your browser via WebAssembly &mdash; the file never leaves this page.
+    </p>
+
+    <div id="drop">
+      <p><strong>Drop a .cbor file here</strong>, or click to choose one.</p>
+      <p>Loading the decoder&hellip;</p>
+      <input id="file-input" type="file" accept=".cbor,application/cbor" />
+    </div>
+
+    <div id="status"></div>
+    <div id="error"></div>
+
+    <div id="result">
+      <h2 id="result-meta"></h2>
+      <pre id="json"></pre>
+    </div>
+
+    <footer>
+      Decoded with <a href="https://github.com/sfalasca/constexpr-cbor" rel="noopener">constexpr-cbor</a>,
+      compiled to WebAssembly. See the
+      <a href="README.md">README in this directory</a> for how CBOR concepts
+      with no JSON equivalent (byte strings, bignums, tags, non-string keys,
+      simple values) are represented below.
+    </footer>
+  </main>
+
+  <script src="dist/cbor.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

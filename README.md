@@ -390,6 +390,17 @@ turn up repeatedly). `decode_value<MaxDepth, ...>`'s `MaxDepth` (default `32`)
 bounds it; exceeding it is a refusal, not a crash, the same as every other
 contract violation in this codec.
 
+## Browser viewer
+
+`webapp/` is a standalone static page that decodes a `.cbor` file to
+pretty-printed JSON entirely in the browser, via this library compiled to
+WebAssembly (`docker/wasm.Dockerfile`'s same toolchain). No upload, no
+server-side component: `docker build -t cbor-webapp -f webapp/Dockerfile .
+&& docker run --rm -p 8080:8080 cbor-webapp`, then open
+`http://localhost:8080`. See `webapp/README.md` for the local-build path
+and exactly how CBOR concepts with no JSON equivalent (byte strings,
+bignums, tags, non-string map keys) are rendered.
+
 ## Building and testing this library
 
 ```sh

@@ -8,3 +8,4 @@ Testing/
 *.obj
 *.swp
 compile_commands.json
+webapp/dist/
