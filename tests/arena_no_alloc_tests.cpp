@@ -7,9 +7,9 @@
 // The functions below are ordinary (non-constexpr) functions instead, so
 // their bodies are real, compiled, executed code; ctest runs the compiled
 // binary and checks its exit code like any other test in this suite. This
-// is also the one file where NodePool::canaries_intact()'s underlying
-// assert() runs as a genuine, compiled runtime check rather than
-// participating in constant evaluation.
+// is also the one file where the ARENA_ASSERT(owns(...)) checks wired
+// into NodePool's accessors run as genuine, compiled runtime checks
+// rather than participating in constant evaluation.
 //
 // Deleting the global operator new/delete to additionally prove no
 // allocation happens at compile-enforced link time was tried and
@@ -68,27 +68,29 @@ bool run_arena_duplicate_key_and_nesting(std::span<const std::uint8_t> duplicate
   return decode_value(pool_c, nested_indefinite_array).has_value();
 }
 
-// Plain-predicate check of the canary-detection logic itself (see
-// NodePool::canaries_intact()'s own comment for why a *triggered* assert()
-// at an allocation call site isn't independently crash-tested here: it's
-// either a hard compile error during consteval or an abort() at runtime,
-// neither of which is something this test suite's normal pass/fail
-// convention can observe without a death-test harness this project
-// doesn't otherwise use). This proves the detection predicate itself is
-// correct: intact on construction, and able to notice a stomped canary.
-bool run_canary_detection() {
+// Plain-predicate check of NodePool::owns() itself (see its own comment
+// for why a *triggered* ARENA_ASSERT at one of the call sites that uses it
+// isn't independently crash-tested here: it's either a hard compile error
+// during consteval or an abort() at runtime, neither of which is something
+// this test suite's normal pass/fail convention can observe without a
+// death-test harness this project doesn't otherwise use). This proves the
+// check itself is correct: true for a pointer this pool actually produced,
+// false for one that didn't come from it at all.
+bool run_owns_check() {
   ArenaStorage<8, 8, 32> storage;
   auto pool = storage.make_pool();
-  if (!pool.canaries_intact()) {
-    return false;
+  constexpr std::uint8_t one_vec[] = {0x01};
+  const auto decoded = decode_value(pool, one_vec);
+  if (!decoded || !pool.owns(decoded->node)) {
+    return false;  // a genuinely-owned pointer must report true
   }
-  storage.bytes[0] ^= 0xff;  // stomp the begin canary
-  if (pool.canaries_intact()) {
-    return false;  // should have noticed
+  ArenaStorage<8, 8, 32> other_storage;  // a second, unrelated pool
+  auto other_pool = other_storage.make_pool();
+  const auto other_decoded = decode_value(other_pool, one_vec);
+  if (!other_decoded || pool.owns(other_decoded->node)) {
+    return false;  // a pointer from a different pool must report false
   }
-  storage.bytes[0] ^= 0xff;  // restore it
-  storage.bytes[storage.bytes.size() - 1] ^= 0xff;  // stomp the end canary instead
-  return !pool.canaries_intact();
+  return !pool.owns(nullptr);
 }
 
 int main() {
@@ -102,7 +104,7 @@ int main() {
   if (!run_arena_duplicate_key_and_nesting(duplicate_key_map, nested_indefinite_array)) {
     return 1;
   }
-  if (!run_canary_detection()) {
+  if (!run_owns_check()) {
     return 1;
   }
   return 0;

@@ -10,10 +10,11 @@
 // NDEBUG strips it in release builds, and inside a consteval/constexpr
 // evaluation a *failing* assert() simply makes the enclosing expression
 // not a core constant expression -- GCC/Clang report that as an ordinary
-// compile error, which is exactly the desired "canary violated => hard
+// compile error, which is exactly the desired "foreign pointer => hard
 // failure" behavior. It never actually fires on the legitimate decode
-// path (nothing stomps the caller's arrays mid-evaluation); it exists for
-// the genuine-misuse case NodePool::canaries_intact() documents.
+// path (every Node* a well-formed decode ever sees genuinely came from
+// this pool's own nodes_ array); it exists for the genuine-misuse case
+// NodePool::owns() documents.
 #define ARENA_ASSERT(cond) assert(cond)
 
 // ---------------------------------------------------------------------------
@@ -45,9 +46,11 @@
 // ordinary local/static object, whose lifetime the caller already
 // understands and controls (a std::array on their stack, a static, a
 // member of a longer-lived object -- anything with a stable address for as
-// long as the decoded tree is used). See NodePool::canaries_intact() below
-// for a defensive, best-effort runtime check of that precondition -- it is
-// not, and cannot be, a substitute for the caller actually upholding it.
+// long as the decoded tree is used). See NodePool::owns() below for a
+// defensive, best-effort runtime check against a *different* mistake
+// (handing this pool a Node* that was never actually one of its own) --
+// it is not, and cannot be, a substitute for the caller upholding the
+// buffer's lifetime, which no runtime check can establish after the fact.
 //
 // This file #includes constexpr_cbor.hpp rather than duplicating its
 // shared, non-allocating primitives (decode_length, decode_uint/negint,
@@ -103,16 +106,6 @@ struct Node {
   friend constexpr bool operator==(const Node&, const Node&) = default;
 };
 
-namespace detail {
-// Two distinct magic words bracketing the caller's byte storage (see
-// NodePool::canaries_intact()) -- distinct so a canary found at the wrong
-// end (e.g. the storage span got reversed/aliased) is also detectable, not
-// just "present or absent."
-inline constexpr std::uint64_t byte_canary_begin = 0x4152454e41424f46ull;  // "ARENABOF"
-inline constexpr std::uint64_t byte_canary_end = 0x4152454e41454f46ull;   // "ARENAEOF"
-constexpr std::size_t canary_bytes = sizeof(std::uint64_t);
-}  // namespace detail
-
 // A small, non-owning, trivially-copyable VIEW over three caller-owned
 // spans -- see this file's own top-of-file comment for the ownership split
 // this embodies and the precondition it rests on (the caller's storage
@@ -121,11 +114,9 @@ constexpr std::size_t canary_bytes = sizeof(std::uint64_t);
 // node_storage holds every scalar and composite Node this value's whole
 // decoded tree may need; ref_storage holds the flat Node* reference slots
 // array/map children are indexed through (see ArrayRef/MapRef above);
-// byte_storage backs every string/bignum's content, with
-// detail::canary_bytes reserved at each end for NodePool::canaries_intact()
-// (see its own comment). Running out of any of the three during decode is
-// a refusal, not a crash -- exactly like every other contract violation in
-// this codec.
+// byte_storage backs every string/bignum's content. Running out of any of
+// the three during decode is a refusal, not a crash -- exactly like every
+// other contract violation in this codec.
 struct NodePool {
   Node* nodes_ = nullptr;
   std::size_t node_capacity_ = 0;
@@ -135,35 +126,20 @@ struct NodePool {
   std::size_t ref_capacity_ = 0;
   std::size_t ref_count_ = 0;
 
-  std::uint8_t* bytes_begin_ = nullptr;   // usable region starts after the begin canary
-  std::size_t byte_capacity_ = 0;         // usable capacity, canaries already excluded
+  std::uint8_t* bytes_begin_ = nullptr;
+  std::size_t byte_capacity_ = 0;
   std::size_t byte_count_ = 0;
-  std::uint8_t* canary_begin_ = nullptr;  // nullptr if byte_storage was too small to hold both canaries
-  std::uint8_t* canary_end_ = nullptr;
 
   constexpr NodePool(std::span<Node> node_storage, std::span<Node*> ref_storage,
                       std::span<std::uint8_t> byte_storage)
       : nodes_(node_storage.data()),
         node_capacity_(node_storage.size()),
         refs_(ref_storage.data()),
-        ref_capacity_(ref_storage.size()) {
-    if (byte_storage.size() >= 2 * detail::canary_bytes) {
-      canary_begin_ = byte_storage.data();
-      canary_end_ = byte_storage.data() + byte_storage.size() - detail::canary_bytes;
-      write_canary(canary_begin_, detail::byte_canary_begin);
-      write_canary(canary_end_, detail::byte_canary_end);
-      bytes_begin_ = byte_storage.data() + detail::canary_bytes;
-      byte_capacity_ = byte_storage.size() - 2 * detail::canary_bytes;
-    }
-    // byte_storage smaller than two canaries' worth: byte_capacity_ stays
-    // 0 (every allocate_bytes call with a non-empty source simply refuses,
-    // same as ordinary exhaustion), and canaries_intact() treats "no
-    // canaries were ever written" as vacuously true -- there is nothing
-    // to protect in storage too small to hold the guard itself.
-  }
+        ref_capacity_(ref_storage.size()),
+        bytes_begin_(byte_storage.data()),
+        byte_capacity_(byte_storage.size()) {}
 
   constexpr Node* allocate_node(Node n) {
-    ARENA_ASSERT(canaries_intact());
     if (node_count_ >= node_capacity_) return nullptr;
     nodes_[node_count_] = n;
     return &nodes_[node_count_++];
@@ -176,7 +152,6 @@ struct NodePool {
   // through; it is NOT a Node allocation, which is the whole point of
   // this design -- see this file's own top comment.
   constexpr Node** reserve_refs(std::size_t count) {
-    ARENA_ASSERT(canaries_intact());
     if (count > ref_capacity_ - ref_count_) return nullptr;
     Node** first = &refs_[ref_count_];
     ref_count_ += count;
@@ -184,7 +159,6 @@ struct NodePool {
   }
 
   constexpr const std::uint8_t* allocate_bytes(std::span<const std::uint8_t> src) {
-    ARENA_ASSERT(canaries_intact());
     if (src.size() > byte_capacity_ - byte_count_) return nullptr;
     std::uint8_t* dest = bytes_begin_ + byte_count_;
     // std::copy over a contiguous range of a trivial type lowers to
@@ -204,46 +178,41 @@ struct NodePool {
     return std::span<const std::uint8_t>(ref.data, ref.length);
   }
 
-  constexpr const Node& child(const ArrayRef& ref, std::size_t i) const { return *ref.first_child[i]; }
-  constexpr const Node& map_key(const MapRef& ref, std::size_t i) const { return *ref.first_pair[2 * i]; }
+  // Best-effort, debug-only (NDEBUG-stripped, like the plain assert() it
+  // wraps elsewhere) check that `ptr` genuinely points somewhere inside
+  // this pool's own node storage -- a pure address-range comparison, never
+  // a dereference, so it works regardless of whether `*ptr` itself would
+  // be safe to read. This catches a Node* that doesn't belong to this pool
+  // at all: one left over from an unrelated or already-destroyed pool,
+  // one derived from bad pointer arithmetic, a null/garbage value. It does
+  // NOT, and cannot, catch the pool's own storage having moved out from
+  // under it: nodes_/node_capacity_ are themselves just members of this
+  // object, captured once, and if the whole arena relocates without this
+  // NodePool's members being updated to match, every pointer involved --
+  // including nodes_ itself -- is equally stale, and the comparison below
+  // tells you nothing about that (it would still report ptr as "in range"
+  // relative to those equally-stale bounds). That category of mistake --
+  // the backing buffer itself moving -- is the one genuinely uncatchable
+  // precondition violation this design has; see this file's own top
+  // comment for why pointers are safe to use here regardless, as long as
+  // that precondition holds.
+  constexpr bool owns(const Node* ptr) const { return ptr != nullptr && ptr >= nodes_ && ptr < nodes_ + node_capacity_; }
+
+  constexpr const Node& child(const ArrayRef& ref, std::size_t i) const {
+    ARENA_ASSERT(owns(ref.first_child[i]));
+    return *ref.first_child[i];
+  }
+  constexpr const Node& map_key(const MapRef& ref, std::size_t i) const {
+    ARENA_ASSERT(owns(ref.first_pair[2 * i]));
+    return *ref.first_pair[2 * i];
+  }
   constexpr const Node& map_value(const MapRef& ref, std::size_t i) const {
+    ARENA_ASSERT(owns(ref.first_pair[2 * i + 1]));
     return *ref.first_pair[2 * i + 1];
   }
-  constexpr const Node& tag_child(const TagRef& ref) const { return *ref.child; }
-
-  // Best-effort, debug-only (NDEBUG-stripped, like the plain assert() it
-  // wraps) defensive check that the caller's storage still looks like what
-  // this pool was built over: the byte-storage canaries are still exactly
-  // where they were written, and the node/ref counters are still within
-  // their own capacities. This catches common misuse -- the caller's
-  // buffer being reused for something else, a stale/moved-from NodePool,
-  // accidental corruption -- but it is NOT a general dangling-buffer
-  // detector: a buffer that has genuinely gone out of scope and whose
-  // memory now happens to hold something that never touches the canary
-  // words or exceeds the counts is ordinary, uncatchable UB, same as
-  // dereferencing any other dangling pointer. The caller upholding "the
-  // buffer outlives every decoded tree into it" is a precondition this
-  // function can help catch violations of, not a guarantee it establishes.
-  constexpr bool canaries_intact() const {
-    if (node_count_ > node_capacity_) return false;
-    if (ref_count_ > ref_capacity_) return false;
-    if (canary_begin_ == nullptr) return true;  // storage too small to hold canaries at all -- see ctor
-    return read_canary(canary_begin_) == detail::byte_canary_begin &&
-           read_canary(canary_end_) == detail::byte_canary_end;
-  }
-
- private:
-  static constexpr void write_canary(std::uint8_t* dest, std::uint64_t value) {
-    for (std::size_t i = 0; i < sizeof(value); ++i) {
-      dest[i] = static_cast<std::uint8_t>(value >> (8 * (sizeof(value) - 1 - i)));
-    }
-  }
-  static constexpr std::uint64_t read_canary(const std::uint8_t* src) {
-    std::uint64_t value = 0;
-    for (std::size_t i = 0; i < sizeof(value); ++i) {
-      value = (value << 8) | src[i];
-    }
-    return value;
+  constexpr const Node& tag_child(const TagRef& ref) const {
+    ARENA_ASSERT(owns(ref.child));
+    return *ref.child;
   }
 };
 
@@ -443,6 +412,8 @@ constexpr std::optional<std::size_t> checked_node_count(std::uint64_t count, std
 // semantics (order-sensitive for arrays/maps, no canonical-equivalence
 // resolution -- bytes are bytes, same stance as the rest of this library).
 constexpr bool node_equal(const NodePool& pool, const Node* a_ptr, const Node* b_ptr) {
+  ARENA_ASSERT(pool.owns(a_ptr));
+  ARENA_ASSERT(pool.owns(b_ptr));
   const Node& a = *a_ptr;
   const Node& b = *b_ptr;
   return std::visit(
@@ -814,6 +785,7 @@ constexpr bool append_float_into(std::span<std::uint8_t> out, std::size_t& pos, 
 // decode_value above.
 constexpr std::optional<std::size_t> encode_value(const NodePool& pool, const Node* node, std::span<std::uint8_t> out,
                                                     std::size_t pos = 0) {
+  ARENA_ASSERT(pool.owns(node));
   return std::visit(
       [&](const auto& v) -> std::optional<std::size_t> {
         using T = std::decay_t<decltype(v)>;

@@ -274,17 +274,25 @@ What's structurally different from the heap-based API, and why:
   `unique_ptr` doesn't help here: it implies heap ownership, which doesn't
   apply to a stack-resident `ArenaStorage` at all, and the actual contract —
   "don't move or destroy this while a decoded tree points into it" — isn't
-  something any smart pointer adds over a plain reference). As a defensive,
-  best-effort check, `NodePool` writes two magic "canary" words bracketing
-  the caller's byte storage at construction and re-checks them (via `assert()`,
-  stripped in release builds under `NDEBUG`) on every `allocate_node`/
-  `reserve_refs`/`allocate_bytes` call, exposed publicly as
-  `canaries_intact()`. This catches common misuse — the caller's buffer being
-  reused for something else, a stale/moved-from `NodePool`, accidental
-  corruption — but it is **not** a general dangling-buffer detector: a buffer
-  that has genuinely gone out of scope and had its memory silently repurposed
-  by something that never touches the canary words is ordinary, uncatchable
-  UB, the same as dereferencing any other dangling pointer.
+  something any smart pointer adds over a plain reference; a moving-buffer
+  content check doesn't help either, since the content just moves with it).
+  As a defensive, best-effort check against a narrower, genuinely catchable
+  mistake, `NodePool::owns(const Node*)` checks — via pure address-range
+  comparison, never a dereference — whether a given pointer actually falls
+  inside *this* pool's own node storage, and `ARENA_ASSERT(owns(...))` (a
+  thin `assert()` wrapper, stripped under `NDEBUG`) guards every place a
+  `Node*` crosses back into the library (`child`/`map_key`/`map_value`/
+  `tag_child`, `encode_value`, `node_equal`, `ArenaBuilder::make_array`/
+  `make_map`). This catches a `Node*` that never belonged to this pool at
+  all — one left over from an unrelated or already-destroyed pool, bad
+  pointer arithmetic, a stray null. It does **not** catch the pool's own
+  storage having moved: `nodes_`/`node_capacity_` are themselves just
+  members captured once, and if the whole arena relocates without this
+  `NodePool`'s members being updated, every pointer involved — `nodes_`
+  included — is equally stale, so the range check can't notice anything
+  is wrong. That category of mistake is the one genuinely uncatchable
+  precondition violation here, same as dereferencing any other dangling
+  pointer in C++.
 
 See `tests/test_arena.cpp` for the full suite (round-trips against the same
 official vectors `tests/test_array.cpp`/`test_map.cpp`/`test_tag.cpp` use for
@@ -441,13 +449,15 @@ bignums, tags, non-string map keys) are rendered.
 performance, memory usage, correctness, and flexibility, with real
 numbers from a reproducible Docker build (`docker build -t cbor-bench -f
 benchmarks/Dockerfile . && docker run --rm cbor-bench`). Short version:
-tinycbor/QCBOR are still smaller in code size and faster raw decoders
-across the board (hand-tuned C state machines); the no-malloc Arena
-mode is consistently competitive with tinycbor, usually within 10-20%.
-constexpr-cbor's case is compile-time-proven correctness, a real
-zero-malloc mode *and* a generic owned-tree mode as equally first-class
-options, and caller-tunable nesting depth/UTF-8 validation/duplicate-key
-policy where the others hard-code one behavior. See
+tinycbor/QCBOR are still smaller in code size, consistently and by a wide
+margin (hand-tuned C state machines, no `std::variant` dispatch); raw
+decode throughput is the one dimension that swings hard between runs on
+the same host — the no-malloc Arena mode has measured anywhere from
+clearly behind both to clearly ahead of both. constexpr-cbor's case is
+compile-time-proven correctness, a real zero-malloc mode *and* a generic
+owned-tree mode as equally first-class options, and caller-tunable
+nesting depth/UTF-8 validation/duplicate-key policy where the others
+hard-code one behavior. See
 `benchmarks/README.md` for the full numbers and methodology, including
 how Arena's internals moved from index-based to pointer-based
 indirection and what that did to code size.

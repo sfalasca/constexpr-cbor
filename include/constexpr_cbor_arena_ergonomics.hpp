@@ -302,6 +302,7 @@ struct ArenaBuilder {
     Node** first = pool->reserve_refs(children.size());
     if (!first) return std::nullopt;
     for (std::size_t i = 0; i < children.size(); ++i) {
+      ARENA_ASSERT(pool->owns(children[i].node));  // catches a child view from a different pool
       first[i] = const_cast<Node*>(children[i].node);
     }
     return alloc(Node{.data = ArrayRef{.first_child = first, .count = children.size()}});
@@ -311,6 +312,8 @@ struct ArenaBuilder {
     Node** first = pool->reserve_refs(2 * pairs.size());
     if (!first) return std::nullopt;
     for (std::size_t i = 0; i < pairs.size(); ++i) {
+      ARENA_ASSERT(pool->owns(pairs[i].first.node));
+      ARENA_ASSERT(pool->owns(pairs[i].second.node));
       first[2 * i] = const_cast<Node*>(pairs[i].first.node);
       first[2 * i + 1] = const_cast<Node*>(pairs[i].second.node);
     }

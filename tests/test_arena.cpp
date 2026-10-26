@@ -403,10 +403,9 @@ consteval bool test_decode_refuses_when_ref_pool_exhausted() {
 }
 static_assert(test_decode_refuses_when_ref_pool_exhausted());
 
-// Same idea for the byte arena: a 3-byte string doesn't fit the usable
-// capacity left after the two 8-byte canaries (18 total -> 2 usable).
+// Same idea for the byte arena: a 3-byte string doesn't fit a 2-byte pool.
 constexpr bool arena_decode_ok_tiny_byte_pool(std::span<const std::uint8_t> bytes) {
-  ArenaStorage<16, 16, 18> storage;
+  ArenaStorage<16, 16, 2> storage;
   auto pool = storage.make_pool();
   return decode_value(pool, bytes).has_value();
 }
