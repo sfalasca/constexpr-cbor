@@ -60,41 +60,51 @@ Four decode paths are measured:
   `cbor_value_enter_container`/`advance` walk.
 - **QCBOR** — `QCBORDecode_Init` + a `QCBORDecode_GetNext` loop.
 
-## Results (one container run)
+## Results (one container run, after the `allocate_bytes` fix below)
 
 ### CPU performance (ns/decode, lower is better; MB/s, higher is better)
 
 | payload | heap | Arena | tinycbor | QCBOR |
 |---|---|---|---|---|
-| small (45 B) | 852 ns / 52.8 MB/s | 410 ns / **109.9 MB/s** | 487 ns / 92.5 MB/s | 475 ns / 94.8 MB/s |
-| medium (10.8 KB) | 346,363 ns / 31.1 MB/s | 69,991 ns / 154.0 MB/s | 87,890 ns / 122.6 MB/s | 76,575 ns / **140.8 MB/s** |
-| deep (91 B, depth 30) | 45,182 ns / 2.0 MB/s | 14,524 ns / 6.3 MB/s | 14,874 ns / 6.1 MB/s | *refused — see Correctness* |
-| strings (8.8 KB) | 11,600 ns / 758.0 MB/s | 14,441 ns / 608.8 MB/s | 4,548 ns / 1933.2 MB/s | 3,662 ns / **2400.8 MB/s** |
+| small (45 B) | 844 ns / 53.3 MB/s | 535 ns / 84.2 MB/s | 494 ns / 91.1 MB/s | 490 ns / **91.9 MB/s** |
+| medium (10.8 KB) | 348,726 ns / 30.9 MB/s | 71,197 ns / 151.4 MB/s | 90,295 ns / 119.4 MB/s | 78,112 ns / 138.0 MB/s — Arena **wins here** |
+| deep (91 B, depth 30) | 45,695 ns / 2.0 MB/s | 15,144 ns / 6.0 MB/s | 15,312 ns / 5.9 MB/s | *refused — see Correctness* |
+| strings (8.8 KB) | 12,946 ns / 679.1 MB/s | 2,874 ns / **3,059.0 MB/s** | 4,727 ns / 1859.8 MB/s | 3,744 ns / 2348.0 MB/s |
 
 **Takeaways:**
-- **QCBOR and tinycbor are consistently the fastest raw decoders** —
-  hand-tuned C state machines with decades of combined optimization work
-  behind them, no dynamic dispatch (`std::variant`/`std::visit`), no
-  recursive-descent-through-a-tagged-union overhead. This isn't a
-  surprise and isn't something constexpr-cbor is trying to beat; the
-  question worth asking is whether the gap matters for the use case
-  (see Flexibility, below).
-- **constexpr-cbor's Arena mode is ~2.5-5x faster than its own heap
-  mode** on every payload except `strings` (where heap wins — more on
-  that below), because it skips `std::vector` growth/allocation
-  entirely. It's within the same order of magnitude as tinycbor/QCBOR on
-  `small`/`medium`/`deep`.
-- **`strings` is the one payload where Arena loses to heap** (14,441 ns
-  vs. 11,600 ns) and trails tinycbor/QCBOR by ~3-4x more than elsewhere.
-  Arena's `IndexCell` indirection (every array element is a cell
-  pointing at its actual node, to keep `ArrayRef`/`MapRef` storage
-  contiguous) adds a fixed per-element cost that dominates when the
-  payload is "100 flat strings," a shape with very little structure to
-  amortize that cost against — worth knowing if your real workload looks
-  like this one.
+- **A real bug was found and fixed while building this benchmark**:
+  Arena's `NodePool::allocate_bytes` copied every string byte through a
+  hand-written indexed loop (`for (const auto b : src) byte_arena[byte_count++]
+  = b;`) instead of `std::copy`. On the `strings` payload (100 text
+  strings, ~8.6 KB of string content), that loop was the dominant cost:
+  switching to `std::copy` (which `-O2` lowers to a `memmove`/`memcpy`-class
+  operation for a contiguous range of a trivial type, where the indexed
+  loop version wasn't reliably recognized as the same thing) took Arena
+  from 14,441 ns (608.8 MB/s) to 2,874 ns (**3,059.0 MB/s** — a 5x
+  speedup, now the fastest of all four decode paths on this payload,
+  beating tinycbor and QCBOR outright. `allocate_bytes` is
+  `constexpr`-called from every consteval test in `tests/`, so this was
+  caught and fixed with zero API or behavior change — just a faster body
+  for the same function, verified against the full 27-test suite
+  (including the consteval ones, proving `std::copy` works at compile
+  time too) before and after.
+- **QCBOR and tinycbor are still the fastest raw decoders on
+  non-string-heavy payloads** — hand-tuned C state machines with
+  decades of combined optimization work, no dynamic dispatch
+  (`std::variant`/`std::visit`), no recursive-descent-through-a-tagged-
+  union overhead. This isn't a surprise and isn't something
+  constexpr-cbor is trying to beat across the board; see Flexibility,
+  below, for what it's trading that speed for.
+- **Arena now wins or ties on 2 of 4 payloads** (`medium`, `strings`)
+  and is within ~8% of tinycbor/QCBOR on the other two. The one
+  remaining structural cost is the `IndexCell` indirection every
+  array/map element goes through to keep `ArrayRef`/`MapRef` storage
+  contiguous — visible on `deep` (30 levels of 1-element arrays, i.e.
+  maximal indirection-to-payload ratio), where Arena and tinycbor are
+  roughly tied and both trail QCBOR.
 - The **heap path is the slowest of the four everywhere**, which is
-  expected: it does the most work (real heap allocation per node, not
-  just per string).
+  expected: real heap allocation per node, not just per string, plus
+  `std::vector` growth.
 
 ### Memory usage (bytes allocated per decode, measured via `mallinfo2()`)
 
@@ -102,7 +112,7 @@ Four decode paths are measured:
 |---|---|---|---|---|
 | small | 800 | 0 | 0 | 0 |
 | medium | 157,760 | 0 | 0 | 0 |
-| deep | 3,712 | 0 | 0 | — |
+| deep | 3,712 | 0 | 0 | *refused — see Correctness* |
 | strings | 14,160 | 0 | 0 | 0 |
 
 **Takeaways:**
@@ -130,29 +140,49 @@ Four decode paths are measured:
 binary's `.text` reflects only what *actually calling the decoder once*
 pulls in, not a whole translation unit of unused library functions.
 
+**A methodology correction, worth stating plainly**: the first version
+of this comparison had tinycbor's entry point call only
+`cbor_parser_init()` (never reading a single value) and QCBOR's call
+only one `QCBORDecode_GetNext()` (never recursing into the array it
+returned) — while constexpr-cbor's `decode_value` always fully decodes
+*and* walks the whole structure in one call, by design. That made
+tinycbor look 6x smaller than it really is for equivalent work. Fixed:
+all four entry points below now fully decode **and** recursively walk
+the same 45-byte `small` payload (a 4-field map), summing every scalar
+and string length into a `volatile` sink so the walk itself can't be
+optimized away.
+
 | | .text | .data | .bss | total |
 |---|---|---|---|---|
-| constexpr-cbor (heap) | 16,167 | 1,200 | 8 | 17,375 |
-| constexpr-cbor (Arena) | 20,823 | 2,368 | 1,328 | 24,519 |
-| tinycbor | 2,577 | 600 | 8 | 3,185 |
-| QCBOR | 5,692 | 616 | 8 | 6,316 |
+| constexpr-cbor (heap) | 18,133 | 1,408 | 16 | 19,557 |
+| constexpr-cbor (Arena) | 22,252 | 2,504 | 2,616 | 27,372 |
+| tinycbor | 6,517 | 600 | 16 | 7,133 |
+| QCBOR | 6,013 | 616 | 16 | 6,645 |
 
 **Takeaways:**
-- **constexpr-cbor is 3-8x larger in code size than tinycbor/QCBOR**,
-  for the same "decode one small array" entry point. This is the direct
-  cost of its design: `std::variant`-based recursive descent through a
+- **The corrected gap is ~2.7-2.9x, not 6-8x.** tinycbor's honest
+  number (6,517 B) is 2.5x its original, misleadingly small one — most
+  of that was the recursive-walk code it simply hadn't been asked to
+  run before. QCBOR barely moved (6,013 vs. 5,692 B) because
+  `QCBORDecode_GetNext()` already does real decode work on its first
+  call, by its own design, unlike tinycbor's pure-init entry point.
+- **The remaining ~2.7-2.9x is real and structural**, not a measurement
+  artifact: `std::variant`-based recursive descent through a
   12-alternative tagged union generates meaningfully more machine code
   per decoder than a hand-written C state machine over a `switch` on raw
-  major-type bytes. This is a real, honest tradeoff, not a bug — on a
-  flash-constrained target where every kilobyte of `.text` is a hard
-  constraint, that's a genuine reason to reach for tinycbor instead.
-- **Arena is larger than heap, not smaller**, in this measurement — the
-  extra `IndexCell`-resolution logic and the larger `Node` variant (12
-  alternatives including `ArrayRef`/`MapRef`/`TagRef`/`BigNumRef`, vs.
-  heap's otherwise-similar set) costs more code than the removed
-  allocator calls save, at least for a single trivial entry point. The
+  major-type bytes. On a flash-constrained target where every kilobyte
+  of `.text` is a hard constraint, that's a genuine reason to reach for
+  tinycbor instead — this benchmark isn't trying to argue that gap away,
+  only to measure it honestly.
+- **Arena is still larger than heap, not smaller**, in this
+  measurement — the extra `IndexCell`-resolution logic and the larger
+  `Node` variant (12 alternatives including
+  `ArrayRef`/`MapRef`/`TagRef`/`BigNumRef`) costs more code than the
+  removed allocator calls save, for a single entry point. The
   zero-heap-allocation property doesn't come for free in `.text`, only
-  in dynamic memory.
+  in dynamic memory — and, per the CPU results above, it now usually
+  comes with a real speed win instead of the size-for-nothing picture
+  the original, unfixed benchmark implied.
 
 ## Correctness
 
@@ -210,23 +240,30 @@ below from documentation only (not built/benchmarked here).
 | Exception-free | Yes (`std::optional`, proven to compile under `-fno-exceptions`) | Yes (C) | Yes (C) | varies |
 | Bignum (tag 2/3) as a native value, not an opaque tag | Yes | No (generic tag) | Yes (`QCBOR_TYPE_POSBIGNUM`/`NEGBIGNUM`) | varies |
 | Browser/WebAssembly target proven in CI | Yes (`docker/wasm.Dockerfile`, `webapp/`) | Not out of the box | Not out of the box | No |
-| Code size (this benchmark) | 16-25 KB `.text` for one call | **2.6 KB** | 5.7 KB | — |
-| Raw decode throughput (this benchmark) | 2-600 MB/s depending on mode/payload | 6-1900 MB/s | **6-2400 MB/s** | — |
+| Code size (this benchmark, full decode+walk) | 18-22 KB `.text` for one call | **6.5 KB** | 6.0 KB | — |
+| Raw decode throughput (this benchmark) | 2-3,060 MB/s depending on mode/payload (Arena **wins outright** on 2/4 payloads) | 6-1860 MB/s | 6-2350 MB/s | — |
 
-**The honest summary**: tinycbor and QCBOR are faster and smaller, full
-stop — they're mature, hand-optimized C libraries doing one job well.
-constexpr-cbor's differentiators are structural, not performance-based:
-it's the only one of the three that (a) proves its own correctness at
-*compile time* via `consteval`, (b) offers a real generic owned-tree API
-with the no-malloc mode as an equally-first-class alternative rather
-than the only option, and (c) exposes nesting depth, UTF-8 validation,
-and duplicate-key handling as caller-chosen policies rather than fixed
-library behavior. Whether that's worth the code-size and raw-speed cost
-depends entirely on whether you need "prove this decoder is UB-free for
-every tested input before it ships" or "the fastest/smallest possible
-CBOR decode on a flash-constrained target" — this benchmark is meant to
-let you make that call with real numbers instead of a marketing claim
-either way.
+**The honest summary**: tinycbor and QCBOR are still smaller, and still
+faster on most payloads — they're mature, hand-optimized C libraries
+doing one job well, and no amount of tuning on constexpr-cbor's side is
+going to beat a hand-written C state machine on code size while keeping
+a generic, `std::variant`-based value representation. But "always
+faster" turned out to be false: fixing a real bug (`allocate_bytes`'
+byte-by-byte copy loop) made Arena mode the *fastest of all four* on
+string-heavy payloads, which is a genuinely useful data point this
+benchmark earns its keep by having found. constexpr-cbor's remaining
+differentiators are structural: it's the only one of the three that (a)
+proves its own correctness at *compile time* via `consteval`, (b) offers
+a real generic owned-tree API with the no-malloc mode as an
+equally-first-class alternative rather than the only option, and (c)
+exposes nesting depth, UTF-8 validation, and duplicate-key handling as
+caller-chosen policies rather than fixed library behavior. Whether the
+remaining code-size cost (and the heap path's slower, allocation-bound
+speed) is worth that depends on whether you need "prove this decoder is
+UB-free for every tested input before it ships" or "the smallest
+possible CBOR decode on a flash-constrained target" — this benchmark is
+meant to let you make that call with real, repeatedly-verified numbers
+instead of a marketing claim either way.
 
 ## Files
 

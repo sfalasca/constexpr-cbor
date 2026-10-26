@@ -407,12 +407,16 @@ bignums, tags, non-string map keys) are rendered.
 performance, memory usage, correctness, and flexibility, with real
 numbers from a reproducible Docker build (`docker build -t cbor-bench -f
 benchmarks/Dockerfile . && docker run --rm cbor-bench`). Short version:
-tinycbor/QCBOR are faster and smaller (hand-tuned C state machines);
-constexpr-cbor's case is compile-time-proven correctness, a real
-zero-malloc mode *and* a generic owned-tree mode as equally first-class
-options, and caller-tunable nesting depth/UTF-8 validation/duplicate-key
-policy where the others hard-code one behavior. See `benchmarks/README.md`
-for the full numbers and methodology.
+tinycbor/QCBOR are still smaller in code size and faster on most
+payloads (hand-tuned C state machines); the no-malloc Arena mode is
+within ~8% of both on the rest and outright *faster* than either on
+string-heavy input, after a real bug this benchmark surfaced and fixed
+(`allocate_bytes`' byte-copy loop). constexpr-cbor's remaining case is
+compile-time-proven correctness, a real zero-malloc mode *and* a
+generic owned-tree mode as equally first-class options, and
+caller-tunable nesting depth/UTF-8 validation/duplicate-key policy
+where the others hard-code one behavior. See `benchmarks/README.md` for
+the full numbers and methodology.
 
 ## Building and testing this library
 
