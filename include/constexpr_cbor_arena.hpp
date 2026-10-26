@@ -1,8 +1,20 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
 
 #include "constexpr_cbor.hpp"
+
+// assert() is used deliberately, not a bespoke contract-check helper: it
+// never throws (abort()s directly, so it's -fno-exceptions-compatible),
+// NDEBUG strips it in release builds, and inside a consteval/constexpr
+// evaluation a *failing* assert() simply makes the enclosing expression
+// not a core constant expression -- GCC/Clang report that as an ordinary
+// compile error, which is exactly the desired "canary violated => hard
+// failure" behavior. It never actually fires on the legitimate decode
+// path (nothing stomps the caller's arrays mid-evaluation); it exists for
+// the genuine-misuse case NodePool::canaries_intact() documents.
+#define ARENA_ASSERT(cond) assert(cond)
 
 // ---------------------------------------------------------------------------
 // No-malloc counterpart of constexpr_cbor.hpp, for environments where a heap
@@ -11,11 +23,31 @@
 // (for the recursive Array/Map/Tag alternatives); std::array<T,N> has no
 // such allowance, so a self-referential type cannot be stored inline in a
 // fixed-size array no matter how it's declared -- some indirection is
-// unavoidable. Here that indirection is an index into a flat, fixed-
-// capacity NodePool rather than a heap pointer: every decoded value
-// (including every array/map element and every tag's nested value) is a
-// Node living in pool.nodes, and a node never contains another node by
-// value, only by index.
+// unavoidable. Here that indirection is a pointer into a Node arena the
+// caller owns, rather than a heap pointer: every decoded value (including
+// every array/map element and every tag's nested value) is a Node living
+// in caller-supplied storage, and a node never contains another node by
+// value, only by pointer.
+//
+// The caller owns three things: a Node[] (every scalar and composite node),
+// a Node*[] (reference slots -- see ArrayRef/MapRef below for why these are
+// a separate category from Node[] itself), and a byte[] (the flat backing
+// store for every string/bignum's content). NodePool is a small, non-
+// owning, trivially-copyable VIEW over those three caller-owned spans --
+// never itself the thing that owns storage, the same relationship
+// std::span has to the container it views. This is a deliberate split: the
+// one thing this whole design depends on is that the caller's buffers
+// don't move or get destroyed while any decoded tree pointing into them is
+// still alive (every Node* this file ever hands back is a raw, unchecked
+// pointer into that caller storage) -- and separating "the view" from "the
+// storage" means the view can be freely copied/returned/reassigned without
+// that ever being a concern, while the storage itself is the caller's own,
+// ordinary local/static object, whose lifetime the caller already
+// understands and controls (a std::array on their stack, a static, a
+// member of a longer-lived object -- anything with a stable address for as
+// long as the decoded tree is used). See NodePool::canaries_intact() below
+// for a defensive, best-effort runtime check of that precondition -- it is
+// not, and cannot be, a substitute for the caller actually upholding it.
 //
 // This file #includes constexpr_cbor.hpp rather than duplicating its
 // shared, non-allocating primitives (decode_length, decode_uint/negint,
@@ -34,131 +66,202 @@ namespace ConstexprCbor::Arena {
 
 struct StringRef {
   CborValue::StringKind kind;
-  std::size_t offset;
+  const std::uint8_t* data;
   std::size_t length;
   friend constexpr bool operator==(const StringRef&, const StringRef&) = default;
 };
 
 struct BigNumRef {
   bool negative;
-  std::size_t offset;
+  const std::uint8_t* data;
   std::size_t length;
   friend constexpr bool operator==(const BigNumRef&, const BigNumRef&) = default;
 };
 
-// A child's slot always holds this: an index pointing at wherever the
-// child's actual node lives (which may be far away, if the child is
-// itself a composite that needed many nodes for its own subtree). This
-// one level of indirection is what makes "my N children are a contiguous
-// block of slots" achievable at all without knowing each child's final
-// size before decoding it.
-struct IndexCell {
-  std::size_t actual_index;
-  friend constexpr bool operator==(const IndexCell&, const IndexCell&) = default;
-};
-
 struct ArrayRef {
-  std::size_t first_child;  // count contiguous IndexCell nodes
+  Node* const* first_child;  // count contiguous Node* reference slots
   std::size_t count;
   friend constexpr bool operator==(const ArrayRef&, const ArrayRef&) = default;
 };
 
 struct MapRef {
-  std::size_t first_pair;  // 2*count contiguous IndexCell nodes: key, value, key, value, ...
+  Node* const* first_pair;  // 2*count contiguous Node* slots: key, value, key, value, ...
   std::size_t count;
   friend constexpr bool operator==(const MapRef&, const MapRef&) = default;
 };
 
 struct TagRef {
   std::uint64_t number;
-  std::size_t child;  // a direct index -- no indirection needed, a tag has exactly one child
+  Node* child;  // direct pointer -- no reference slot needed, a tag has exactly one child
   friend constexpr bool operator==(const TagRef&, const TagRef&) = default;
 };
 
 struct Node {
-  std::variant<std::monostate, std::nullptr_t, bool, std::uint64_t, NegativeInt,
-               double, StringRef, BigNumRef, CborValue::SimpleValue, ArrayRef,
-               MapRef, TagRef, IndexCell>
+  std::variant<std::monostate, std::nullptr_t, bool, std::uint64_t, NegativeInt, double, StringRef,
+               BigNumRef, CborValue::SimpleValue, ArrayRef, MapRef, TagRef>
       data;
   friend constexpr bool operator==(const Node&, const Node&) = default;
 };
 
-// MaxNodes bounds how many Node slots this value's whole decoded tree may
-// use (every scalar, every array/map element's IndexCell, every composite
-// itself); MaxBytes bounds the flat arena backing every string/bignum's
-// content. Both are caller-tunable the same way MaxDepth already is above
-// -- running out of either is a refusal, not a crash.
-template <std::size_t MaxNodes, std::size_t MaxBytes>
-struct NodePool {
-  std::array<Node, MaxNodes> nodes{};
-  std::size_t node_count = 0;
-  std::array<std::uint8_t, MaxBytes> byte_arena{};
-  std::size_t byte_count = 0;
+namespace detail {
+// Two distinct magic words bracketing the caller's byte storage (see
+// NodePool::canaries_intact()) -- distinct so a canary found at the wrong
+// end (e.g. the storage span got reversed/aliased) is also detectable, not
+// just "present or absent."
+inline constexpr std::uint64_t byte_canary_begin = 0x4152454e41424f46ull;  // "ARENABOF"
+inline constexpr std::uint64_t byte_canary_end = 0x4152454e41454f46ull;   // "ARENAEOF"
+constexpr std::size_t canary_bytes = sizeof(std::uint64_t);
+}  // namespace detail
 
-  constexpr std::optional<std::size_t> allocate_node(Node n) {
-    if (node_count >= MaxNodes) return std::nullopt;
-    nodes[node_count] = n;
-    return node_count++;
+// A small, non-owning, trivially-copyable VIEW over three caller-owned
+// spans -- see this file's own top-of-file comment for the ownership split
+// this embodies and the precondition it rests on (the caller's storage
+// must not move or die while any decoded tree into it is alive).
+//
+// node_storage holds every scalar and composite Node this value's whole
+// decoded tree may need; ref_storage holds the flat Node* reference slots
+// array/map children are indexed through (see ArrayRef/MapRef above);
+// byte_storage backs every string/bignum's content, with
+// detail::canary_bytes reserved at each end for NodePool::canaries_intact()
+// (see its own comment). Running out of any of the three during decode is
+// a refusal, not a crash -- exactly like every other contract violation in
+// this codec.
+struct NodePool {
+  Node* nodes_ = nullptr;
+  std::size_t node_capacity_ = 0;
+  std::size_t node_count_ = 0;
+
+  Node** refs_ = nullptr;
+  std::size_t ref_capacity_ = 0;
+  std::size_t ref_count_ = 0;
+
+  std::uint8_t* bytes_begin_ = nullptr;   // usable region starts after the begin canary
+  std::size_t byte_capacity_ = 0;         // usable capacity, canaries already excluded
+  std::size_t byte_count_ = 0;
+  std::uint8_t* canary_begin_ = nullptr;  // nullptr if byte_storage was too small to hold both canaries
+  std::uint8_t* canary_end_ = nullptr;
+
+  constexpr NodePool(std::span<Node> node_storage, std::span<Node*> ref_storage,
+                      std::span<std::uint8_t> byte_storage)
+      : nodes_(node_storage.data()),
+        node_capacity_(node_storage.size()),
+        refs_(ref_storage.data()),
+        ref_capacity_(ref_storage.size()) {
+    if (byte_storage.size() >= 2 * detail::canary_bytes) {
+      canary_begin_ = byte_storage.data();
+      canary_end_ = byte_storage.data() + byte_storage.size() - detail::canary_bytes;
+      write_canary(canary_begin_, detail::byte_canary_begin);
+      write_canary(canary_end_, detail::byte_canary_end);
+      bytes_begin_ = byte_storage.data() + detail::canary_bytes;
+      byte_capacity_ = byte_storage.size() - 2 * detail::canary_bytes;
+    }
+    // byte_storage smaller than two canaries' worth: byte_capacity_ stays
+    // 0 (every allocate_bytes call with a non-empty source simply refuses,
+    // same as ordinary exhaustion), and canaries_intact() treats "no
+    // canaries were ever written" as vacuously true -- there is nothing
+    // to protect in storage too small to hold the guard itself.
   }
 
-  // Reserves `count` contiguous nodes (initialized as harmless
-  // placeholders), returning the index of the first one, or nullopt if
-  // they wouldn't fit.
-  constexpr std::optional<std::size_t> reserve_nodes(std::size_t count) {
-    if (count > MaxNodes - node_count) return std::nullopt;
-    const std::size_t first = node_count;
-    node_count += count;
+  constexpr Node* allocate_node(Node n) {
+    ARENA_ASSERT(canaries_intact());
+    if (node_count_ >= node_capacity_) return nullptr;
+    nodes_[node_count_] = n;
+    return &nodes_[node_count_++];
+  }
+
+  // Reserves `count` contiguous reference slots (left uninitialized --
+  // every caller of this immediately overwrites each one before anyone
+  // reads it back), returning a pointer to the first one, or nullptr if
+  // they wouldn't fit. This is the slot array ArrayRef/MapRef index
+  // through; it is NOT a Node allocation, which is the whole point of
+  // this design -- see this file's own top comment.
+  constexpr Node** reserve_refs(std::size_t count) {
+    ARENA_ASSERT(canaries_intact());
+    if (count > ref_capacity_ - ref_count_) return nullptr;
+    Node** first = &refs_[ref_count_];
+    ref_count_ += count;
     return first;
   }
 
-  constexpr std::optional<std::size_t> allocate_bytes(std::span<const std::uint8_t> src) {
-    if (src.size() > MaxBytes - byte_count) return std::nullopt;
-    const std::size_t offset = byte_count;
+  constexpr const std::uint8_t* allocate_bytes(std::span<const std::uint8_t> src) {
+    ARENA_ASSERT(canaries_intact());
+    if (src.size() > byte_capacity_ - byte_count_) return nullptr;
+    std::uint8_t* dest = bytes_begin_ + byte_count_;
     // std::copy over a contiguous range of a trivial type lowers to
     // memmove at -O2 (unlike the equivalent index-and-increment loop,
     // which a compiler is free to but isn't guaranteed to recognize the
     // same way); std::copy is constexpr since C++20, so this stays valid
     // in the consteval decode paths too.
-    std::copy(src.begin(), src.end(), byte_arena.begin() + static_cast<std::ptrdiff_t>(offset));
-    byte_count += src.size();
-    return offset;
+    std::copy(src.begin(), src.end(), dest);
+    byte_count_ += src.size();
+    return dest;
   }
 
   constexpr std::span<const std::uint8_t> bytes_of(const StringRef& ref) const {
-    return std::span<const std::uint8_t>(byte_arena).subspan(ref.offset, ref.length);
+    return std::span<const std::uint8_t>(ref.data, ref.length);
   }
   constexpr std::span<const std::uint8_t> bytes_of(const BigNumRef& ref) const {
-    return std::span<const std::uint8_t>(byte_arena).subspan(ref.offset, ref.length);
+    return std::span<const std::uint8_t>(ref.data, ref.length);
   }
 
-  // Resolves one level of IndexCell indirection transparently.
-  constexpr const Node& resolve(std::size_t idx) const {
-    const Node& n = nodes[idx];
-    if (const auto* cell = std::get_if<IndexCell>(&n.data)) {
-      return nodes[cell->actual_index];
-    }
-    return n;
-  }
-  // Same resolution as resolve(), but returning the index rather than a
-  // reference -- needed wherever the caller must recurse further (passing
-  // a reference down wouldn't let a recursive call index into `nodes`
-  // again), such as node_equal below.
-  constexpr std::size_t resolve_index(std::size_t idx) const {
-    if (const auto* cell = std::get_if<IndexCell>(&nodes[idx].data)) {
-      return cell->actual_index;
-    }
-    return idx;
-  }
-  constexpr const Node& child(const ArrayRef& ref, std::size_t i) const {
-    return resolve(ref.first_child + i);
-  }
-  constexpr const Node& map_key(const MapRef& ref, std::size_t i) const {
-    return resolve(ref.first_pair + 2 * i);
-  }
+  constexpr const Node& child(const ArrayRef& ref, std::size_t i) const { return *ref.first_child[i]; }
+  constexpr const Node& map_key(const MapRef& ref, std::size_t i) const { return *ref.first_pair[2 * i]; }
   constexpr const Node& map_value(const MapRef& ref, std::size_t i) const {
-    return resolve(ref.first_pair + 2 * i + 1);
+    return *ref.first_pair[2 * i + 1];
   }
-  constexpr const Node& tag_child(const TagRef& ref) const { return nodes[ref.child]; }
+  constexpr const Node& tag_child(const TagRef& ref) const { return *ref.child; }
+
+  // Best-effort, debug-only (NDEBUG-stripped, like the plain assert() it
+  // wraps) defensive check that the caller's storage still looks like what
+  // this pool was built over: the byte-storage canaries are still exactly
+  // where they were written, and the node/ref counters are still within
+  // their own capacities. This catches common misuse -- the caller's
+  // buffer being reused for something else, a stale/moved-from NodePool,
+  // accidental corruption -- but it is NOT a general dangling-buffer
+  // detector: a buffer that has genuinely gone out of scope and whose
+  // memory now happens to hold something that never touches the canary
+  // words or exceeds the counts is ordinary, uncatchable UB, same as
+  // dereferencing any other dangling pointer. The caller upholding "the
+  // buffer outlives every decoded tree into it" is a precondition this
+  // function can help catch violations of, not a guarantee it establishes.
+  constexpr bool canaries_intact() const {
+    if (node_count_ > node_capacity_) return false;
+    if (ref_count_ > ref_capacity_) return false;
+    if (canary_begin_ == nullptr) return true;  // storage too small to hold canaries at all -- see ctor
+    return read_canary(canary_begin_) == detail::byte_canary_begin &&
+           read_canary(canary_end_) == detail::byte_canary_end;
+  }
+
+ private:
+  static constexpr void write_canary(std::uint8_t* dest, std::uint64_t value) {
+    for (std::size_t i = 0; i < sizeof(value); ++i) {
+      dest[i] = static_cast<std::uint8_t>(value >> (8 * (sizeof(value) - 1 - i)));
+    }
+  }
+  static constexpr std::uint64_t read_canary(const std::uint8_t* src) {
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < sizeof(value); ++i) {
+      value = (value << 8) | src[i];
+    }
+    return value;
+  }
+};
+
+// Owning storage for a NodePool: the direct successor of this file's
+// earlier NTTP-sized NodePool<MaxNodes,MaxBytes>, now explicitly "the
+// buffer" rather than "the allocator" (NodePool above is the allocator --
+// see the split explained in this file's top comment). MaxRefs is an
+// independently-tunable third capacity, distinct from MaxNodes: every node
+// that's ever an array/map child needs exactly one reference slot, so
+// MaxRefs == MaxNodes is a safe, conservative default, but a caller
+// decoding shallowly-nested, mostly-scalar data can size it much smaller.
+template <std::size_t MaxNodes, std::size_t MaxRefs, std::size_t MaxBytes>
+struct ArenaStorage {
+  std::array<Node, MaxNodes> nodes{};
+  std::array<Node*, MaxRefs> refs{};
+  std::array<std::uint8_t, MaxBytes> bytes{};
+
+  constexpr NodePool make_pool() { return NodePool(nodes, refs, bytes); }
 };
 
 // Walks exactly one CBOR item structurally (definite or indefinite form)
@@ -303,17 +406,17 @@ constexpr std::optional<std::uint64_t> count_indefinite_map_pairs(std::span<cons
 }
 
 // A CBOR length/count field is a uint64_t (the wire format allows up to
-// 2^64-1 items), but NodePool indexes with std::size_t, which can be
-// narrower (32 bits on common embedded targets). Arena::decode_value
-// reserves a node slot for every item *before* decoding any of them (see
-// the array/map cases below), so a silently-truncating cast here would be
-// exactly the libcbor PR #387 shape of bug: a huge count wraps to a small
-// one, reserve_nodes "succeeds" against that undersized number, and the
-// loop -- which still iterates the real, untruncated uint64_t count --
-// then writes past the reservation. `multiplier` additionally guards the
-// *2 the map case needs for its key+value slot pairs. Returns nullopt
-// (the same refusal every other contract violation in this codec uses)
-// instead of truncating.
+// 2^64-1 items), but the reference-slot array indexes with std::size_t,
+// which can be narrower (32 bits on common embedded targets).
+// Arena::decode_value reserves a reference slot for every item *before*
+// decoding any of them (see the array/map cases below), so a silently-
+// truncating cast here would be exactly the libcbor PR #387 shape of bug:
+// a huge count wraps to a small one, reserve_refs "succeeds" against that
+// undersized number, and the loop -- which still iterates the real,
+// untruncated uint64_t count -- then writes past the reservation.
+// `multiplier` additionally guards the *2 the map case needs for its
+// key+value slot pairs. Returns nullopt (the same refusal every other
+// contract violation in this codec uses) instead of truncating.
 constexpr std::optional<std::size_t> checked_node_count(std::uint64_t count, std::size_t multiplier = 1) {
   const std::uint64_t size_max = std::numeric_limits<std::size_t>::max();
   const std::uint64_t wide_multiplier = multiplier;
@@ -331,7 +434,7 @@ constexpr std::optional<std::size_t> checked_node_count(std::uint64_t count, std
 
 }  // namespace detail
 
-// Structural equality between two already-decoded nodes, by index --
+// Structural equality between two already-decoded nodes, by pointer --
 // needed to detect a duplicate map key, since an arena map has no flat,
 // directly-comparable entries container the way the heap-based decoder's
 // std::vector<pair<CborValue,CborValue>> does. Mirrors CborValue's own
@@ -339,10 +442,9 @@ constexpr std::optional<std::size_t> checked_node_count(std::uint64_t count, std
 // Array/Map/Tag keys, which are legal CBOR map keys even if unusual) and
 // semantics (order-sensitive for arrays/maps, no canonical-equivalence
 // resolution -- bytes are bytes, same stance as the rest of this library).
-template <std::size_t MaxNodes, std::size_t MaxBytes>
-constexpr bool node_equal(const NodePool<MaxNodes, MaxBytes>& pool, std::size_t a_index, std::size_t b_index) {
-  const Node& a = pool.nodes[a_index];
-  const Node& b = pool.nodes[b_index];
+constexpr bool node_equal(const NodePool& pool, const Node* a_ptr, const Node* b_ptr) {
+  const Node& a = *a_ptr;
+  const Node& b = *b_ptr;
   return std::visit(
       [&](const auto& va) {
         return std::visit(
@@ -362,27 +464,20 @@ constexpr bool node_equal(const NodePool<MaxNodes, MaxBytes>& pool, std::size_t 
               } else if constexpr (std::is_same_v<TA, ArrayRef>) {
                 if (va.count != vb.count) return false;
                 for (std::size_t i = 0; i < va.count; ++i) {
-                  if (!node_equal(pool, pool.resolve_index(va.first_child + i),
-                                   pool.resolve_index(vb.first_child + i))) {
-                    return false;
-                  }
+                  if (!node_equal(pool, va.first_child[i], vb.first_child[i])) return false;
                 }
                 return true;
               } else if constexpr (std::is_same_v<TA, MapRef>) {
                 if (va.count != vb.count) return false;
                 for (std::size_t i = 0; i < va.count; ++i) {
-                  if (!node_equal(pool, pool.resolve_index(va.first_pair + 2 * i),
-                                   pool.resolve_index(vb.first_pair + 2 * i)) ||
-                      !node_equal(pool, pool.resolve_index(va.first_pair + 2 * i + 1),
-                                   pool.resolve_index(vb.first_pair + 2 * i + 1))) {
+                  if (!node_equal(pool, va.first_pair[2 * i], vb.first_pair[2 * i]) ||
+                      !node_equal(pool, va.first_pair[2 * i + 1], vb.first_pair[2 * i + 1])) {
                     return false;
                   }
                 }
                 return true;
               } else if constexpr (std::is_same_v<TA, TagRef>) {
                 return va.number == vb.number && node_equal(pool, va.child, vb.child);
-              } else if constexpr (std::is_same_v<TA, IndexCell>) {
-                return false;  // never reached: callers always pass resolved indices
               } else {
                 return va == vb;  // uint64_t, NegativeInt, double, bool, nullptr_t, monostate, SimpleValue
               }
@@ -393,44 +488,47 @@ constexpr bool node_equal(const NodePool<MaxNodes, MaxBytes>& pool, std::size_t 
 }
 
 // Arena-shaped counterpart of ::ConstexprCbor::is_duplicate_key_policy_v:
-// checks the on_duplicate<MaxNodes, MaxBytes>(NodePool&, size_t, size_t,
-// size_t, size_t) member template each policy in the enclosing namespace
-// also provides (picking an arbitrary concrete NodePool<1, 1> just to name
-// a complete type for the check -- the actual call site always deduces
-// its own real pool type). Partial specialization + void_t, not a plain
-// std::is_invocable_r_v on a bare decltype(&P::template on_duplicate<1,1>):
-// for a P that doesn't provide that member template at all, forming the
-// expression is a hard "no member named" error, and a class template's
-// base-class list isn't a SFINAE context, so that error would abort
-// compilation instead of letting the trait evaluate to false -- the same
-// reasoning as ::ConstexprCbor::is_duplicate_key_policy just above.
+// checks the on_duplicate(NodePool&, Node**, size_t, Node*, Node*) member
+// each policy in the enclosing namespace also provides. Once NodePool
+// carries no NTTPs, this overload no longer needs to be a member
+// *template* either -- but that also means a bare `&P::on_duplicate` is
+// now ambiguous between it and the heap-shaped std::vector overload (both
+// are plain, non-template overloads of the same name), so this needs the
+// same static_cast-to-a-concrete-function-pointer-type pin
+// ::ConstexprCbor::is_duplicate_key_policy_v uses for exactly that reason
+// -- see that trait's own comment for why a plain std::is_invocable_r_v
+// on a bare decltype(&P::on_duplicate) won't compile, and why the void_t
+// partial specialization (not a direct bool_constant) is required: for a
+// P that provides no Arena-shaped overload at all, the static_cast itself
+// is a hard "no matching function" error, and a class template's
+// base-class list isn't a SFINAE context, so void_t's own substitution-
+// failure-is-not-an-error protection is what lets this trait still
+// evaluate to false instead of aborting compilation.
 template <typename P, typename = void>
 struct is_duplicate_key_policy : std::false_type {};
 
 template <typename P>
 struct is_duplicate_key_policy<
-    P, std::void_t<decltype(&P::template on_duplicate<1, 1>)>>
-    : std::bool_constant<std::is_invocable_r_v<bool, decltype(&P::template on_duplicate<1, 1>), NodePool<1, 1>&,
-                                                 std::size_t, std::size_t, std::size_t, std::size_t>> {};
+    P, std::void_t<decltype(static_cast<bool (*)(NodePool&, Node**, std::size_t, Node*, Node*)>(&P::on_duplicate))>>
+    : std::true_type {};
 
 template <typename P>
 inline constexpr bool is_duplicate_key_policy_v = is_duplicate_key_policy<P>::value;
 
 struct DecodedNode {
-  std::size_t node_index;
+  Node* node;
   std::size_t bytes_consumed;
 };
 
 // The arena counterpart of ConstexprCbor::decode_value: same contract
 // (pure function over an immutable span, std::nullopt on any refusal),
-// but every allocation goes into the caller-supplied, fixed-capacity
-// `pool` instead of the heap -- running out of pool capacity is just
-// another refusal, indistinguishable from a malformed-input one, exactly
-// like NodePool::allocate_node/reserve_nodes/allocate_bytes already do.
-template <std::size_t MaxDepth = 32, typename Utf8Policy = NoUtf8Validation, typename KeyPolicy = RejectDuplicateKeys,
-          std::size_t MaxNodes, std::size_t MaxBytes>
-constexpr std::optional<DecodedNode> decode_value(NodePool<MaxNodes, MaxBytes>& pool,
-                                                    std::span<const std::uint8_t> bytes, std::size_t depth = 0) {
+// but every allocation goes into the caller-supplied `pool` instead of the
+// heap -- running out of pool capacity is just another refusal,
+// indistinguishable from a malformed-input one, exactly like
+// NodePool::allocate_node/reserve_refs/allocate_bytes already do.
+template <std::size_t MaxDepth = 32, typename Utf8Policy = NoUtf8Validation, typename KeyPolicy = RejectDuplicateKeys>
+constexpr std::optional<DecodedNode> decode_value(NodePool& pool, std::span<const std::uint8_t> bytes,
+                                                    std::size_t depth = 0) {
   if (bytes.empty()) return std::nullopt;
   const std::uint8_t major_type = bytes[0] >> 5;
 
@@ -438,22 +536,22 @@ constexpr std::optional<DecodedNode> decode_value(NodePool<MaxNodes, MaxBytes>& 
     case 0: {
       const auto u = decode_uint(bytes);
       if (!u) return std::nullopt;
-      const auto idx = pool.allocate_node(Node{.data = u->value});
-      if (!idx) return std::nullopt;
-      return DecodedNode{.node_index = *idx, .bytes_consumed = u->bytes_consumed};
+      const auto node = pool.allocate_node(Node{.data = u->value});
+      if (!node) return std::nullopt;
+      return DecodedNode{.node = node, .bytes_consumed = u->bytes_consumed};
     }
     case 1: {
       const auto n = decode_negint(bytes);
       if (!n) return std::nullopt;
-      const auto idx = pool.allocate_node(Node{.data = n->value});
-      if (!idx) return std::nullopt;
-      return DecodedNode{.node_index = *idx, .bytes_consumed = n->bytes_consumed};
+      const auto node = pool.allocate_node(Node{.data = n->value});
+      if (!node) return std::nullopt;
+      return DecodedNode{.node = node, .bytes_consumed = n->bytes_consumed};
     }
     case 2:
     case 3: {
       const auto kind = (major_type == 2) ? CborValue::StringKind::Bytes : CborValue::StringKind::Text;
       if (is_indefinite_or_break(bytes)) {
-        const std::size_t start_offset = pool.byte_count;
+        const std::uint8_t* start = pool.bytes_begin_ + pool.byte_count_;
         std::size_t consumed = 1;
         while (true) {
           if (consumed >= bytes.size()) return std::nullopt;
@@ -464,20 +562,20 @@ constexpr std::optional<DecodedNode> decode_value(NodePool<MaxNodes, MaxBytes>& 
           if (!pool.allocate_bytes(chunk->bytes)) return std::nullopt;
           consumed += chunk->bytes_consumed;
         }
-        const std::size_t length = pool.byte_count - start_offset;
-        const auto idx = pool.allocate_node(
-            Node{.data = StringRef{.kind = kind, .offset = start_offset, .length = length}});
-        if (!idx) return std::nullopt;
-        return DecodedNode{.node_index = *idx, .bytes_consumed = consumed};
+        const std::size_t length = static_cast<std::size_t>((pool.bytes_begin_ + pool.byte_count_) - start);
+        const auto node =
+            pool.allocate_node(Node{.data = StringRef{.kind = kind, .data = start, .length = length}});
+        if (!node) return std::nullopt;
+        return DecodedNode{.node = node, .bytes_consumed = consumed};
       }
       const auto result = (major_type == 2) ? decode_byte_string(bytes) : decode_text_string<Utf8Policy>(bytes);
       if (!result) return std::nullopt;
-      const auto offset = pool.allocate_bytes(result->bytes);
-      if (!offset) return std::nullopt;
-      const auto idx = pool.allocate_node(
-          Node{.data = StringRef{.kind = kind, .offset = *offset, .length = result->bytes.size()}});
-      if (!idx) return std::nullopt;
-      return DecodedNode{.node_index = *idx, .bytes_consumed = result->bytes_consumed};
+      const auto data = pool.allocate_bytes(result->bytes);
+      if (!data) return std::nullopt;
+      const auto node =
+          pool.allocate_node(Node{.data = StringRef{.kind = kind, .data = data, .length = result->bytes.size()}});
+      if (!node) return std::nullopt;
+      return DecodedNode{.node = node, .bytes_consumed = result->bytes_consumed};
     }
     case 4: {
       if (depth >= MaxDepth) return std::nullopt;
@@ -495,7 +593,7 @@ constexpr std::optional<DecodedNode> decode_value(NodePool<MaxNodes, MaxBytes>& 
       }
       const auto safe_count = detail::checked_node_count(count);
       if (!safe_count) return std::nullopt;
-      const auto first_slot = pool.reserve_nodes(*safe_count);
+      const auto first_slot = pool.reserve_refs(*safe_count);
       if (!first_slot) return std::nullopt;
       // size_t loop counter, not uint64_t: count == *safe_count numerically
       // (checked_node_count already proved count fits in size_t), so
@@ -507,23 +605,22 @@ constexpr std::optional<DecodedNode> decode_value(NodePool<MaxNodes, MaxBytes>& 
         if (consumed > bytes.size()) return std::nullopt;
         const auto item = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(pool, bytes.subspan(consumed), depth + 1);
         if (!item) return std::nullopt;
-        pool.nodes[*first_slot + i] = Node{.data = IndexCell{.actual_index = item->node_index}};
+        first_slot[i] = item->node;
         consumed += item->bytes_consumed;
       }
       if (is_indefinite_or_break(bytes)) {
         if (consumed >= bytes.size() || bytes[consumed] != 0xff) return std::nullopt;
         ++consumed;
       }
-      const auto idx =
-          pool.allocate_node(Node{.data = ArrayRef{.first_child = *first_slot, .count = *safe_count}});
-      if (!idx) return std::nullopt;
-      return DecodedNode{.node_index = *idx, .bytes_consumed = consumed};
+      const auto node = pool.allocate_node(Node{.data = ArrayRef{.first_child = first_slot, .count = *safe_count}});
+      if (!node) return std::nullopt;
+      return DecodedNode{.node = node, .bytes_consumed = consumed};
     }
     case 5: {
       if (depth >= MaxDepth) return std::nullopt;
       static_assert(is_duplicate_key_policy_v<KeyPolicy>,
-                    "KeyPolicy must provide static bool on_duplicate(NodePool<MaxNodes,MaxBytes>&, "
-                    "size_t first_pair, size_t existing_pair_index, size_t new_key_index, size_t new_value_index)");
+                    "KeyPolicy must provide static bool on_duplicate(NodePool&, Node** first_pair, "
+                    "size_t existing_pair_index, Node* new_key, Node* new_value)");
       std::size_t consumed = 1;
       std::uint64_t pair_count;
       if (is_indefinite_or_break(bytes)) {
@@ -548,7 +645,7 @@ constexpr std::optional<DecodedNode> decode_value(NodePool<MaxNodes, MaxBytes>& 
       // full, the same shape as libcbor PR #387).
       const auto safe_pair_count = detail::checked_node_count(pair_count, 2);
       if (!safe_pair_count) return std::nullopt;
-      const auto first_pair = pool.reserve_nodes(*safe_pair_count);
+      const auto first_pair = pool.reserve_refs(*safe_pair_count);
       if (!first_pair) return std::nullopt;
       std::size_t written = 0;
       for (std::uint64_t i = 0; i < pair_count; ++i) {
@@ -563,18 +660,18 @@ constexpr std::optional<DecodedNode> decode_value(NodePool<MaxNodes, MaxBytes>& 
 
         std::optional<std::size_t> duplicate_at;
         for (std::size_t j = 0; j < written; ++j) {
-          if (node_equal(pool, pool.resolve_index(*first_pair + 2 * j), key->node_index)) {
+          if (node_equal(pool, first_pair[2 * j], key->node)) {
             duplicate_at = j;
             break;
           }
         }
         if (duplicate_at) {
-          if (!KeyPolicy::on_duplicate(pool, *first_pair, *duplicate_at, key->node_index, value->node_index)) {
+          if (!KeyPolicy::on_duplicate(pool, first_pair, *duplicate_at, key->node, value->node)) {
             return std::nullopt;
           }
         } else {
-          pool.nodes[*first_pair + 2 * written] = Node{.data = IndexCell{.actual_index = key->node_index}};
-          pool.nodes[*first_pair + 2 * written + 1] = Node{.data = IndexCell{.actual_index = value->node_index}};
+          first_pair[2 * written] = key->node;
+          first_pair[2 * written + 1] = value->node;
           ++written;
         }
       }
@@ -582,9 +679,9 @@ constexpr std::optional<DecodedNode> decode_value(NodePool<MaxNodes, MaxBytes>& 
         if (consumed >= bytes.size() || bytes[consumed] != 0xff) return std::nullopt;
         ++consumed;
       }
-      const auto idx = pool.allocate_node(Node{.data = MapRef{.first_pair = *first_pair, .count = written}});
-      if (!idx) return std::nullopt;
-      return DecodedNode{.node_index = *idx, .bytes_consumed = consumed};
+      const auto node = pool.allocate_node(Node{.data = MapRef{.first_pair = first_pair, .count = written}});
+      if (!node) return std::nullopt;
+      return DecodedNode{.node = node, .bytes_consumed = consumed};
     }
     case 6: {
       if (depth >= MaxDepth) return std::nullopt;
@@ -593,47 +690,46 @@ constexpr std::optional<DecodedNode> decode_value(NodePool<MaxNodes, MaxBytes>& 
       const auto nested = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(pool, bytes.subspan(len->bytes_consumed), depth + 1);
       if (!nested) return std::nullopt;
       if (len->value == 2 || len->value == 3) {
-        if (const auto* string_ref = std::get_if<StringRef>(&pool.nodes[nested->node_index].data);
+        if (const auto* string_ref = std::get_if<StringRef>(&nested->node->data);
             string_ref && string_ref->kind == CborValue::StringKind::Bytes) {
-          const auto idx = pool.allocate_node(Node{.data = BigNumRef{.negative = (len->value == 3),
-                                                                       .offset = string_ref->offset,
+          const auto node = pool.allocate_node(Node{.data = BigNumRef{.negative = (len->value == 3),
+                                                                       .data = string_ref->data,
                                                                        .length = string_ref->length}});
-          if (!idx) return std::nullopt;
-          return DecodedNode{.node_index = *idx, .bytes_consumed = len->bytes_consumed + nested->bytes_consumed};
+          if (!node) return std::nullopt;
+          return DecodedNode{.node = node, .bytes_consumed = len->bytes_consumed + nested->bytes_consumed};
         }
       }
-      const auto idx =
-          pool.allocate_node(Node{.data = TagRef{.number = len->value, .child = nested->node_index}});
-      if (!idx) return std::nullopt;
-      return DecodedNode{.node_index = *idx, .bytes_consumed = len->bytes_consumed + nested->bytes_consumed};
+      const auto node = pool.allocate_node(Node{.data = TagRef{.number = len->value, .child = nested->node}});
+      if (!node) return std::nullopt;
+      return DecodedNode{.node = node, .bytes_consumed = len->bytes_consumed + nested->bytes_consumed};
     }
     case 7: {
       const auto s = decode_simple(bytes);
       if (!s) return std::nullopt;
       using K = DecodedSimple::Kind;
-      std::optional<std::size_t> idx;
+      Node* node = nullptr;
       switch (s->kind) {
         case K::False:
-          idx = pool.allocate_node(Node{.data = false});
+          node = pool.allocate_node(Node{.data = false});
           break;
         case K::True:
-          idx = pool.allocate_node(Node{.data = true});
+          node = pool.allocate_node(Node{.data = true});
           break;
         case K::Null:
-          idx = pool.allocate_node(Node{.data = nullptr});
+          node = pool.allocate_node(Node{.data = nullptr});
           break;
         case K::Undefined:
-          idx = pool.allocate_node(Node{.data = std::monostate{}});
+          node = pool.allocate_node(Node{.data = std::monostate{}});
           break;
         case K::Float:
-          idx = pool.allocate_node(Node{.data = s->as_double});
+          node = pool.allocate_node(Node{.data = s->as_double});
           break;
         case K::Simple:
-          idx = pool.allocate_node(Node{.data = CborValue::SimpleValue{.number = s->simple_value}});
+          node = pool.allocate_node(Node{.data = CborValue::SimpleValue{.number = s->simple_value}});
           break;
       }
-      if (!idx) return std::nullopt;
-      return DecodedNode{.node_index = *idx, .bytes_consumed = s->bytes_consumed};
+      if (!node) return std::nullopt;
+      return DecodedNode{.node = node, .bytes_consumed = s->bytes_consumed};
     }
     default:
       return std::nullopt;
@@ -715,13 +811,9 @@ constexpr bool append_float_into(std::span<std::uint8_t> out, std::size_t& pos, 
 // The arena counterpart of ConstexprCbor::encode_value: writes into a
 // caller-supplied fixed buffer and returns how many bytes it used, or
 // nullopt if the value doesn't fit -- never allocates, same discipline as
-// decode_value above. node_index indexes directly into pool.nodes (not
-// through an IndexCell), matching how callers already reach a node via
-// pool.child/map_key/map_value/tag_child, or the root's own DecodedNode.
-template <std::size_t MaxNodes, std::size_t MaxBytes>
-constexpr std::optional<std::size_t> encode_value(const NodePool<MaxNodes, MaxBytes>& pool, std::size_t node_index,
-                                                    std::span<std::uint8_t> out, std::size_t pos = 0) {
-  const Node& node = pool.nodes[node_index];
+// decode_value above.
+constexpr std::optional<std::size_t> encode_value(const NodePool& pool, const Node* node, std::span<std::uint8_t> out,
+                                                    std::size_t pos = 0) {
   return std::visit(
       [&](const auto& v) -> std::optional<std::size_t> {
         using T = std::decay_t<decltype(v)>;
@@ -772,8 +864,7 @@ constexpr std::optional<std::size_t> encode_value(const NodePool<MaxNodes, MaxBy
         } else if constexpr (std::is_same_v<T, ArrayRef>) {
           if (!detail::append_header_into(out, pos, 4, v.count)) return std::nullopt;
           for (std::size_t i = 0; i < v.count; ++i) {
-            const auto cell = std::get<IndexCell>(pool.nodes[v.first_child + i].data);
-            const auto written = encode_value(pool, cell.actual_index, out, pos);
+            const auto written = encode_value(pool, v.first_child[i], out, pos);
             if (!written) return std::nullopt;
             pos = *written;
           }
@@ -781,26 +872,22 @@ constexpr std::optional<std::size_t> encode_value(const NodePool<MaxNodes, MaxBy
         } else if constexpr (std::is_same_v<T, MapRef>) {
           if (!detail::append_header_into(out, pos, 5, v.count)) return std::nullopt;
           for (std::size_t i = 0; i < v.count; ++i) {
-            const auto key_cell = std::get<IndexCell>(pool.nodes[v.first_pair + 2 * i].data);
-            const auto key_written = encode_value(pool, key_cell.actual_index, out, pos);
+            const auto key_written = encode_value(pool, v.first_pair[2 * i], out, pos);
             if (!key_written) return std::nullopt;
             pos = *key_written;
-            const auto value_cell = std::get<IndexCell>(pool.nodes[v.first_pair + 2 * i + 1].data);
-            const auto value_written = encode_value(pool, value_cell.actual_index, out, pos);
+            const auto value_written = encode_value(pool, v.first_pair[2 * i + 1], out, pos);
             if (!value_written) return std::nullopt;
             pos = *value_written;
           }
           return pos;
-        } else if constexpr (std::is_same_v<T, TagRef>) {
+        } else {  // TagRef
           if (!detail::append_header_into(out, pos, 6, v.number)) return std::nullopt;
           const auto written = encode_value(pool, v.child, out, pos);
           if (!written) return std::nullopt;
           return *written;
-        } else {
-          return std::nullopt;  // IndexCell: never a node a caller encodes directly
         }
       },
-      node.data);
+      node->data);
 }
 
 }  // namespace ConstexprCbor::Arena
@@ -808,20 +895,18 @@ constexpr std::optional<std::size_t> encode_value(const NodePool<MaxNodes, MaxBy
 namespace ConstexprCbor {
 
 // Out-of-line definition, placed here (rather than in constexpr_cbor.hpp)
-// because Arena::Node and Arena::IndexCell need to be complete types (see
-// the forward declarations and the in-class declaration in
-// constexpr_cbor.hpp, next to RejectDuplicateKeys and KeepFirstDuplicateKey's
-// own Arena overloads). A project that includes only constexpr_cbor.hpp
-// never instantiates this template, so it never needs this definition at
-// all; a project that includes this file gets it.
-template <std::size_t MaxNodes, std::size_t MaxBytes>
-constexpr bool KeepLastDuplicateKey::on_duplicate(Arena::NodePool<MaxNodes, MaxBytes>& pool, std::size_t first_pair,
-                                                   std::size_t existing_pair_index, std::size_t /*new_key_index*/,
-                                                   std::size_t new_value_index) {
+// because Arena::Node needs to be complete (see the forward declaration
+// and the in-class declaration in constexpr_cbor.hpp, next to
+// RejectDuplicateKeys and KeepFirstDuplicateKey's own Arena overloads). A
+// project that includes only constexpr_cbor.hpp never instantiates this
+// template, so it never needs this definition at all; a project that
+// includes this file gets it.
+constexpr bool KeepLastDuplicateKey::on_duplicate(Arena::NodePool&, Arena::Node** first_pair,
+                                                   std::size_t existing_pair_index, Arena::Node* /*new_key*/,
+                                                   Arena::Node* new_value) {
   // Overwrite the existing pair's value slot in place -- the pair stays
-  // at its original position, only the value it points to changes.
-  pool.nodes[first_pair + 2 * existing_pair_index + 1] =
-      Arena::Node{.data = Arena::IndexCell{.actual_index = new_value_index}};
+  // at its original position, only the reference it points to changes.
+  first_pair[2 * existing_pair_index + 1] = new_value;
   return true;
 }
 

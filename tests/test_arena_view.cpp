@@ -16,7 +16,8 @@ constexpr std::uint8_t kBytes[] = {
 
 constexpr bool heap_and_arena_agree_on_shape() {
   const auto heap = decode_value(kBytes);
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto view = decode_view(pool, kBytes);
   if (!heap || !view) return false;
   if (heap->first.is_map() != view->is_map()) return false;
@@ -33,7 +34,8 @@ constexpr bool heap_and_arena_agree_on_shape() {
 }
 
 constexpr std::uint64_t sum_array_view_iteration() {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto view = decode_view(pool, kBytes);
   if (!view) return 0;
   const auto b = (*view)["b"];
@@ -45,7 +47,8 @@ constexpr std::uint64_t sum_array_view_iteration() {
 }
 
 constexpr bool items_proxy_matches_heap() {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto view = decode_view(pool, kBytes);
   if (!view) return false;
   std::size_t count = 0;
@@ -57,7 +60,8 @@ constexpr bool items_proxy_matches_heap() {
 }
 
 constexpr bool miss_returns_undefined_sentinel() {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto view = decode_view(pool, kBytes);
   if (!view) return false;
   return (*view)["missing"].is_undefined() && (*view)[99].is_undefined();
@@ -68,7 +72,8 @@ constexpr bool tags_and_bignums_agree() {
   // is_tag() and the same nested scalar.
   constexpr std::uint8_t tagged[] = {0xc1, 0x1a, 0x51, 0x4b, 0x67, 0xb0};
   const auto heap = decode_value(tagged);
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto view = decode_view(pool, tagged);
   if (!heap || !view) return false;
   return heap->first.is_tag() == view->is_tag();

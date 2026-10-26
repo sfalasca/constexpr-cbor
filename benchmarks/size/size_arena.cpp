@@ -3,7 +3,8 @@
 
 namespace {
 volatile std::uint64_t sink = 0;
-ConstexprCbor::Arena::NodePool<64, 512> pool;
+ConstexprCbor::Arena::ArenaStorage<64, 64, 512> storage;
+ConstexprCbor::Arena::NodePool pool = storage.make_pool();
 
 void walk(const ConstexprCbor::Arena::Node& node) {
   using namespace ConstexprCbor::Arena;
@@ -29,10 +30,11 @@ void walk(const ConstexprCbor::Arena::Node& node) {
 }  // namespace
 
 extern "C" bool decode_entry(const unsigned char* p, unsigned long n) {
-  pool.node_count = 0;
-  pool.byte_count = 0;
+  pool.node_count_ = 0;
+  pool.ref_count_ = 0;
+  pool.byte_count_ = 0;
   const auto decoded = ConstexprCbor::Arena::decode_value(pool, std::span<const std::uint8_t>(p, n));
   if (!decoded) return false;
-  walk(pool.resolve(decoded->node_index));
+  walk(*decoded->node);
   return true;
 }

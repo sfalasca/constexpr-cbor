@@ -14,40 +14,45 @@ using namespace CompileTimeUnitTesting;
 // sibling files' plain byte vectors are. The actual rule is narrower than
 // that, though: a variable of automatic storage duration is fine inside a
 // constant expression as long as its lifetime began within that *same*
-// evaluation. A plain constexpr helper function, with its own NodePool
-// declared and consumed entirely inside its own body, is exactly that --
-// the call `some_helper(vec) == expected` is one self-contained
-// expression, so it's usable directly as an expect_true<>() argument.
+// evaluation. A plain constexpr helper function, with its own
+// ArenaStorage/NodePool declared and consumed entirely inside its own
+// body, is exactly that -- the call `some_helper(vec) == expected` is one
+// self-contained expression, so it's usable directly as an expect_true<>()
+// argument.
 
 constexpr bool arena_decode_ok(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   return decode_value(pool, bytes).has_value();
 }
 
 constexpr std::size_t arena_bytes_consumed(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   return result ? result->bytes_consumed : std::size_t{0};
 }
 
 constexpr std::size_t arena_array_count(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return 0;
-  return std::get<ArrayRef>(pool.nodes[result->node_index].data).count;
+  return std::get<ArrayRef>(result->node->data).count;
 }
 
 constexpr std::uint64_t arena_array_child_u64(std::span<const std::uint8_t> bytes, std::size_t i) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return 0;
-  const auto& arr = std::get<ArrayRef>(pool.nodes[result->node_index].data);
+  const auto& arr = std::get<ArrayRef>(result->node->data);
   return std::get<std::uint64_t>(pool.child(arr, i).data);
 }
 
 // RFC 8949 Appendix A: [1, 2, 3] -> 0x83010203. Same vector test_array.cpp
 // uses for the heap-based decoder, proving the arena one reaches the same
-// result through NodePool/IndexCell indirection instead of std::vector.
+// result through pointer-based reference slots instead of std::vector.
 consteval bool test_decode_flat_array_matches_official_vector() {
   constexpr std::uint8_t vec[] = {0x83, 0x01, 0x02, 0x03};
   expect_true<arena_decode_ok(vec)>();
@@ -74,17 +79,18 @@ static_assert(test_decode_indefinite_array_matches_official_vector());
 
 constexpr std::uint64_t arena_nested_array_child_u64(std::span<const std::uint8_t> bytes, std::size_t outer_i,
                                                        std::size_t inner_i) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return 0;
-  const auto& outer = std::get<ArrayRef>(pool.nodes[result->node_index].data);
+  const auto& outer = std::get<ArrayRef>(result->node->data);
   const auto& inner = std::get<ArrayRef>(pool.child(outer, outer_i).data);
   return std::get<std::uint64_t>(pool.child(inner, inner_i).data);
 }
 
 // RFC 8949 Appendix A: [1, [2, 3]] isn't a Table 6 row verbatim, but is
 // built from two rows in it ([1,2,3] and nested-array handling above);
-// proves IndexCell's indirection resolves correctly when a child is
+// proves the reference-slot indirection resolves correctly when a child is
 // itself a composite that needed its own multi-node subtree.
 consteval bool test_decode_array_handles_nesting() {
   constexpr std::uint8_t vec[] = {0x82, 0x01, 0x82, 0x02, 0x03};
@@ -99,27 +105,30 @@ static_assert(test_decode_array_handles_nesting());
 
 template <typename KeyPolicy = RejectDuplicateKeys>
 constexpr std::size_t arena_map_count(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value<32, NoUtf8Validation, KeyPolicy>(pool, bytes);
   if (!result) return 0;
-  return std::get<MapRef>(pool.nodes[result->node_index].data).count;
+  return std::get<MapRef>(result->node->data).count;
 }
 
 template <typename KeyPolicy = RejectDuplicateKeys>
 constexpr std::uint64_t arena_map_key_u64(std::span<const std::uint8_t> bytes, std::size_t i) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value<32, NoUtf8Validation, KeyPolicy>(pool, bytes);
   if (!result) return 0;
-  const auto& m = std::get<MapRef>(pool.nodes[result->node_index].data);
+  const auto& m = std::get<MapRef>(result->node->data);
   return std::get<std::uint64_t>(pool.map_key(m, i).data);
 }
 
 template <typename KeyPolicy = RejectDuplicateKeys>
 constexpr std::uint64_t arena_map_value_u64(std::span<const std::uint8_t> bytes, std::size_t i) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value<32, NoUtf8Validation, KeyPolicy>(pool, bytes);
   if (!result) return 0;
-  const auto& m = std::get<MapRef>(pool.nodes[result->node_index].data);
+  const auto& m = std::get<MapRef>(result->node->data);
   return std::get<std::uint64_t>(pool.map_value(m, i).data);
 }
 
@@ -149,24 +158,27 @@ consteval bool test_decode_indefinite_map() {
 static_assert(test_decode_indefinite_map());
 
 constexpr bool arena_string_is_bytes_kind(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return false;
-  return std::get<StringRef>(pool.nodes[result->node_index].data).kind == CborValue::StringKind::Bytes;
+  return std::get<StringRef>(result->node->data).kind == CborValue::StringKind::Bytes;
 }
 
 constexpr std::size_t arena_string_length(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return 0;
-  return std::get<StringRef>(pool.nodes[result->node_index].data).length;
+  return std::get<StringRef>(result->node->data).length;
 }
 
 constexpr std::uint8_t arena_string_byte_at(std::span<const std::uint8_t> bytes, std::size_t i) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return 0;
-  const auto& s = std::get<StringRef>(pool.nodes[result->node_index].data);
+  const auto& s = std::get<StringRef>(result->node->data);
   return pool.bytes_of(s)[i];
 }
 
@@ -186,17 +198,19 @@ consteval bool test_decode_indefinite_byte_string() {
 static_assert(test_decode_indefinite_byte_string());
 
 constexpr std::size_t arena_string_length_with_policy(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value<32, ConstexprCbor::CompleteUtf8Validation>(pool, bytes);
   if (!result) return 0;
-  return std::get<StringRef>(pool.nodes[result->node_index].data).length;
+  return std::get<StringRef>(result->node->data).length;
 }
 
 constexpr bool arena_string_is_text_kind_with_policy(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value<32, ConstexprCbor::CompleteUtf8Validation>(pool, bytes);
   if (!result) return false;
-  return std::get<StringRef>(pool.nodes[result->node_index].data).kind == CborValue::StringKind::Text;
+  return std::get<StringRef>(result->node->data).kind == CborValue::StringKind::Text;
 }
 
 // RFC 8949 Appendix A: "IETF" -> 0x6449455446, with the same
@@ -212,24 +226,27 @@ consteval bool test_decode_text_string_with_utf8_policy() {
 static_assert(test_decode_text_string_with_utf8_policy());
 
 constexpr bool arena_bignum_negative(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return false;
-  return std::get<BigNumRef>(pool.nodes[result->node_index].data).negative;
+  return std::get<BigNumRef>(result->node->data).negative;
 }
 
 constexpr std::size_t arena_bignum_length(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return 0;
-  return std::get<BigNumRef>(pool.nodes[result->node_index].data).length;
+  return std::get<BigNumRef>(result->node->data).length;
 }
 
 constexpr std::uint8_t arena_bignum_byte_at(std::span<const std::uint8_t> bytes, std::size_t i) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return 0;
-  const auto& b = std::get<BigNumRef>(pool.nodes[result->node_index].data);
+  const auto& b = std::get<BigNumRef>(result->node->data);
   return pool.bytes_of(b)[i];
 }
 
@@ -248,32 +265,35 @@ consteval bool test_decode_bignum_tag() {
 static_assert(test_decode_bignum_tag());
 
 constexpr std::uint64_t arena_tag_number(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return 0;
-  return std::get<TagRef>(pool.nodes[result->node_index].data).number;
+  return std::get<TagRef>(result->node->data).number;
 }
 
 constexpr std::size_t arena_tag_child_length(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return 0;
-  const auto& t = std::get<TagRef>(pool.nodes[result->node_index].data);
+  const auto& t = std::get<TagRef>(result->node->data);
   return std::get<StringRef>(pool.tag_child(t).data).length;
 }
 
 constexpr std::uint8_t arena_tag_child_first_byte(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return 0;
-  const auto& t = std::get<TagRef>(pool.nodes[result->node_index].data);
+  const auto& t = std::get<TagRef>(result->node->data);
   const auto& s = std::get<StringRef>(pool.tag_child(t).data);
   return pool.bytes_of(s)[0];
 }
 
 // RFC 8949 Appendix A: 32("http://www.example.com") shape (shortened here)
-// -- an ordinary tag, not a bignum, proving TagRef's direct (non-IndexCell)
-// child index works.
+// -- an ordinary tag, not a bignum, proving TagRef's direct (non-indirected)
+// child pointer works.
 consteval bool test_decode_plain_tag() {
   constexpr std::uint8_t vec[] = {0xd8, 0x20, 0x61, 0x61};  // tag 32, "a"
   expect_eq<arena_bytes_consumed(vec), std::size_t{4}>();
@@ -285,10 +305,11 @@ consteval bool test_decode_plain_tag() {
 static_assert(test_decode_plain_tag());
 
 constexpr double arena_float_value(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, bytes);
   if (!result) return 0.0;
-  return std::get<double>(pool.nodes[result->node_index].data);
+  return std::get<double>(result->node->data);
 }
 
 // RFC 8949 Appendix A: 1.5 -> 0xf93e00 (half-precision float).
@@ -301,27 +322,31 @@ static_assert(test_decode_float());
 
 constexpr bool arena_decodes_as_true() {
   constexpr std::uint8_t vec[] = {0xf5};
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, vec);
-  return result && std::get<bool>(pool.nodes[result->node_index].data) == true;
+  return result && std::get<bool>(result->node->data) == true;
 }
 constexpr bool arena_decodes_as_false() {
   constexpr std::uint8_t vec[] = {0xf4};
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, vec);
-  return result && std::get<bool>(pool.nodes[result->node_index].data) == false;
+  return result && std::get<bool>(result->node->data) == false;
 }
 constexpr bool arena_decodes_as_null() {
   constexpr std::uint8_t vec[] = {0xf6};
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, vec);
-  return result && std::holds_alternative<std::nullptr_t>(pool.nodes[result->node_index].data);
+  return result && std::holds_alternative<std::nullptr_t>(result->node->data);
 }
 constexpr bool arena_decodes_as_undefined() {
   constexpr std::uint8_t vec[] = {0xf7};
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value(pool, vec);
-  return result && std::holds_alternative<std::monostate>(pool.nodes[result->node_index].data);
+  return result && std::holds_alternative<std::monostate>(result->node->data);
 }
 
 // RFC 8949 Appendix A: true/false/null/undefined.
@@ -342,10 +367,13 @@ consteval bool test_decode_refuses_truncated_array() {
 static_assert(test_decode_refuses_truncated_array());
 
 // Running out of node capacity is a refusal, not UB: a 3-element array
-// needs 3 reserved child slots plus the array node itself (4 total),
-// which doesn't fit in a 2-node pool.
+// needs 3 reference slots plus the array node itself (4 node allocations
+// total, since reference slots are their own, separately-capacitied
+// storage now -- see arena_decode_ok_tiny_ref_pool below for that axis
+// isolated), which doesn't fit in a 2-node pool.
 constexpr bool arena_decode_ok_tiny_node_pool(std::span<const std::uint8_t> bytes) {
-  NodePool<2, 16> pool;
+  ArenaStorage<2, 8, 32> storage;
+  auto pool = storage.make_pool();
   return decode_value(pool, bytes).has_value();
 }
 
@@ -356,9 +384,30 @@ consteval bool test_decode_refuses_when_node_pool_exhausted() {
 }
 static_assert(test_decode_refuses_when_node_pool_exhausted());
 
-// Same idea for the byte arena: a 3-byte string doesn't fit a 2-byte pool.
+// A genuinely new, previously-impossible-to-isolate exhaustion axis: node
+// and byte budgets are generous, but only 2 reference slots are
+// available, so a 3-element array (needing 3 contiguous Node* slots)
+// still gets refused even though every other capacity has plenty of room.
+// Before this redesign, reference slots were IndexCell *nodes*, sharing
+// one budget with every other node -- this axis didn't exist on its own.
+constexpr bool arena_decode_ok_tiny_ref_pool(std::span<const std::uint8_t> bytes) {
+  ArenaStorage<32, 2, 32> storage;
+  auto pool = storage.make_pool();
+  return decode_value(pool, bytes).has_value();
+}
+
+consteval bool test_decode_refuses_when_ref_pool_exhausted() {
+  constexpr std::uint8_t vec[] = {0x83, 0x01, 0x02, 0x03};  // needs 3 ref slots, only 2 available
+  expect_false<arena_decode_ok_tiny_ref_pool(vec)>();
+  return true;
+}
+static_assert(test_decode_refuses_when_ref_pool_exhausted());
+
+// Same idea for the byte arena: a 3-byte string doesn't fit the usable
+// capacity left after the two 8-byte canaries (18 total -> 2 usable).
 constexpr bool arena_decode_ok_tiny_byte_pool(std::span<const std::uint8_t> bytes) {
-  NodePool<16, 2> pool;
+  ArenaStorage<16, 16, 18> storage;
+  auto pool = storage.make_pool();
   return decode_value(pool, bytes).has_value();
 }
 
@@ -371,7 +420,8 @@ static_assert(test_decode_refuses_when_byte_arena_exhausted());
 
 template <std::size_t MaxDepth>
 constexpr bool arena_decode_ok_with_depth(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   return decode_value<MaxDepth>(pool, bytes).has_value();
 }
 
@@ -394,21 +444,23 @@ static_assert(test_decode_respects_max_depth());
 // directly, no extra trick needed.
 
 constexpr std::size_t arena_encode_written(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto decoded = decode_value(pool, bytes);
   if (!decoded) return 0;
   std::array<std::uint8_t, 32> out{};
-  const auto written = encode_value(pool, decoded->node_index, out);
+  const auto written = encode_value(pool, decoded->node, out);
   return written ? *written : std::size_t{0};
 }
 
 template <std::size_t N>
 constexpr std::array<std::uint8_t, N> arena_encode_bytes(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto decoded = decode_value(pool, bytes);
   std::array<std::uint8_t, N> out{};
   if (!decoded) return out;
-  encode_value(pool, decoded->node_index, out);
+  encode_value(pool, decoded->node, out);
   return out;
 }
 
@@ -459,11 +511,12 @@ static_assert(test_indefinite_array_encodes_as_canonical_definite());
 // A buffer too small to hold the encoded output is a refusal, not a
 // truncated or out-of-bounds write.
 constexpr bool arena_encode_fits_in_3_bytes(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto decoded = decode_value(pool, bytes);
   if (!decoded) return false;
   std::array<std::uint8_t, 3> too_small{};
-  return encode_value(pool, decoded->node_index, too_small).has_value();
+  return encode_value(pool, decoded->node, too_small).has_value();
 }
 
 consteval bool test_encode_refuses_when_output_buffer_too_small() {
@@ -477,8 +530,8 @@ static_assert(test_encode_refuses_when_output_buffer_too_small());
 // KeepLastDuplicateKey are the exact same types usable with
 // ConstexprCbor::decode_value (see constexpr_cbor.hpp), not a parallel
 // Arena-only copy of each -- each one's Arena-shaped on_duplicate overload
-// works over NodePool indices instead of a std::vector<pair<...>>, since
-// an arena map has no flat, directly-comparable entries container to
+// works over pointers into the pool instead of a std::vector<pair<...>>,
+// since an arena map has no flat, directly-comparable entries container to
 // search or mutate.
 
 // {1: 2, 1: 3} -> 0xa2 0102 0103 (two entries, same key 1, values 2 then 3).
@@ -486,7 +539,8 @@ constexpr std::uint8_t duplicate_key_vec[] = {0xa2, 0x01, 0x02, 0x01, 0x03};
 
 template <typename KeyPolicy>
 constexpr bool arena_decode_ok_with_policy(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   return decode_value<32, NoUtf8Validation, KeyPolicy>(pool, bytes).has_value();
 }
 
@@ -525,19 +579,21 @@ consteval bool test_no_duplicates_same_result_under_every_policy() {
 static_assert(test_no_duplicates_same_result_under_every_policy());
 
 constexpr std::uint8_t arena_structural_dup_value_first_byte(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value<32, NoUtf8Validation, KeepLastDuplicateKey>(pool, bytes);
   if (!result) return 0;
-  const auto& m = std::get<MapRef>(pool.nodes[result->node_index].data);
+  const auto& m = std::get<MapRef>(result->node->data);
   const auto& val = std::get<StringRef>(pool.map_value(m, 0).data);
   return pool.bytes_of(val)[0];
 }
 
 constexpr std::size_t arena_structural_dup_count(std::span<const std::uint8_t> bytes) {
-  NodePool<32, 32> pool;
+  ArenaStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
   const auto result = decode_value<32, NoUtf8Validation, KeepLastDuplicateKey>(pool, bytes);
   if (!result) return 0;
-  return std::get<MapRef>(pool.nodes[result->node_index].data).count;
+  return std::get<MapRef>(result->node->data).count;
 }
 
 // Structural (non-scalar) duplicate key: {[1,2]: "a", [1,2]: "b"} under
@@ -553,13 +609,14 @@ consteval bool test_structural_key_duplicate_detection() {
 static_assert(test_structural_key_duplicate_detection());
 
 // --- Overflow-then-undersized-buffer guard: a CBOR length field can claim
-// up to 2^64-1 items, but NodePool indexes with std::size_t (which can be
-// narrower, e.g. 32 bits on common embedded targets). Arena::decode_value
-// reserves node slots for a whole array/map's children *before* decoding
-// any of them, so a silently-truncating uint64_t->size_t cast there would
-// be the libcbor PR #387 shape of bug: a huge count wraps to a small one,
-// the reservation "succeeds" against that undersized number, and the loop
-// -- which still iterates the real, untruncated count -- writes past it.
+// up to 2^64-1 items, but the reference-slot array indexes with
+// std::size_t (which can be narrower, e.g. 32 bits on common embedded
+// targets). Arena::decode_value reserves reference slots for a whole
+// array/map's children *before* decoding any of them, so a silently-
+// truncating uint64_t->size_t cast there would be the libcbor PR #387
+// shape of bug: a huge count wraps to a small one, the reservation
+// "succeeds" against that undersized number, and the loop -- which still
+// iterates the real, untruncated count -- writes past it.
 
 // Array claiming 2^64-1 elements (major type 4, additional info 27).
 constexpr std::uint8_t huge_array_count_vec[] = {0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};

@@ -95,9 +95,8 @@ HeapResult decode_heap(std::span<const std::uint8_t> bytes) {
 // constexpr-cbor, no-malloc Arena
 // ---------------------------------------------------------------------
 
-template <std::size_t MaxNodes, std::size_t MaxBytes>
-void walk_arena_node(const ConstexprCbor::Arena::NodePool<MaxNodes, MaxBytes>& pool,
-                      const ConstexprCbor::Arena::Node& node, Checksum& sum) {
+void walk_arena_node(const ConstexprCbor::Arena::NodePool& pool, const ConstexprCbor::Arena::Node& node,
+                      Checksum& sum) {
   using namespace ConstexprCbor::Arena;
   sum.items++;
   std::visit(
@@ -128,17 +127,17 @@ void walk_arena_node(const ConstexprCbor::Arena::NodePool<MaxNodes, MaxBytes>& p
 // `pool` is provisioned once by the caller, outside the measured window
 // below, exactly as a real embedded caller would provision a
 // static/stack NodePool up front -- re-decoding into the same pool
-// repeatedly (resetting its two cursors) is what the Arena API is
+// repeatedly (resetting its three cursors) is what the Arena API is
 // actually for, so that's what's timed, not a fresh allocation per call.
-template <std::size_t MaxNodes, std::size_t MaxBytes>
-HeapResult decode_arena(ConstexprCbor::Arena::NodePool<MaxNodes, MaxBytes>& pool, std::span<const std::uint8_t> bytes) {
-  pool.node_count = 0;
-  pool.byte_count = 0;
+HeapResult decode_arena(ConstexprCbor::Arena::NodePool& pool, std::span<const std::uint8_t> bytes) {
+  pool.node_count_ = 0;
+  pool.ref_count_ = 0;
+  pool.byte_count_ = 0;
   const long long before = alloc_delta_begin();
   const auto decoded = ConstexprCbor::Arena::decode_value(pool, bytes);
   if (!decoded) return {false, {}, 0};
   Checksum sum;
-  walk_arena_node(pool, pool.resolve(decoded->node_index), sum);
+  walk_arena_node(pool, *decoded->node, sum);
   const long long after = alloc_delta_begin();
   return {true, sum, after - before};
 }
@@ -286,11 +285,13 @@ double time_ns_per_call(F&& f, int iterations) {
 }
 
 constexpr std::size_t kArenaMaxNodes = 65536;
+constexpr std::size_t kArenaMaxRefs = 65536;
 constexpr std::size_t kArenaMaxBytes = 262144;
 
 void run_payload(const Payload& p) {
   const std::span<const std::uint8_t> bytes(p.bytes, p.len);
-  static ConstexprCbor::Arena::NodePool<kArenaMaxNodes, kArenaMaxBytes> pool;
+  static ConstexprCbor::Arena::ArenaStorage<kArenaMaxNodes, kArenaMaxRefs, kArenaMaxBytes> storage;
+  static auto pool = storage.make_pool();
 
   const auto heap_r = decode_heap(bytes);
   const auto arena_r = decode_arena(pool, bytes);

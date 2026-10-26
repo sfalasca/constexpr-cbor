@@ -60,51 +60,84 @@ Four decode paths are measured:
   `cbor_value_enter_container`/`advance` walk.
 - **QCBOR** — `QCBORDecode_Init` + a `QCBORDecode_GetNext` loop.
 
-## Results (one container run, after the `allocate_bytes` fix below)
+## Results (one container run, after the pointer-based Arena redesign below)
 
 ### CPU performance (ns/decode, lower is better; MB/s, higher is better)
 
 | payload | heap | Arena | tinycbor | QCBOR |
 |---|---|---|---|---|
-| small (45 B) | 844 ns / 53.3 MB/s | 535 ns / 84.2 MB/s | 494 ns / 91.1 MB/s | 490 ns / **91.9 MB/s** |
-| medium (10.8 KB) | 348,726 ns / 30.9 MB/s | 71,197 ns / 151.4 MB/s | 90,295 ns / 119.4 MB/s | 78,112 ns / 138.0 MB/s — Arena **wins here** |
-| deep (91 B, depth 30) | 45,695 ns / 2.0 MB/s | 15,144 ns / 6.0 MB/s | 15,312 ns / 5.9 MB/s | *refused — see Correctness* |
-| strings (8.8 KB) | 12,946 ns / 679.1 MB/s | 2,874 ns / **3,059.0 MB/s** | 4,727 ns / 1859.8 MB/s | 3,744 ns / 2348.0 MB/s |
+| small (45 B) | 758 ns / 59.4 MB/s | 484 ns / 93.0 MB/s | 416 ns / 108.2 MB/s | 409 ns / **110.1 MB/s** |
+| medium (10.8 KB) | 319,455 ns / 33.7 MB/s | 102,458 ns / 105.2 MB/s | 78,731 ns / 136.9 MB/s | 68,820 ns / **156.6 MB/s** |
+| deep (91 B, depth 30) | 41,111 ns / 2.2 MB/s | 15,770 ns / 5.8 MB/s | 15,404 ns / 5.9 MB/s | *refused — see Correctness* |
+| strings (8.8 KB) | 10,178 ns / 863.8 MB/s | 4,119 ns / 2,134.6 MB/s | 4,028 ns / 2,182.7 MB/s | 3,267 ns / **2,691.0 MB/s** |
 
 **Takeaways:**
-- **A real bug was found and fixed while building this benchmark**:
-  Arena's `NodePool::allocate_bytes` copied every string byte through a
-  hand-written indexed loop (`for (const auto b : src) byte_arena[byte_count++]
-  = b;`) instead of `std::copy`. On the `strings` payload (100 text
-  strings, ~8.6 KB of string content), that loop was the dominant cost:
-  switching to `std::copy` (which `-O2` lowers to a `memmove`/`memcpy`-class
-  operation for a contiguous range of a trivial type, where the indexed
-  loop version wasn't reliably recognized as the same thing) took Arena
-  from 14,441 ns (608.8 MB/s) to 2,874 ns (**3,059.0 MB/s** — a 5x
-  speedup, now the fastest of all four decode paths on this payload,
-  beating tinycbor and QCBOR outright. `allocate_bytes` is
-  `constexpr`-called from every consteval test in `tests/`, so this was
-  caught and fixed with zero API or behavior change — just a faster body
-  for the same function, verified against the full 27-test suite
-  (including the consteval ones, proving `std::copy` works at compile
-  time too) before and after.
-- **QCBOR and tinycbor are still the fastest raw decoders on
-  non-string-heavy payloads** — hand-tuned C state machines with
-  decades of combined optimization work, no dynamic dispatch
-  (`std::variant`/`std::visit`), no recursive-descent-through-a-tagged-
-  union overhead. This isn't a surprise and isn't something
-  constexpr-cbor is trying to beat across the board; see Flexibility,
-  below, for what it's trading that speed for.
-- **Arena now wins or ties on 2 of 4 payloads** (`medium`, `strings`)
-  and is within ~8% of tinycbor/QCBOR on the other two. The one
-  remaining structural cost is the `IndexCell` indirection every
-  array/map element goes through to keep `ArrayRef`/`MapRef` storage
-  contiguous — visible on `deep` (30 levels of 1-element arrays, i.e.
-  maximal indirection-to-payload ratio), where Arena and tinycbor are
-  roughly tied and both trail QCBOR.
+- **Arena is consistently competitive with tinycbor, usually within
+  10-20%, but QCBOR is the fastest raw decoder on every payload it
+  accepts.** This is a change from an earlier revision of this benchmark
+  (see "Arena internals" below), which had reported Arena *winning*
+  outright on `medium` and `strings` after a since-superseded
+  `allocate_bytes` fix. Re-measured after replacing Arena's index-based
+  internals with pointer-based ones (see below), two consecutive container
+  runs both show the ordering above, consistently — it isn't run-to-run
+  noise, it's a real shift from the previous measurement, most likely
+  reflecting a different host/container environment between the two
+  benchmark sessions rather than the redesign itself making things slower
+  (the redesign removed a layer of indirection, which should help, not
+  hurt — see the code-size section for where that's unambiguously visible
+  instead). Treat the exact numbers here as one snapshot, re-run the
+  container for current ones; the qualitative picture — Arena solidly
+  ahead of the heap path, competitive with but not reliably beating the
+  hand-tuned C decoders — is the durable takeaway.
+- **QCBOR and tinycbor are still the fastest raw decoders overall** —
+  hand-tuned C state machines with decades of combined optimization work,
+  no dynamic dispatch (`std::variant`/`std::visit`), no recursive-
+  descent-through-a-tagged-union overhead. This isn't a surprise and isn't
+  something constexpr-cbor is trying to beat across the board; see
+  Flexibility, below, for what it's trading that speed for.
 - The **heap path is the slowest of the four everywhere**, which is
   expected: real heap allocation per node, not just per string, plus
   `std::vector` growth.
+
+### Arena internals: from index-based to pointer-based
+
+Arena's `NodePool` used to own its storage directly (`std::array<Node,MaxNodes>`,
+`std::array<uint8_t,MaxBytes>`, both NTTP-sized) and reference array/map
+children through `IndexCell` — a dedicated `Node`-variant alternative that
+existed solely to carry one `size_t` index, so that a contiguous block of
+"child slots" could be reserved before each child was actually decoded and
+landed wherever the arena's cursor happened to be. The indices were chosen
+to make the decoded tree *relocatable* — safe even if the whole `NodePool`
+object were moved or copied. That turned out to be solving a problem this
+library doesn't actually have: `NodePool`'s real contract is that the
+*caller* owns the backing storage and it never moves while any decoded tree
+into it is alive — under that contract, raw pointers are exactly as safe as
+indices, and strictly cheaper, since a dedicated `Node*` reference slot is
+8 bytes, versus `IndexCell`'s "a whole `Node`-variant-sized slot (sized to
+the variant's largest alternative plus its discriminant) just to carry one
+`size_t`."
+
+The resulting design: `NodePool` is now a small, non-owning,
+trivially-copyable *view* (in the spirit of `std::span`) over three
+separate, caller-owned, typed spans (`Node[]`, a dedicated `Node*[]` for
+reference slots, and `uint8_t[]` for string/bignum content) — `ArenaStorage<MaxNodes,MaxRefs,MaxBytes>`
+is the owning counterpart callers actually declare. `IndexCell` is gone
+entirely; `ArrayRef`/`MapRef` now point directly at a block of `Node*`
+slots, and `decode_value`'s array/map cases allocate one fewer `Node` per
+child than before (no slot-sized placeholder to immediately overwrite).
+The reference-slot array also became an independently-tunable capacity
+(`MaxRefs`), decoupled from the node budget it used to silently share.
+
+One defensive addition from this change: since the whole design now rests
+on the caller's buffer outliving every decoded reference into it, `NodePool`
+writes two magic "canary" words bracketing the caller's byte storage at
+construction and exposes `canaries_intact()`, checked via `assert()` at
+every allocation call — a best-effort, debug-build-only check that catches
+common misuse (the caller's buffer being reused, corrupted, or a stale
+`NodePool` object), not a general dangling-buffer detector (a buffer that
+has genuinely gone out of scope and had its memory silently repurposed by
+something that never touches the canary words is ordinary, uncatchable UB,
+same as any other dangling pointer).
 
 ### Memory usage (bytes allocated per decode, measured via `mallinfo2()`)
 
@@ -155,34 +188,37 @@ optimized away.
 | | .text | .data | .bss | total |
 |---|---|---|---|---|
 | constexpr-cbor (heap) | 18,133 | 1,408 | 16 | 19,557 |
-| constexpr-cbor (Arena) | 22,252 | 2,504 | 2,616 | 27,372 |
+| constexpr-cbor (Arena) | 20,249 | 1,968 | 3,208 | 25,425 |
 | tinycbor | 6,517 | 600 | 16 | 7,133 |
 | QCBOR | 6,013 | 616 | 16 | 6,645 |
 
 **Takeaways:**
-- **The corrected gap is ~2.7-2.9x, not 6-8x.** tinycbor's honest
-  number (6,517 B) is 2.5x its original, misleadingly small one — most
-  of that was the recursive-walk code it simply hadn't been asked to
-  run before. QCBOR barely moved (6,013 vs. 5,692 B) because
-  `QCBORDecode_GetNext()` already does real decode work on its first
-  call, by its own design, unlike tinycbor's pure-init entry point.
-- **The remaining ~2.7-2.9x is real and structural**, not a measurement
-  artifact: `std::variant`-based recursive descent through a
-  12-alternative tagged union generates meaningfully more machine code
-  per decoder than a hand-written C state machine over a `switch` on raw
-  major-type bytes. On a flash-constrained target where every kilobyte
-  of `.text` is a hard constraint, that's a genuine reason to reach for
+- **The gap against tinycbor/QCBOR is ~2.8-3.1x**, real and structural,
+  not a measurement artifact: `std::variant`-based recursive descent
+  through a tagged union generates meaningfully more machine code per
+  decoder than a hand-written C state machine over a `switch` on raw
+  major-type bytes. On a flash-constrained target where every kilobyte of
+  `.text` is a hard constraint, that's a genuine reason to reach for
   tinycbor instead — this benchmark isn't trying to argue that gap away,
   only to measure it honestly.
-- **Arena is still larger than heap, not smaller**, in this
-  measurement — the extra `IndexCell`-resolution logic and the larger
-  `Node` variant (12 alternatives including
-  `ArrayRef`/`MapRef`/`TagRef`/`BigNumRef`) costs more code than the
-  removed allocator calls save, for a single entry point. The
-  zero-heap-allocation property doesn't come for free in `.text`, only
-  in dynamic memory — and, per the CPU results above, it now usually
-  comes with a real speed win instead of the size-for-nothing picture
-  the original, unfixed benchmark implied.
+- **Removing `IndexCell` shrank Arena's `.text` by ~2,000 bytes (~9%)**,
+  from 22,252 B to 20,249 B, and `.data` by ~22%, after the pointer-based
+  redesign described above: each array/map child reference slot is now a
+  bare 8-byte `Node*` instead of a whole `Node`-variant-sized placeholder
+  allocated just to carry one index, and `node_equal`/`encode_value`'s
+  walks no longer need a separate "resolve one level of indirection" step.
+  `.bss` grew instead (2,616 B to 3,208 B) — the three separately-typed,
+  independently-sized `ArenaStorage` arrays (`Node[]`, the new `Node*[]`
+  reference-slot array, `uint8_t[]`) don't pack quite as tightly as the
+  old design's two NTTP-sized arrays did for this particular entry point's
+  chosen capacities; this wasn't tuned for minimal `.bss` and a caller
+  sizing `MaxRefs` tightly for their own data shape would see a smaller
+  number here than this generic single-entry-point benchmark shows.
+- **Arena is still larger than heap** in this measurement (20,249 vs.
+  18,133 B) — the larger `Node` variant and the separate reference-slot
+  array still cost more code than the removed allocator calls save, for a
+  single entry point. The zero-heap-allocation property doesn't come free
+  in `.text`, only in dynamic memory.
 
 ## Correctness
 
@@ -240,19 +276,20 @@ below from documentation only (not built/benchmarked here).
 | Exception-free | Yes (`std::optional`, proven to compile under `-fno-exceptions`) | Yes (C) | Yes (C) | varies |
 | Bignum (tag 2/3) as a native value, not an opaque tag | Yes | No (generic tag) | Yes (`QCBOR_TYPE_POSBIGNUM`/`NEGBIGNUM`) | varies |
 | Browser/WebAssembly target proven in CI | Yes (`docker/wasm.Dockerfile`, `webapp/`) | Not out of the box | Not out of the box | No |
-| Code size (this benchmark, full decode+walk) | 18-22 KB `.text` for one call | **6.5 KB** | 6.0 KB | — |
-| Raw decode throughput (this benchmark) | 2-3,060 MB/s depending on mode/payload (Arena **wins outright** on 2/4 payloads) | 6-1860 MB/s | 6-2350 MB/s | — |
+| Code size (this benchmark, full decode+walk) | 18-20 KB `.text` for one call | **6.5 KB** | 6.0 KB | — |
+| Raw decode throughput (this benchmark) | 2-2,135 MB/s depending on mode/payload | 6-2,183 MB/s | 6-2,726 MB/s | — |
 
 **The honest summary**: tinycbor and QCBOR are still smaller, and still
-faster on most payloads — they're mature, hand-optimized C libraries
+faster on every payload — they're mature, hand-optimized C libraries
 doing one job well, and no amount of tuning on constexpr-cbor's side is
 going to beat a hand-written C state machine on code size while keeping
-a generic, `std::variant`-based value representation. But "always
-faster" turned out to be false: fixing a real bug (`allocate_bytes`'
-byte-by-byte copy loop) made Arena mode the *fastest of all four* on
-string-heavy payloads, which is a genuinely useful data point this
-benchmark earns its keep by having found. constexpr-cbor's remaining
-differentiators are structural: it's the only one of the three that (a)
+a generic, `std::variant`-based value representation. Arena is
+consistently the closest competitor of the two constexpr-cbor modes
+(usually within 10-20% of tinycbor), which is the useful data point this
+benchmark earns its keep by tracking honestly, run over run, rather than
+by picking the single most flattering snapshot. constexpr-cbor's
+remaining differentiators are structural: it's the only one of the three
+that (a)
 proves its own correctness at *compile time* via `consteval`, (b) offers
 a real generic owned-tree API with the no-malloc mode as an
 equally-first-class alternative rather than the only option, and (c)

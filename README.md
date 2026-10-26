@@ -145,9 +145,14 @@ an incomplete element type, which is exactly what makes a recursive value type
 possible without a heap pointer indirection of some kind — but it does mean a
 heap. For environments without one at all, `ConstexprCbor::Arena` (in its own
 header, `include/constexpr_cbor_arena.hpp`) is the no-malloc counterpart: every
-decoded value lives in a caller-sized `NodePool<MaxNodes, MaxBytes>` (a flat
-`std::array<Node, MaxNodes>` plus a flat byte arena for string/bignum content)
-instead of on the heap.
+decoded value is a `Node` living in storage the *caller* owns and sizes —
+`ArenaStorage<MaxNodes, MaxRefs, MaxBytes>` bundles a `Node[]`, a `Node*[]`
+reference-slot array (see below), and a flat byte array for string/bignum
+content. `NodePool` is a small, non-owning view over those three spans — the
+actual allocator, not the storage itself — so the one thing this whole design
+rests on is that the caller's `ArenaStorage` outlives every decoded reference
+into it; see "Running out of capacity, and the buffer-lifetime precondition"
+below for exactly what that means and how `NodePool` defensively checks for it.
 
 The two headers are independently usable: a project that only wants the
 heap-based API includes just `constexpr_cbor.hpp`, and a project that only
@@ -172,13 +177,14 @@ using namespace ConstexprCbor;
 constexpr std::uint8_t bytes[] = {0x83, 0x01, 0x02, 0x03};  // [1, 2, 3]
 
 consteval bool round_trips() {
-    Arena::NodePool<16, 16> pool;               // 16 nodes, 16 content bytes -- sized by the caller
+    Arena::ArenaStorage<16, 16, 16> storage;     // 16 nodes, 16 ref slots, 16 content bytes -- sized by the caller
+    auto pool = storage.make_pool();
     const auto decoded = Arena::decode_value(pool, bytes);
     if (!decoded) return false;
-    const auto& items = std::get<Arena::ArrayRef>(pool.nodes[decoded->node_index].data);
+    const auto& items = std::get<Arena::ArrayRef>(decoded->node->data);
     if (items.count != 3) return false;
     std::array<std::uint8_t, 16> out{};
-    const auto written = Arena::encode_value(pool, decoded->node_index, out);
+    const auto written = Arena::encode_value(pool, decoded->node, out);
     return written && std::equal(out.begin(), out.begin() + *written, bytes);
 }
 
@@ -190,18 +196,22 @@ What's structurally different from the heap-based API, and why:
 - **`std::array<T, N>` can't hold an incomplete `T`.** `std::vector<T>` explicitly
   permits an incomplete element type (internal pointer indirection); a fixed-size
   array cannot, so a self-referential value type needs *some* indirection no
-  matter how it's declared. Here that's an index into the pool rather than a
-  heap pointer: a `Node` never contains another `Node` by value, only by index
-  (`ArrayRef`/`MapRef`/`TagRef` hold indices, not nested values).
+  matter how it's declared. Here that's a pointer into caller-owned storage
+  rather than a heap pointer: a `Node` never contains another `Node` by value,
+  only by pointer (`ArrayRef`/`MapRef`/`TagRef` hold pointers, not nested
+  values) — safe precisely because the caller's `ArenaStorage` is guaranteed
+  not to move or be destroyed while any decoded tree into it is alive (see
+  below).
 - **Arrays and maps need their N children as a contiguous run of slots**, so a
-  child can be reached by `first_child + i` instead of being, say, a
+  child can be reached by `first_child[i]` instead of being, say, a
   singly-linked chain. But contiguity has to be reserved *before* any child is
   decoded, and a child's own node count isn't known until it's actually decoded
   (a nested array needs however many nodes its own subtree needs). The fix is
-  one level of indirection per slot (`IndexCell`, resolved transparently by
-  `NodePool::child`/`map_key`/`map_value`): the slot always holds a cheap,
-  fixed-size index, and the child's real (possibly far-away, possibly
-  many-node) subtree lives wherever it was actually decoded.
+  a dedicated reference-slot array, separate from the `Node` storage itself
+  (`ArenaStorage`'s `Node*[]`, sized independently via `MaxRefs`): each slot is
+  a bare 8-byte pointer, resolved directly by `NodePool::child`/`map_key`/
+  `map_value` with no further indirection, and the child's real (possibly
+  far-away, possibly many-node) subtree lives wherever it was actually decoded.
 - **Indefinite-length arrays/maps don't know their count upfront at all** (no
   length marker, just items until a `0xFF` break), yet still need that same
   contiguous reservation before decoding any child. `Arena::skip_item` is a
@@ -221,7 +231,7 @@ What's structurally different from the heap-based API, and why:
   of entries seen so far; an arena map has no such flat, directly-comparable
   container (keys/values are scattered across whatever subtrees their own
   recursive decode needed), so `Arena::decode_value` instead compares each new
-  key structurally (`Arena::node_equal`, a recursive by-index equality covering
+  key structurally (`Arena::node_equal`, a recursive by-pointer equality covering
   every alternative, including composite Array/Map/Tag keys) against the keys
   already written, and calls the same `KeyPolicy::on_duplicate` — through its
   Arena-shaped overload — on a match. `KeepFirstDuplicateKey` simply doesn't
@@ -229,10 +239,14 @@ What's structurally different from the heap-based API, and why:
   overwrites the earlier pair's value slot in place. Reserved-but-unused
   trailing slots from dropped pairs are harmless (`MapRef.count` only ever
   covers the pairs actually written).
-- **Running out of `MaxNodes` or `MaxBytes` is a refusal** (`std::nullopt`),
-  exactly like a malformed-input refusal elsewhere in this library — never a
-  crash or a silent truncation. Sizing either pool is the caller's job, the
-  same way sizing an output buffer for `Arena::encode_value` is.
+- **Running out of `MaxNodes`, `MaxRefs`, or `MaxBytes` is a refusal**
+  (`std::nullopt`), exactly like a malformed-input refusal elsewhere in this
+  library — never a crash or a silent truncation. Sizing `ArenaStorage` is the
+  caller's job, the same way sizing an output buffer for `Arena::encode_value`
+  is. `MaxRefs` is independent of `MaxNodes`: every node that's ever an
+  array/map child needs one reference slot, so `MaxRefs == MaxNodes` is a safe
+  default, but a caller decoding shallow, mostly-scalar data can size it
+  smaller.
 - **`Arena::encode_value` writes into a caller-supplied `std::span<std::uint8_t>`**
   instead of returning a `std::vector`, returning how many bytes it used or
   `std::nullopt` if the buffer was too small — never a truncated or
@@ -241,16 +255,36 @@ What's structurally different from the heap-based API, and why:
   re-encodes to its definite-length equivalent, not byte-for-byte back to the
   original bytes.
 - **A CBOR length field is checked before it's ever cast to `std::size_t`.**
-  The wire format allows an array/map to claim up to 2^64-1 items, but
-  `NodePool` indexes with `std::size_t`, which can be narrower than 64 bits
-  (32 on common embedded targets). `Arena::decode_value` reserves node slots
-  for a whole array/map's children *before* decoding any of them, so a
-  silently-truncating cast there would be the exact shape of libcbor PR #387's
-  bug: a huge count wraps to a small one, the reservation "succeeds" against
-  that undersized number, and the loop — which still iterates the real,
-  untruncated count — writes past it. `Arena::detail::checked_node_count`
-  refuses (`std::nullopt`) instead, the same contract every other refusal in
-  this codec uses; it also guards the `*2` a map's key+value slot pairs need.
+  The wire format allows an array/map to claim up to 2^64-1 items, but the
+  reference-slot array indexes with `std::size_t`, which can be narrower than
+  64 bits (32 on common embedded targets). `Arena::decode_value` reserves
+  reference slots for a whole array/map's children *before* decoding any of
+  them, so a silently-truncating cast there would be the exact shape of
+  libcbor PR #387's bug: a huge count wraps to a small one, the reservation
+  "succeeds" against that undersized number, and the loop — which still
+  iterates the real, untruncated count — writes past it.
+  `Arena::detail::checked_node_count` refuses (`std::nullopt`) instead, the
+  same contract every other refusal in this codec uses; it also guards the
+  `*2` a map's key+value slot pairs need.
+- **Running out of capacity, and the buffer-lifetime precondition.** Every
+  `Node*` this file ever hands back is a raw, unchecked pointer into whatever
+  `ArenaStorage` the caller constructed `NodePool` over — safe as long as that
+  storage outlives every decoded reference into it, which is a precondition
+  the caller upholds, not something `NodePool` can enforce structurally (a
+  `unique_ptr` doesn't help here: it implies heap ownership, which doesn't
+  apply to a stack-resident `ArenaStorage` at all, and the actual contract —
+  "don't move or destroy this while a decoded tree points into it" — isn't
+  something any smart pointer adds over a plain reference). As a defensive,
+  best-effort check, `NodePool` writes two magic "canary" words bracketing
+  the caller's byte storage at construction and re-checks them (via `assert()`,
+  stripped in release builds under `NDEBUG`) on every `allocate_node`/
+  `reserve_refs`/`allocate_bytes` call, exposed publicly as
+  `canaries_intact()`. This catches common misuse — the caller's buffer being
+  reused for something else, a stale/moved-from `NodePool`, accidental
+  corruption — but it is **not** a general dangling-buffer detector: a buffer
+  that has genuinely gone out of scope and had its memory silently repurposed
+  by something that never touches the canary words is ordinary, uncatchable
+  UB, the same as dereferencing any other dangling pointer.
 
 See `tests/test_arena.cpp` for the full suite (round-trips against the same
 official vectors `tests/test_array.cpp`/`test_map.cpp`/`test_tag.cpp` use for
@@ -354,20 +388,20 @@ consumer who only wants raw `Arena::decode_value` never pays for it:
 #include "constexpr_cbor_arena_ergonomics.hpp"
 using namespace ConstexprCbor::Arena;
 
-NodePool<32, 32> pool;
-const auto view = decode_view(pool, bytes);  // std::optional<ArenaView<32, 32>>
+ArenaStorage<32, 32, 32> storage;
+auto pool = storage.make_pool();
+const auto view = decode_view(pool, bytes);  // std::optional<ArenaView>
 view->operator[]("name").get<std::string>();
 for (const auto& v : (*view)["thresholds"]) { /* ... */ }
 ```
 
-`ArenaView<MaxNodes, MaxBytes>` bundles a `(pool, node_index)` pair so
-`view["a"][2]["b"]` chains without re-threading `pool` at every step, and is
-templated on its pool's exact capacity (consistent with how `NodePool`/
-`decode_value` already work — a view never crosses pools of different
-capacity). It also provides a minimal, explicitly pool-exhaustion-aware
-**builder** (`ArenaBuilder<MaxNodes, MaxBytes>`, `make_null`/`make_bool`/
-`make_uint`/`make_int`/`make_float`/`make_text`/`make_bytes`/`make_array`/
-`make_map`) that writes new nodes into an *existing* pool's remaining
+`ArenaView` bundles a `(pool, node)` pair so `view["a"][2]["b"]` chains
+without re-threading `pool` at every step; a non-template, concrete type
+(the pool it points into is no longer sized via template parameters either —
+see "No-malloc decoding/encoding" above). It also provides a minimal,
+explicitly pool-exhaustion-aware **builder** (`ArenaBuilder`, `make_null`/
+`make_bool`/`make_uint`/`make_int`/`make_float`/`make_text`/`make_bytes`/
+`make_array`/`make_map`) that writes new nodes into an *existing* pool's remaining
 capacity — every write returns `std::optional`, since pool exhaustion is an
 ordinary, expected failure here (unlike the heap builder, where `std::vector`
 growth can't fail). `make_array`/`make_map` take already-built (post-order)
@@ -407,16 +441,16 @@ bignums, tags, non-string map keys) are rendered.
 performance, memory usage, correctness, and flexibility, with real
 numbers from a reproducible Docker build (`docker build -t cbor-bench -f
 benchmarks/Dockerfile . && docker run --rm cbor-bench`). Short version:
-tinycbor/QCBOR are still smaller in code size and faster on most
-payloads (hand-tuned C state machines); the no-malloc Arena mode is
-within ~8% of both on the rest and outright *faster* than either on
-string-heavy input, after a real bug this benchmark surfaced and fixed
-(`allocate_bytes`' byte-copy loop). constexpr-cbor's remaining case is
-compile-time-proven correctness, a real zero-malloc mode *and* a
-generic owned-tree mode as equally first-class options, and
-caller-tunable nesting depth/UTF-8 validation/duplicate-key policy
-where the others hard-code one behavior. See `benchmarks/README.md` for
-the full numbers and methodology.
+tinycbor/QCBOR are still smaller in code size and faster raw decoders
+across the board (hand-tuned C state machines); the no-malloc Arena
+mode is consistently competitive with tinycbor, usually within 10-20%.
+constexpr-cbor's case is compile-time-proven correctness, a real
+zero-malloc mode *and* a generic owned-tree mode as equally first-class
+options, and caller-tunable nesting depth/UTF-8 validation/duplicate-key
+policy where the others hard-code one behavior. See
+`benchmarks/README.md` for the full numbers and methodology, including
+how Arena's internals moved from index-based to pointer-based
+indirection and what that did to code size.
 
 ## Building and testing this library
 

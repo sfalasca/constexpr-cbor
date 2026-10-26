@@ -864,22 +864,22 @@ struct CborSerializer {
   }
 };
 
-// Forward declarations only: ConstexprCbor::Arena::NodePool/Node/IndexCell
-// are defined later in this header (after this ConstexprCbor namespace
+// Forward declarations only: ConstexprCbor::Arena::NodePool/Node are
+// defined later in this header (after this ConstexprCbor namespace
 // closes), but the duplicate-key policies just below need to declare an
 // Arena-shaped on_duplicate overload alongside their std::vector-shaped
 // one, so that the exact same policy TYPE works for both decode_value
 // (this namespace) and Arena::decode_value -- "it's still a policy" means
 // one coherent type per policy, not a parallel Arena-only copy of each.
-// Declaring (not yet defining) these here is enough: the member function
-// templates below are only instantiated once actually called, by which
-// point Arena's own definitions have long since appeared in the same
-// translation unit.
+// Declaring (not yet defining) these here is enough: the member functions
+// below are only instantiated once actually called, by which point
+// Arena's own definitions have long since appeared in the same
+// translation unit. Neither type carries NTTPs: NodePool is a small,
+// non-owning, trivially-copyable view over caller-supplied storage, not a
+// container sized by template parameters.
 namespace Arena {
-template <std::size_t MaxNodes, std::size_t MaxBytes>
 struct NodePool;
 struct Node;
-struct IndexCell;
 }  // namespace Arena
 
 // ---------------------------------------------------------------------------
@@ -924,20 +924,20 @@ inline constexpr bool is_duplicate_key_policy_v = is_duplicate_key_policy<P>::va
 // mutates `entries` as needed and returns false to abort the whole map's
 // decode (reject), true to continue. Each policy below also provides an
 // Arena-shaped overload (same decision, same return-value contract, just
-// expressed over NodePool indices instead of a std::vector<pair<...>> --
+// expressed over pointers into the pool instead of a std::vector<pair<...>> --
 // Arena::decode_value has no flat, directly-comparable entries container
-// to search or mutate, only a pool and indices into it): `existing_pair_index`
-// is which already-written pair (0-based) the new key matched;
-// `new_key_index`/`new_value_index` are where the newly-decoded pair's key
-// and value already live in the pool.
+// to search or mutate, only a pool and references into it): `first_pair`
+// is the base of the pair's contiguous Node* reference-slot block,
+// `existing_pair_index` is which already-written pair (0-based) the new
+// key matched, and `new_key`/`new_value` are where the newly-decoded
+// pair's key and value nodes already live in the pool.
 struct RejectDuplicateKeys {
   static constexpr bool on_duplicate(std::vector<std::pair<CborValue, CborValue>>&, CborValue, CborValue) {
     return false;
   }
-  template <std::size_t MaxNodes, std::size_t MaxBytes>
-  static constexpr bool on_duplicate(Arena::NodePool<MaxNodes, MaxBytes>&, std::size_t /*first_pair*/,
-                                      std::size_t /*existing_pair_index*/, std::size_t /*new_key_index*/,
-                                      std::size_t /*new_value_index*/) {
+  static constexpr bool on_duplicate(Arena::NodePool&, Arena::Node** /*first_pair*/,
+                                      std::size_t /*existing_pair_index*/, Arena::Node* /*new_key*/,
+                                      Arena::Node* /*new_value*/) {
     return false;
   }
 };
@@ -945,10 +945,9 @@ struct KeepFirstDuplicateKey {
   static constexpr bool on_duplicate(std::vector<std::pair<CborValue, CborValue>>&, CborValue, CborValue) {
     return true;  // first occurrence already in entries; drop this one
   }
-  template <std::size_t MaxNodes, std::size_t MaxBytes>
-  static constexpr bool on_duplicate(Arena::NodePool<MaxNodes, MaxBytes>&, std::size_t /*first_pair*/,
-                                      std::size_t /*existing_pair_index*/, std::size_t /*new_key_index*/,
-                                      std::size_t /*new_value_index*/) {
+  static constexpr bool on_duplicate(Arena::NodePool&, Arena::Node** /*first_pair*/,
+                                      std::size_t /*existing_pair_index*/, Arena::Node* /*new_key*/,
+                                      Arena::Node* /*new_value*/) {
     return true;  // first occurrence's pair is left exactly where it is; drop this one
   }
 };
@@ -963,16 +962,15 @@ struct KeepLastDuplicateKey {
     }
     return true;
   }
-  // Defined out-of-line, after Arena::Node/IndexCell are complete: GCC's
-  // -Wtemplate-body checks aggregate-initializer syntax against a member
-  // template's body eagerly, even though it's only truly instantiated
-  // once called (by which point Arena's own types have long since been
-  // fully defined later in this header) -- an inline body here would hit
-  // that check while IndexCell is still just a forward declaration.
-  template <std::size_t MaxNodes, std::size_t MaxBytes>
-  static constexpr bool on_duplicate(Arena::NodePool<MaxNodes, MaxBytes>& pool, std::size_t first_pair,
-                                      std::size_t existing_pair_index, std::size_t new_key_index,
-                                      std::size_t new_value_index);
+  // Defined out-of-line, after Arena::Node is complete: GCC's
+  // -Wtemplate-body checks aggregate-initializer syntax eagerly against a
+  // member function's body even though it's only truly instantiated once
+  // called (by which point Arena's own types have long since been fully
+  // defined later in this header) -- an inline body here would hit that
+  // check while Node is still just a forward declaration.
+  static constexpr bool on_duplicate(Arena::NodePool& pool, Arena::Node** first_pair,
+                                      std::size_t existing_pair_index, Arena::Node* new_key,
+                                      Arena::Node* new_value);
 };
 
 namespace detail {
