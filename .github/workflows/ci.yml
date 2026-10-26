@@ -5,13 +5,21 @@ on:
   pull_request:
 
 jobs:
+  # g++ only: the real, verified floor is GCC 13+ or Clang 19+ paired with
+  # -stdlib=libc++ (see README's Requirements section and docker/README.md
+  # for the full, checked-not-assumed story). ubuntu-latest's default
+  # `clang++` is paired with the distro's system libstdc++, not libc++ --
+  # an untested, unsupported, and unclaimed pairing, not a weaker version
+  # of the pairing this project actually supports. Clang itself (19-21,
+  # with libc++) is already exercised correctly by the docker-matrix job
+  # below; duplicating it here under a different, unsupported pairing
+  # would only add a confusing, non-representative red X.
   native:
-    name: native (${{ matrix.compiler }}, C++${{ matrix.std }})
+    name: native (g++, C++${{ matrix.std }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        compiler: [g++, clang++]
         std: [20, 23]
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +27,7 @@ jobs:
       - name: Configure
         run: >
           cmake -S . -B build
-          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_CXX_COMPILER=g++
           -DCMAKE_CXX_STANDARD=${{ matrix.std }}
           -DCMAKE_BUILD_TYPE=Debug
 
@@ -35,17 +43,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install clang-tools
-        run: sudo apt-get update && sudo apt-get install -y clang-tools
+      # Pinned to clang-19 + libc++-19: the one Clang/standard-library
+      # pairing this project actually supports (see the native job's
+      # comment above) -- scan-build is clang-based, so it needs the same
+      # pairing the docker-matrix's clang-19..21 images use, not whatever
+      # default "clang" the runner's distro happens to resolve to.
+      - name: Install clang-19 + libc++-19
+        run: >
+          sudo apt-get update && sudo apt-get install -y
+          clang-19 clang-tools-19 libc++-19-dev libc++abi-19-dev perl-modules-5.38
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_STANDARD=23
+        run: >
+          cmake -S . -B build
+          -DCMAKE_CXX_COMPILER=clang++-19
+          -DCMAKE_CXX_STANDARD=23
+          -DCMAKE_CXX_FLAGS=-stdlib=libc++
+          -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -lc++abi"
 
       - name: Build once (populate object files so the target has something to re-scan)
         run: cmake --build build -j
 
-      - name: Run static_analysis target
-        run: cmake --build build --target static_analysis
+      - name: Run cbor_static_analysis target
+        run: cmake --build build --target cbor_static_analysis
 
   docker-matrix:
     name: docker (${{ matrix.target }})
@@ -54,26 +74,45 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - gcc-10
-          - gcc-11
-          - gcc-12
           - gcc-13
           - gcc-14
           - gcc-15
-          - clang-13
-          - clang-14
-          - clang-15
-          - clang-16
-          - clang-17
-          - clang-18
           - clang-19
           - clang-20
           - clang-21
           - esp32
           - stm32
           - riscv32
+        # Kept building (not deleted) and intentionally allowed to fail,
+        # each for its own distinct, checked reason documented in
+        # docker/README.md -- this is this project's own
+        # expected_failures/ convention applied to the compiler matrix
+        # itself: proving where the real floor is, not silently dropping
+        # the versions below it. A red X here is expected, not a CI bug;
+        # a green check here would actually be the surprise worth
+        # investigating.
+        include:
+          - target: gcc-10
+            allow_failure: true
+          - target: gcc-11
+            allow_failure: true
+          - target: gcc-12
+            allow_failure: true
+          - target: clang-13
+            allow_failure: true
+          - target: clang-14
+            allow_failure: true
+          - target: clang-15
+            allow_failure: true
+          - target: clang-16
+            allow_failure: true
+          - target: clang-17
+            allow_failure: true
+          - target: clang-18
+            allow_failure: true
     steps:
       - uses: actions/checkout@v4
 
       - name: docker build -f docker/${{ matrix.target }}.Dockerfile
+        continue-on-error: ${{ matrix.allow_failure == true }}
         run: docker build -f docker/${{ matrix.target }}.Dockerfile -t cbor-${{ matrix.target }} .

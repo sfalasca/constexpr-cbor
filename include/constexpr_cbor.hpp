@@ -371,6 +371,8 @@ constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_
 template <typename T, typename = void>
 struct CborSerializer;
 
+struct CborValue;
+
 // ---------------------------------------------------------------------------
 // The recursive value type arrays, maps, and tags are built from. Byte/text
 // string content here is owned (a copy), not a zero-copy span like
@@ -439,17 +441,66 @@ struct CborValue {
 
   constexpr CborValue() = default;
 
-  // The single converting constructor every ergonomic construction path goes
-  // through -- one if-constexpr dispatch chain (matching the codebase's own
-  // encode_value-visitor idiom) rather than a proliferation of overloads,
-  // which would recreate exactly the overload-ambiguity problems described
-  // below for the array/map literal case. Excludes T == CborValue itself so
-  // it never hijacks the implicitly-declared copy/move constructor (the
-  // classic "forwarding reference shadows copy constructor" trap).
+  // The three self-referential/recursive alternatives (containing CborValue
+  // itself, directly or via pair) get their OWN constructor, member-
+  // initializing `data` directly via the variant's own constructor, rather
+  // than default-constructing `data` to monostate first and then switching
+  // it to a different active alternative via assignment in the body below
+  // -- a strictly better, more direct construction path under GCC/libstdc++
+  // (this project's only toolchain with full, verified support; see
+  // README's "Toolchain support" section). Note for the record: this does
+  // NOT make these three alternatives constructible under Clang -- Clang's
+  // handling of std::variant's in_place_index-based constructor for a
+  // self-referential alternative this deep fails ("placement new would
+  // change type of storage from '__aligned_membuf<...>' to '...'") even for
+  // a single, fresh, first-ever construction, with no prior "switch"
+  // involved at all. Confirmed empirically (including against the
+  // pre-ergonomics commit, before this constructor existed at all) to be a
+  // pre-existing Clang/libstdc++ limitation this codebase cannot work
+  // around from user code, not something introduced or fixable here.
   template <typename T>
-    requires(!std::same_as<std::remove_cvref_t<T>, CborValue>)
+    requires(std::same_as<std::remove_cvref_t<T>, std::vector<CborValue>> ||
+             std::same_as<std::remove_cvref_t<T>, std::vector<std::pair<CborValue, CborValue>>> ||
+             std::same_as<std::remove_cvref_t<T>, Tag>)
+  constexpr CborValue(T&& v) : data(std::forward<T>(v)) {}  // NOLINT(google-explicit-constructor)
+
+  // The single converting constructor every other ergonomic construction
+  // path goes through -- one if-constexpr dispatch chain (matching the
+  // codebase's own encode_value-visitor idiom) rather than a proliferation
+  // of overloads, which would recreate exactly the overload-ambiguity
+  // problems described below for the array/map literal case. Excludes
+  // T == CborValue itself so it never hijacks the implicitly-declared
+  // copy/move constructor (the classic "forwarding reference shadows copy
+  // constructor" trap), and excludes the three recursive alternatives
+  // above (handled by the dedicated constructor instead).
+  template <typename T>
+    requires(!std::same_as<std::remove_cvref_t<T>, CborValue> &&
+             !std::same_as<std::remove_cvref_t<T>, std::vector<CborValue>> &&
+             !std::same_as<std::remove_cvref_t<T>, std::vector<std::pair<CborValue, CborValue>>> &&
+             !std::same_as<std::remove_cvref_t<T>, Tag>)
   constexpr CborValue(T&& v) {  // NOLINT(google-explicit-constructor)
-    assign_from(std::forward<T>(v));
+    using D = std::remove_cvref_t<T>;
+    if constexpr (std::same_as<D, std::monostate> || std::same_as<D, std::nullptr_t> || std::same_as<D, bool> ||
+                  std::same_as<D, std::uint64_t> || std::same_as<D, NegativeInt> || std::same_as<D, OwnedString> ||
+                  std::same_as<D, BigNum> || std::same_as<D, SimpleValue> || std::same_as<D, double>) {
+      data = std::forward<T>(v);
+    } else if constexpr (std::integral<D> && !std::same_as<D, bool>) {
+      const std::int64_t iv = static_cast<std::int64_t>(v);
+      if (iv >= 0) {
+        data = static_cast<std::uint64_t>(iv);
+      } else {
+        data = NegativeInt{.n = static_cast<std::uint64_t>(-1 - iv)};
+      }
+    } else if constexpr (std::same_as<D, float>) {
+      data = static_cast<double>(v);
+    } else if constexpr (std::constructible_from<std::string_view, T>) {
+      const std::string_view sv(v);
+      data = OwnedString{.kind = StringKind::Text, .content = {sv.begin(), sv.end()}};
+    } else {
+      if (!CborSerializer<D>::to_cbor(*this, v)) {
+        data = std::monostate{};
+      }
+    }
   }
 
   template <typename T>
@@ -468,7 +519,7 @@ struct CborValue {
   // nlohmann's string-only-key heuristic: CBOR map keys are unrestricted,
   // so the rule is purely structural -- every element a 2-element array, not
   // "every element a 2-element array whose first is a string."
-  constexpr CborValue(std::initializer_list<CborValue> init, bool type_deduction = true) {
+  static constexpr CborValue build_array_or_map(std::initializer_list<CborValue> init, bool type_deduction) {
     bool all_pairs = type_deduction && init.size() > 0;
     if (all_pairs) {
       for (const auto& elem : init) {
@@ -485,11 +536,16 @@ struct CborValue {
         const auto& arr = std::get<std::vector<CborValue>>(elem.data);
         entries.emplace_back(arr[0], arr[1]);
       }
-      data = std::move(entries);
-    } else {
-      data = std::vector<CborValue>(init.begin(), init.end());
+      return CborValue(std::move(entries));
     }
+    return CborValue(std::vector<CborValue>(init.begin(), init.end()));
   }
+
+  constexpr CborValue(std::initializer_list<CborValue> init, bool type_deduction = true)
+      // Delegates to the move constructor (itself constructing `data`
+      // directly via the recursive constructor above) rather than default-
+      // constructing `data` and assigning into it here.
+      : CborValue(build_array_or_map(init, type_deduction)) {}  // NOLINT(google-explicit-constructor)
 
   // Forces array interpretation, bypassing the heuristic above -- covers
   // `{}` (ambiguous between empty array/empty map) and any genuine array
@@ -675,35 +731,6 @@ struct CborValue {
   constexpr ItemsProxy items() {
     if (auto* m = std::get_if<std::vector<std::pair<CborValue, CborValue>>>(&data)) return ItemsProxy{m};
     return ItemsProxy{nullptr};
-  }
-
- private:
-  template <typename T>
-  constexpr void assign_from(T&& v) {
-    using D = std::remove_cvref_t<T>;
-    if constexpr (std::same_as<D, std::monostate> || std::same_as<D, std::nullptr_t> || std::same_as<D, bool> ||
-                  std::same_as<D, std::uint64_t> || std::same_as<D, NegativeInt> || std::same_as<D, OwnedString> ||
-                  std::same_as<D, BigNum> || std::same_as<D, SimpleValue> || std::same_as<D, double> ||
-                  std::same_as<D, std::vector<CborValue>> ||
-                  std::same_as<D, std::vector<std::pair<CborValue, CborValue>>> || std::same_as<D, Tag>) {
-      data = std::forward<T>(v);
-    } else if constexpr (std::integral<D> && !std::same_as<D, bool>) {
-      const std::int64_t iv = static_cast<std::int64_t>(v);
-      if (iv >= 0) {
-        data = static_cast<std::uint64_t>(iv);
-      } else {
-        data = NegativeInt{.n = static_cast<std::uint64_t>(-1 - iv)};
-      }
-    } else if constexpr (std::same_as<D, float>) {
-      data = static_cast<double>(v);
-    } else if constexpr (std::constructible_from<std::string_view, T>) {
-      const std::string_view sv(v);
-      data = OwnedString{.kind = StringKind::Text, .content = {sv.begin(), sv.end()}};
-    } else {
-      if (!CborSerializer<D>::to_cbor(*this, v)) {
-        data = std::monostate{};
-      }
-    }
   }
 };
 
