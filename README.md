@@ -255,13 +255,132 @@ What's structurally different from the heap-based API, and why:
 See `tests/test_arena.cpp` for the full suite (round-trips against the same
 official vectors `tests/test_array.cpp`/`test_map.cpp`/`test_tag.cpp` use for
 the heap-based decoder, plus pool-exhaustion and buffer-too-small refusal
-cases). It doesn't use `compile_time_ut`'s `expect_eq<A, B>()` NTTP form the
-way sibling test files do: that form requires every operand to be a freshly
-formed constant expression with no named variable carried in from an earlier
-statement, and `NodePool` can never itself be `constexpr` (it's mutated by
-`decode_value` through a non-const reference) — so every check in that file
-uses the plain if/return idiom instead, proved by `static_assert` same as
-everywhere else in this codebase.
+cases). It *is* fully `compile_time_ut`-based, same as every other test file:
+`NodePool` can never itself be a `constexpr` input the way sibling test
+files' plain byte vectors are (it's mutated by `decode_value` through a
+non-const reference), but a small `constexpr` helper function that declares
+and consumes its own `NodePool` entirely inside its own body is a
+self-contained expression, usable directly as an `expect_eq<>()`/
+`expect_true<>()` argument.
+
+## nlohmann::json-style ergonomics
+
+Both `CborValue` and the Arena's `ArenaView` support an nlohmann::json-style
+ergonomic interface on top of the raw `std::get`/`std::visit` access shown
+above — entirely additive, and kept exception-free throughout: a miss or
+type mismatch returns a shared sentinel or `std::optional`, never throws,
+preserving `-fno-exceptions` compatibility and `consteval`-safety for every
+path.
+
+```cpp
+#include "constexpr_cbor.hpp"
+using namespace ConstexprCbor;
+
+CborValue config = {{"name", "sensor-1"}, {"thresholds", {10, 20, 30}}};
+config["name"].get<std::string>();          // -> std::optional<std::string>{"sensor-1"}
+config["thresholds"][1].get<std::uint64_t>();  // -> std::optional<std::uint64_t>{20}
+config["missing"].is_undefined();           // -> true, no throw, no crash
+
+for (const auto& v : config["thresholds"]) { /* ... */ }
+
+CborValue built;
+built["x"] = 42;           // auto-promotes Undefined -> Map
+built["y"][2] = "z";       // auto-promotes/null-pads -> Array
+```
+
+`is_undefined()`/`is_null()`/`is_boolean()`/`is_unsigned()`/`is_negative_int()`/
+`is_bignum()`/`is_integer()`/`is_float()`/`is_number()`/`is_string()`/
+`is_binary()`/`is_simple()`/`is_array()`/`is_map()` (alias `is_object()`)/
+`is_tag()`, plus `size()`/`empty()`/`contains()`, `operator[]` (index, key,
+or any type implicitly convertible to `CborValue`, including string
+literals), `.get<T>()` (built-ins return `std::optional<T>`; see below for
+user types), range-for iteration (array elements, or map *values* — matching
+nlohmann's own default), and `.items()` (map key/value pairs).
+
+**No `.at()`**: nlohmann's `.at()` throws on a miss; this library stays
+exception-free, so rather than offer a method whose name implies that
+contract and silently diverges from it, only `operator[]` is provided.
+
+**Array vs. map literal construction**, adapted from nlohmann's own
+heuristic (generalized here since CBOR map keys aren't restricted to
+strings — a nested 2-element array in the braced list is read as a
+key/value pair regardless of what the key is):
+
+```cpp
+CborValue arr = {1, 2, 3};                    // array
+CborValue obj = {{"a", 1}, {"b", 2}};         // map (every element is a 2-elem array)
+CborValue forced_arr = CborValue::array({});  // bypasses the heuristic (also covers {})
+CborValue forced_obj = CborValue::object({{CborValue::array({1, 2}), "composite-key"}});
+CborValue bytes = CborValue::binary(some_span);  // byte strings need an explicit call,
+                                                   // same ambiguity nlohmann's json::binary solves
+```
+
+**User types**, via ADL hooks mirroring nlohmann's `adl_serializer`
+(`to_cbor`/`from_cbor` found unqualified in the type's own namespace, or a
+`CborSerializer<T>` specialization for types you can't attach a free
+function to):
+
+```cpp
+namespace mylib {
+struct Point { int x, y; };
+constexpr bool to_cbor(CborValue& out, const Point& p) {
+  out = CborValue::object({{"x", p.x}, {"y", p.y}});
+  return true;
+}
+constexpr bool from_cbor(const CborValue& in, Point& p) {
+  auto x = in["x"].get<std::int64_t>(), y = in["y"].get<std::int64_t>();
+  if (!x || !y) return false;
+  p = {static_cast<int>(*x), static_cast<int>(*y)};
+  return true;
+}
+}
+
+CborValue v = mylib::Point{3, 4};
+auto p = v.get<mylib::Point>();  // std::optional<mylib::Point>
+```
+
+A `.get<T>()` call for a `T` with no built-in support, no ADL hook, and no
+`CborSerializer<T>` specialization is a **compile error** — the one place
+this interface is allowed to hard-fail at compile time (a template
+instantiation failure, not a runtime/consteval-execution-time one).
+
+**Arena (`ConstexprCbor::Arena::ArenaView`)**: the same read-only surface
+(`is_*()`/`operator[]`/`.get<T>()`/iteration/`.items()`), via
+`#include "constexpr_cbor_arena_ergonomics.hpp"` — a third, separately
+includable header (depends on both existing ones), so a minimal embedded
+consumer who only wants raw `Arena::decode_value` never pays for it:
+
+```cpp
+#include "constexpr_cbor_arena_ergonomics.hpp"
+using namespace ConstexprCbor::Arena;
+
+NodePool<32, 32> pool;
+const auto view = decode_view(pool, bytes);  // std::optional<ArenaView<32, 32>>
+view->operator[]("name").get<std::string>();
+for (const auto& v : (*view)["thresholds"]) { /* ... */ }
+```
+
+`ArenaView<MaxNodes, MaxBytes>` bundles a `(pool, node_index)` pair so
+`view["a"][2]["b"]` chains without re-threading `pool` at every step, and is
+templated on its pool's exact capacity (consistent with how `NodePool`/
+`decode_value` already work — a view never crosses pools of different
+capacity). It also provides a minimal, explicitly pool-exhaustion-aware
+**builder** (`ArenaBuilder<MaxNodes, MaxBytes>`, `make_null`/`make_bool`/
+`make_uint`/`make_int`/`make_float`/`make_text`/`make_bytes`/`make_array`/
+`make_map`) that writes new nodes into an *existing* pool's remaining
+capacity — every write returns `std::optional`, since pool exhaustion is an
+ordinary, expected failure here (unlike the heap builder, where `std::vector`
+growth can't fail). `make_array`/`make_map` take already-built (post-order)
+child `ArenaView`s into the *same* pool; `make_map` does no duplicate-key
+handling of its own (the builder isn't policy-templated — a caller needing
+dedup resolves it in their own pair list first). A **mutable `operator[]`**
+and **brace-initializer construction** are deliberately out of scope for
+Arena: both would need the exact same optional-returning grow/promote
+machinery the builder already has, just duplicated under a value-type
+syntax that can't naturally express "this might fail" — not a small
+addition once pool exhaustion is taken seriously, and read-only view
+ergonomics plus the explicit builder calls above already cover the common
+cases.
 
 ## Caller-tunable nesting depth
 

@@ -51,10 +51,10 @@ static_assert(test_decode_tag_refuses_truncated_input());
 consteval bool test_encode_tag_matches_official_vectors() {
   using namespace CompileTimeUnitTesting;
   constexpr std::array<std::uint8_t, 6> expected{0xc1, 0x1a, 0x51, 0x4b, 0x67, 0xb0};
-  const CborValue value{.data = CborValue::Tag{
-                             .number = 1,
-                             .value = {CborValue{.data = std::uint64_t{1363896240}}},
-                         }};
+  const CborValue value(CborValue::Tag{
+      .number = 1,
+      .value = {CborValue(std::uint64_t{1363896240})},
+  });
   const auto encoded = encode_value(value);
   expect_eq(std::span<const std::uint8_t>(encoded), std::span<const std::uint8_t>(expected));
   return true;

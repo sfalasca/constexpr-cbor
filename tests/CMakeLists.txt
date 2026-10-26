@@ -34,6 +34,14 @@ set(positive_test_sources
     test_malformed_input.cpp
     test_arena.cpp
     arena_no_alloc_tests.cpp
+    test_ergonomics_predicates.cpp
+    test_ergonomics_access.cpp
+    test_ergonomics_iteration.cpp
+    test_ergonomics_builder.cpp
+    test_ergonomics_get.cpp
+    test_ergonomics_adl.cpp
+    test_arena_view.cpp
+    test_arena_builder.cpp
 )
 
 # arena_no_alloc_tests.cpp is the one source that doesn't use
@@ -122,6 +130,10 @@ add_compile_failure_test_with_values(wrong_shape_duplicate_key_policy
 add_compile_failure_test_with_values(wrong_shape_duplicate_key_policy_arena
     expected_failures/wrong_shape_duplicate_key_policy_arena.cpp LABELS policy
     EXPECT "KeyPolicy must provide static bool on_duplicate")
+
+add_compile_failure_test_with_values(ergonomics_get_unregistered_type
+    expected_failures/ergonomics_get_unregistered_type.cpp LABELS policy
+    EXPECT "No from_cbor(const CborValue&, T&) found via ADL and no CborSerializer<T> specialization provided")
 
 add_compile_failure_test(expect_eq_wrong_decoded_value
     expected_failures/expect_eq_wrong_decoded_value.cpp LABELS sanity)

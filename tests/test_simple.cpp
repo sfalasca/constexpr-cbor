@@ -123,8 +123,8 @@ consteval bool test_encode_simple_matches_official_vectors() {
   using namespace CompileTimeUnitTesting;
   constexpr std::array<std::uint8_t, 1> expected_16{0xf0};
   constexpr std::array<std::uint8_t, 2> expected_255{0xf8, 0xff};
-  const CborValue v16{.data = CborValue::SimpleValue{.number = 16}};
-  const CborValue v255{.data = CborValue::SimpleValue{.number = 255}};
+  const CborValue v16(CborValue::SimpleValue{.number = 16});
+  const CborValue v255(CborValue::SimpleValue{.number = 255});
   const auto e16 = encode_value(v16);
   const auto e255 = encode_value(v255);
   expect_eq(std::span<const std::uint8_t>(e16), std::span<const std::uint8_t>(expected_16));

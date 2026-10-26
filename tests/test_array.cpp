@@ -80,11 +80,11 @@ static_assert(test_decode_array_refuses_truncated_input());
 consteval bool test_encode_array_matches_official_vectors() {
   using namespace CompileTimeUnitTesting;
   constexpr std::array<std::uint8_t, 4> expected{0x83, 0x01, 0x02, 0x03};
-  const CborValue value{.data = std::vector<CborValue>{
-                             CborValue{.data = std::uint64_t{1}},
-                             CborValue{.data = std::uint64_t{2}},
-                             CborValue{.data = std::uint64_t{3}},
-                         }};
+  const CborValue value(std::vector<CborValue>{
+      CborValue(std::uint64_t{1}),
+      CborValue(std::uint64_t{2}),
+      CborValue(std::uint64_t{3}),
+  });
   const auto encoded = encode_value(value);
   expect_eq(std::span<const std::uint8_t>(encoded), std::span<const std::uint8_t>(expected));
   return true;

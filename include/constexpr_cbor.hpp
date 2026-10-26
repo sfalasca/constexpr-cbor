@@ -3,12 +3,15 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <numeric>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -360,6 +363,14 @@ constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_
   }
 }
 
+// Forward declaration only: CborValue's own templated constructor/.get<T>()
+// fall back to this (ADL user-type hook dispatch, see the definition below
+// this class) for any T that isn't one of the built-in CBOR alternatives.
+// Declaring it here (not yet defining it) is enough, the same forward-
+// declare-then-define-later pattern already used for Arena::NodePool below.
+template <typename T, typename = void>
+struct CborSerializer;
+
 // ---------------------------------------------------------------------------
 // The recursive value type arrays, maps, and tags are built from. Byte/text
 // string content here is owned (a copy), not a zero-copy span like
@@ -368,6 +379,16 @@ constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_
 // header interspersed), so concatenating them can't stay zero-copy, and
 // CborValue needs one uniform representation that covers both the definite
 // and indefinite case.
+//
+// Beyond the raw variant, CborValue also provides an nlohmann::json-style
+// ergonomic interface (is_*()/operator[]/.get<T>()/iteration/brace-init
+// construction) -- entirely additive, kept exception-free throughout (no
+// throwing anywhere: a miss/type-mismatch returns a shared sentinel or
+// std::optional, never throws, preserving -fno-exceptions compatibility and
+// consteval-safety for every existing decode/encode path). Adding the
+// builder constructor below necessarily makes CborValue a non-aggregate
+// (a deliberate, accepted break from the old CborValue{.data = ...}
+// construction syntax -- .data itself stays public and unchanged).
 struct CborValue {
   enum class StringKind { Bytes, Text };
   struct OwnedString {
@@ -415,6 +436,383 @@ struct CborValue {
       data;
 
   friend constexpr bool operator==(const CborValue&, const CborValue&) = default;
+
+  constexpr CborValue() = default;
+
+  // The single converting constructor every ergonomic construction path goes
+  // through -- one if-constexpr dispatch chain (matching the codebase's own
+  // encode_value-visitor idiom) rather than a proliferation of overloads,
+  // which would recreate exactly the overload-ambiguity problems described
+  // below for the array/map literal case. Excludes T == CborValue itself so
+  // it never hijacks the implicitly-declared copy/move constructor (the
+  // classic "forwarding reference shadows copy constructor" trap).
+  template <typename T>
+    requires(!std::same_as<std::remove_cvref_t<T>, CborValue>)
+  constexpr CborValue(T&& v) {  // NOLINT(google-explicit-constructor)
+    assign_from(std::forward<T>(v));
+  }
+
+  template <typename T>
+    requires(!std::same_as<std::remove_cvref_t<T>, CborValue>)
+  constexpr CborValue& operator=(T&& v) {
+    *this = CborValue(std::forward<T>(v));
+    return *this;
+  }
+
+  // Array-vs-map brace-init disambiguation, adapted from nlohmann's own
+  // mechanism (a single constructor + a runtime heuristic over the
+  // materialized elements, not plain overloading -- nlohmann itself
+  // abandoned overloading for the exact same ambiguity a nested braced
+  // element like `{"a", 1}` creates against either an initializer_list<T>
+  // or an initializer_list<pair<T,T>> element type). Generalized here vs.
+  // nlohmann's string-only-key heuristic: CBOR map keys are unrestricted,
+  // so the rule is purely structural -- every element a 2-element array, not
+  // "every element a 2-element array whose first is a string."
+  constexpr CborValue(std::initializer_list<CborValue> init, bool type_deduction = true) {
+    bool all_pairs = type_deduction && init.size() > 0;
+    if (all_pairs) {
+      for (const auto& elem : init) {
+        const auto* arr = std::get_if<std::vector<CborValue>>(&elem.data);
+        if (!arr || arr->size() != 2) {
+          all_pairs = false;
+          break;
+        }
+      }
+    }
+    if (all_pairs) {
+      std::vector<std::pair<CborValue, CborValue>> entries;
+      for (const auto& elem : init) {
+        const auto& arr = std::get<std::vector<CborValue>>(elem.data);
+        entries.emplace_back(arr[0], arr[1]);
+      }
+      data = std::move(entries);
+    } else {
+      data = std::vector<CborValue>(init.begin(), init.end());
+    }
+  }
+
+  // Forces array interpretation, bypassing the heuristic above -- covers
+  // `{}` (ambiguous between empty array/empty map) and any genuine array
+  // of 2-element sub-arrays the heuristic would otherwise misread as a map.
+  static constexpr CborValue array(std::initializer_list<CborValue> init = {}) { return CborValue(init, false); }
+
+  // Forces map interpretation; the always-unambiguous spelling, especially
+  // once keys aren't plain strings: object({ {1u, "one"}, {array({1,2}),
+  // "composite-key"} }). Every element must be a 2-element array (key,
+  // value) -- not re-checked here, same discipline as the rest of this
+  // ergonomic layer trusting caller-authored-in-code input.
+  static constexpr CborValue object(std::initializer_list<CborValue> init) {
+    std::vector<std::pair<CborValue, CborValue>> entries;
+    for (const auto& elem : init) {
+      const auto& arr = std::get<std::vector<CborValue>>(elem.data);
+      entries.emplace_back(arr[0], arr[1]);
+    }
+    return CborValue(std::move(entries));
+  }
+
+  // A dedicated factory, not an implicit path: a bare byte sequence is
+  // exactly as ambiguous with "array of small integers" as in nlohmann,
+  // which solved it identically with json::binary(...).
+  static constexpr CborValue binary(std::span<const std::uint8_t> bytes) {
+    return CborValue(OwnedString{.kind = StringKind::Bytes, .content = {bytes.begin(), bytes.end()}});
+  }
+
+  constexpr bool is_undefined() const { return std::holds_alternative<std::monostate>(data); }
+  constexpr bool is_null() const { return std::holds_alternative<std::nullptr_t>(data); }
+  constexpr bool is_boolean() const { return std::holds_alternative<bool>(data); }
+  constexpr bool is_unsigned() const { return std::holds_alternative<std::uint64_t>(data); }
+  constexpr bool is_negative_int() const { return std::holds_alternative<NegativeInt>(data); }
+  constexpr bool is_bignum() const { return std::holds_alternative<BigNum>(data); }
+  constexpr bool is_integer() const { return is_unsigned() || is_negative_int() || is_bignum(); }
+  constexpr bool is_float() const { return std::holds_alternative<double>(data); }
+  constexpr bool is_number() const { return is_integer() || is_float(); }
+  constexpr bool is_string() const {
+    const auto* s = std::get_if<OwnedString>(&data);
+    return s != nullptr && s->kind == StringKind::Text;
+  }
+  constexpr bool is_binary() const {
+    const auto* s = std::get_if<OwnedString>(&data);
+    return s != nullptr && s->kind == StringKind::Bytes;
+  }
+  constexpr bool is_simple() const { return std::holds_alternative<SimpleValue>(data); }
+  constexpr bool is_array() const { return std::holds_alternative<std::vector<CborValue>>(data); }
+  constexpr bool is_map() const { return std::holds_alternative<std::vector<std::pair<CborValue, CborValue>>>(data); }
+  constexpr bool is_object() const { return is_map(); }
+  constexpr bool is_tag() const { return std::holds_alternative<Tag>(data); }
+
+  // Matches nlohmann's own convention: 0 for null/undefined, 1 for any
+  // other scalar, element/pair count for array/map.
+  constexpr std::size_t size() const {
+    if (is_undefined() || is_null()) return 0;
+    if (const auto* arr = std::get_if<std::vector<CborValue>>(&data)) return arr->size();
+    if (const auto* m = std::get_if<std::vector<std::pair<CborValue, CborValue>>>(&data)) return m->size();
+    return 1;
+  }
+  constexpr bool empty() const { return size() == 0; }
+
+  constexpr bool contains(const CborValue& key) const {
+    const auto* entries = std::get_if<std::vector<std::pair<CborValue, CborValue>>>(&data);
+    if (!entries) return false;
+    for (const auto& [k, v] : *entries) {
+      if (k.data == key.data) return true;
+    }
+    return false;
+  }
+  // No separate std::string_view overload: a string literal already
+  // converts to CborValue implicitly via the converting constructor above,
+  // and adding one creates a genuine ambiguity (both std::string_view and
+  // CborValue are reachable from `const char*` via exactly one user-defined
+  // conversion, so overload resolution can't prefer either).
+
+  // Declared here, defined out-of-line after null_sentinel (below this
+  // class) is complete -- the miss-case return path needs a CborValue to
+  // bind a reference to, and a static member of CborValue's own type can't
+  // be initialized inside this still-incomplete class body.
+  constexpr const CborValue& operator[](std::size_t i) const;
+  constexpr CborValue& operator[](std::size_t i);
+  constexpr const CborValue& operator[](const CborValue& key) const;
+  constexpr CborValue& operator[](const CborValue& key);
+
+  template <typename T>
+  constexpr std::optional<T> get() const {
+    if constexpr (std::same_as<T, bool>) {
+      const auto* p = std::get_if<bool>(&data);
+      return p ? std::optional<T>(*p) : std::nullopt;
+    } else if constexpr (std::same_as<T, std::uint64_t>) {
+      const auto* p = std::get_if<std::uint64_t>(&data);
+      return p ? std::optional<T>(*p) : std::nullopt;
+    } else if constexpr (std::same_as<T, std::int64_t>) {
+      if (const auto* p = std::get_if<std::uint64_t>(&data)) {
+        if (*p <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+          return static_cast<std::int64_t>(*p);
+        }
+        return std::nullopt;
+      }
+      if (const auto* p = std::get_if<NegativeInt>(&data)) {
+        return p->to_int64();
+      }
+      return std::nullopt;
+    } else if constexpr (std::same_as<T, double>) {
+      const auto* p = std::get_if<double>(&data);
+      return p ? std::optional<T>(*p) : std::nullopt;
+    } else if constexpr (std::same_as<T, std::string>) {
+      const auto* p = std::get_if<OwnedString>(&data);
+      if (p && p->kind == StringKind::Text) return std::string(p->content.begin(), p->content.end());
+      return std::nullopt;
+    } else if constexpr (std::same_as<T, std::vector<std::uint8_t>>) {
+      const auto* p = std::get_if<OwnedString>(&data);
+      if (p && p->kind == StringKind::Bytes) return p->content;
+      return std::nullopt;
+    } else if constexpr (std::same_as<T, std::monostate>) {
+      return is_undefined() ? std::optional<T>(std::monostate{}) : std::nullopt;
+    } else if constexpr (std::same_as<T, std::nullptr_t>) {
+      return is_null() ? std::optional<T>(nullptr) : std::nullopt;
+    } else {
+      T value{};
+      if (CborSerializer<T>::from_cbor(*this, value)) return value;
+      return std::nullopt;
+    }
+  }
+
+  // Iteration: array yields elements in order; map yields values only
+  // (matching nlohmann's own `for (auto& v : j)` default). No primitive
+  // iteration arm -- iterating a scalar is simply not supported here.
+  struct const_iterator {
+    std::variant<std::vector<CborValue>::const_iterator, std::vector<std::pair<CborValue, CborValue>>::const_iterator>
+        it;
+    constexpr const CborValue& operator*() const {
+      return std::visit(
+          [](const auto& i) -> const CborValue& {
+            using It = std::decay_t<decltype(i)>;
+            if constexpr (std::is_same_v<It, std::vector<CborValue>::const_iterator>) {
+              return *i;
+            } else {
+              return i->second;
+            }
+          },
+          it);
+    }
+    constexpr const_iterator& operator++() {
+      std::visit([](auto& i) { ++i; }, it);
+      return *this;
+    }
+    constexpr bool operator==(const const_iterator& other) const { return it == other.it; }
+  };
+
+  constexpr const_iterator begin() const {
+    if (const auto* arr = std::get_if<std::vector<CborValue>>(&data)) return const_iterator{arr->begin()};
+    if (const auto* m = std::get_if<std::vector<std::pair<CborValue, CborValue>>>(&data))
+      return const_iterator{m->begin()};
+    return const_iterator{std::vector<CborValue>::const_iterator{}};
+  }
+  constexpr const_iterator end() const {
+    if (const auto* arr = std::get_if<std::vector<CborValue>>(&data)) return const_iterator{arr->end()};
+    if (const auto* m = std::get_if<std::vector<std::pair<CborValue, CborValue>>>(&data))
+      return const_iterator{m->end()};
+    return const_iterator{std::vector<CborValue>::const_iterator{}};
+  }
+
+  // .items(): key/value pairs for a map; an empty range for anything else
+  // (not ill-formed -- this is ergonomic sugar, not decode validation).
+  struct ItemsProxy {
+    std::vector<std::pair<CborValue, CborValue>>* entries;
+    struct Item {
+      const CborValue& key;
+      CborValue& value;
+    };
+    struct iterator {
+      std::vector<std::pair<CborValue, CborValue>>::iterator it;
+      constexpr Item operator*() const { return Item{it->first, it->second}; }
+      constexpr iterator& operator++() {
+        ++it;
+        return *this;
+      }
+      constexpr bool operator==(const iterator& other) const { return it == other.it; }
+    };
+    constexpr iterator begin() const { return entries ? iterator{entries->begin()} : iterator{}; }
+    constexpr iterator end() const { return entries ? iterator{entries->end()} : iterator{}; }
+  };
+  constexpr ItemsProxy items() {
+    if (auto* m = std::get_if<std::vector<std::pair<CborValue, CborValue>>>(&data)) return ItemsProxy{m};
+    return ItemsProxy{nullptr};
+  }
+
+ private:
+  template <typename T>
+  constexpr void assign_from(T&& v) {
+    using D = std::remove_cvref_t<T>;
+    if constexpr (std::same_as<D, std::monostate> || std::same_as<D, std::nullptr_t> || std::same_as<D, bool> ||
+                  std::same_as<D, std::uint64_t> || std::same_as<D, NegativeInt> || std::same_as<D, OwnedString> ||
+                  std::same_as<D, BigNum> || std::same_as<D, SimpleValue> || std::same_as<D, double> ||
+                  std::same_as<D, std::vector<CborValue>> ||
+                  std::same_as<D, std::vector<std::pair<CborValue, CborValue>>> || std::same_as<D, Tag>) {
+      data = std::forward<T>(v);
+    } else if constexpr (std::integral<D> && !std::same_as<D, bool>) {
+      const std::int64_t iv = static_cast<std::int64_t>(v);
+      if (iv >= 0) {
+        data = static_cast<std::uint64_t>(iv);
+      } else {
+        data = NegativeInt{.n = static_cast<std::uint64_t>(-1 - iv)};
+      }
+    } else if constexpr (std::same_as<D, float>) {
+      data = static_cast<double>(v);
+    } else if constexpr (std::constructible_from<std::string_view, T>) {
+      const std::string_view sv(v);
+      data = OwnedString{.kind = StringKind::Text, .content = {sv.begin(), sv.end()}};
+    } else {
+      if (!CborSerializer<D>::to_cbor(*this, v)) {
+        data = std::monostate{};
+      }
+    }
+  }
+};
+
+// Shared, namespace-scope (not function-local -- see the comment on
+// detail::call_to_cbor below for why that distinction matters here too)
+// sentinel every miss-case const operator[] below binds its return
+// reference to, giving `j["x"]["y"]` chainability even through a miss
+// (detect it via .is_undefined()). inline constexpr gives exactly one
+// address across translation units and is constant-initialized, so it's
+// simultaneously usable inside consteval evaluation, at ordinary runtime,
+// and safe under concurrent read access (it is never mutated).
+inline constexpr CborValue null_sentinel{};
+
+constexpr const CborValue& CborValue::operator[](std::size_t i) const {
+  if (const auto* arr = std::get_if<std::vector<CborValue>>(&data); arr && i < arr->size()) {
+    return (*arr)[i];
+  }
+  return null_sentinel;
+}
+
+constexpr CborValue& CborValue::operator[](std::size_t i) {
+  if (!std::holds_alternative<std::vector<CborValue>>(data)) {
+    data = std::vector<CborValue>{};
+  }
+  auto& arr = std::get<std::vector<CborValue>>(data);
+  if (i >= arr.size()) {
+    arr.resize(i + 1);
+  }
+  return arr[i];
+}
+
+constexpr const CborValue& CborValue::operator[](const CborValue& key) const {
+  if (const auto* entries = std::get_if<std::vector<std::pair<CborValue, CborValue>>>(&data)) {
+    for (const auto& [k, v] : *entries) {
+      if (k.data == key.data) return v;
+    }
+  }
+  return null_sentinel;
+}
+
+constexpr CborValue& CborValue::operator[](const CborValue& key) {
+  if (!std::holds_alternative<std::vector<std::pair<CborValue, CborValue>>>(data)) {
+    data = std::vector<std::pair<CborValue, CborValue>>{};
+  }
+  auto& entries = std::get<std::vector<std::pair<CborValue, CborValue>>>(data);
+  for (auto& [k, v] : entries) {
+    if (k.data == key.data) return v;
+  }
+  entries.emplace_back(key, CborValue{});
+  return entries.back().second;
+}
+
+// ---------------------------------------------------------------------------
+// to_cbor/from_cbor ADL hooks: mirrors nlohmann's adl_serializer pattern.
+// The real reason for this indirection isn't "ADL needs a wrapper" (an
+// unqualified call already gets ADL) -- it's that it creates a second,
+// independent customization point for types a user can't attach a free
+// function to at all (third-party/std types), via specializing
+// CborSerializer<T> directly instead.
+//
+// call_to_cbor/call_from_cbor MUST be free functions, not members of
+// CborSerializer itself: inside a member function body, unqualified lookup
+// finds the enclosing class's own member of the same name first (if
+// CborSerializer<T>::to_cbor called an unqualified `to_cbor(...)` directly,
+// it would find itself and recurse, never reaching ADL -- ordinary lookup
+// finding a class member suppresses ADL entirely, per [basic.lookup.argdep]).
+// A free function has no enclosing class, so ordinary lookup here finds
+// nothing and ADL fires normally against T's own associated namespaces.
+namespace detail {
+template <typename T>
+concept HasFreeToCbor = requires(CborValue& out, const T& v) {
+  { to_cbor(out, v) } -> std::convertible_to<bool>;
+};
+template <typename T>
+concept HasFreeFromCbor = requires(const CborValue& in, T& v) {
+  { from_cbor(in, v) } -> std::convertible_to<bool>;
+};
+
+template <typename T>
+constexpr bool call_to_cbor(CborValue& out, const T& value) {
+  return to_cbor(out, value);
+}
+template <typename T>
+constexpr bool call_from_cbor(const CborValue& in, T& value) {
+  return from_cbor(in, value);
+}
+}  // namespace detail
+
+template <typename T, typename>
+struct CborSerializer {
+  static constexpr bool to_cbor(CborValue& out, const T& value) {
+    static_assert(detail::HasFreeToCbor<T>,
+                  "No to_cbor(CborValue&, const T&) found via ADL and no CborSerializer<T> specialization provided");
+    if constexpr (detail::HasFreeToCbor<T>) {
+      return detail::call_to_cbor(out, value);
+    } else {
+      return false;
+    }
+  }
+  static constexpr bool from_cbor(const CborValue& in, T& value) {
+    static_assert(
+        detail::HasFreeFromCbor<T>,
+        "No from_cbor(const CborValue&, T&) found via ADL and no CborSerializer<T> specialization provided");
+    if constexpr (detail::HasFreeFromCbor<T>) {
+      return detail::call_from_cbor(in, value);
+    } else {
+      return false;
+    }
+  }
 };
 
 // Forward declarations only: ConstexprCbor::Arena::NodePool/Node/IndexCell
@@ -554,12 +952,12 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
     case 0: {
       const auto u = decode_uint(bytes);
       if (!u) return std::nullopt;
-      return std::pair{CborValue{.data = u->value}, u->bytes_consumed};
+      return std::pair{CborValue(u->value), u->bytes_consumed};
     }
     case 1: {
       const auto n = decode_negint(bytes);
       if (!n) return std::nullopt;
-      return std::pair{CborValue{.data = n->value}, n->bytes_consumed};
+      return std::pair{CborValue(n->value), n->bytes_consumed};
     }
     case 2:
     case 3: {
@@ -579,15 +977,14 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
           content.insert(content.end(), chunk->bytes.begin(), chunk->bytes.end());
           consumed += chunk->bytes_consumed;
         }
-        return std::pair{CborValue{.data = CborValue::OwnedString{.kind = kind, .content = std::move(content)}},
-                          consumed};
+        return std::pair{CborValue(CborValue::OwnedString{.kind = kind, .content = std::move(content)}), consumed};
       }
       const auto result =
           (major_type == 2) ? decode_byte_string(bytes) : decode_text_string<Utf8Policy>(bytes);
       if (!result) return std::nullopt;
-      return std::pair{CborValue{.data = CborValue::OwnedString{
-                            .kind = kind, .content = {result->bytes.begin(), result->bytes.end()}}},
-                        result->bytes_consumed};
+      return std::pair{
+          CborValue(CborValue::OwnedString{.kind = kind, .content = {result->bytes.begin(), result->bytes.end()}}),
+          result->bytes_consumed};
     }
     case 4: {
       if (depth >= MaxDepth) return std::nullopt;
@@ -614,7 +1011,7 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
           consumed += item->second;
         }
       }
-      return std::pair{CborValue{.data = std::move(items)}, consumed};
+      return std::pair{CborValue(std::move(items)), consumed};
     }
     case 5: {
       if (depth >= MaxDepth) return std::nullopt;
@@ -660,7 +1057,7 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
         }
         ++pairs_read;
       }
-      return std::pair{CborValue{.data = std::move(entries)}, consumed};
+      return std::pair{CborValue(std::move(entries)), consumed};
     }
     case 6: {
       if (depth >= MaxDepth) return std::nullopt;
@@ -671,14 +1068,14 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
       if (len->value == 2 || len->value == 3) {
         if (const auto* bytes_value = std::get_if<CborValue::OwnedString>(&nested->first.data);
             bytes_value && bytes_value->kind == CborValue::StringKind::Bytes) {
-          return std::pair{CborValue{.data = CborValue::BigNum{.negative = (len->value == 3),
-                                                                 .magnitude = bytes_value->content}},
-                            len->bytes_consumed + nested->second};
+          return std::pair{
+              CborValue(CborValue::BigNum{.negative = (len->value == 3), .magnitude = bytes_value->content}),
+              len->bytes_consumed + nested->second};
         }
       }
       std::vector<CborValue> wrapped;
       wrapped.push_back(std::move(nested->first));
-      return std::pair{CborValue{.data = CborValue::Tag{.number = len->value, .value = std::move(wrapped)}},
+      return std::pair{CborValue(CborValue::Tag{.number = len->value, .value = std::move(wrapped)}),
                         len->bytes_consumed + nested->second};
     }
     case 7: {
@@ -687,17 +1084,17 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
       using K = DecodedSimple::Kind;
       switch (s->kind) {
         case K::False:
-          return std::pair{CborValue{.data = false}, s->bytes_consumed};
+          return std::pair{CborValue(false), s->bytes_consumed};
         case K::True:
-          return std::pair{CborValue{.data = true}, s->bytes_consumed};
+          return std::pair{CborValue(true), s->bytes_consumed};
         case K::Null:
-          return std::pair{CborValue{.data = nullptr}, s->bytes_consumed};
+          return std::pair{CborValue(nullptr), s->bytes_consumed};
         case K::Undefined:
-          return std::pair{CborValue{.data = std::monostate{}}, s->bytes_consumed};
+          return std::pair{CborValue(std::monostate{}), s->bytes_consumed};
         case K::Float:
-          return std::pair{CborValue{.data = s->as_double}, s->bytes_consumed};
+          return std::pair{CborValue(s->as_double), s->bytes_consumed};
         case K::Simple:
-          return std::pair{CborValue{.data = CborValue::SimpleValue{.number = s->simple_value}}, s->bytes_consumed};
+          return std::pair{CborValue(CborValue::SimpleValue{.number = s->simple_value}), s->bytes_consumed};
       }
       return std::nullopt;
     }
