@@ -51,7 +51,7 @@ jobs:
       - name: Install clang-19 + libc++-19
         run: >
           sudo apt-get update && sudo apt-get install -y
-          clang-19 clang-tools-19 libc++-19-dev libc++abi-19-dev perl-modules-5.38
+          clang-19 clang-tools-19 libc++-19-dev libc++abi-19-dev perl
 
       - name: Configure
         run: >
