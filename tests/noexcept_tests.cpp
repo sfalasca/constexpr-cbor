@@ -5,6 +5,7 @@
 // Standalone: no compile_time_ut dependency, since the bare-metal images
 // only copy include/, not a fetched sibling library.
 #include "constexpr_cbor.hpp"
+#include "constexpr_cbor_sax.hpp"
 
 using namespace ConstexprCbor;
 
@@ -30,5 +31,15 @@ constexpr bool test_uint_and_negint() {
   return decode_uint(uint_vec)->value == 23 && decode_negint(negint_vec)->value.to_int64() == -1;
 }
 static_assert(test_uint_and_negint());
+
+constexpr bool test_sax_decode() {
+  std::size_t items = 0;
+  for (auto ev : Sax::SaxRange<32>{array_vec}) {
+    if (ev.kind == Sax::EventKind::Error) return false;
+    ++items;
+  }
+  return items == 5;  // BeginArray, 1, 2, 3, EndArray
+}
+static_assert(test_sax_decode());
 
 int main() { return 0; }

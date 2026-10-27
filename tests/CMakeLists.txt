@@ -42,6 +42,7 @@ set(positive_test_sources
     test_ergonomics_adl.cpp
     test_noalloc_view.cpp
     test_noalloc_builder.cpp
+    test_sax.cpp
 )
 
 # noalloc_runtime_tests.cpp is the one source that doesn't use
@@ -129,6 +130,10 @@ add_compile_failure_test_with_values(wrong_shape_duplicate_key_policy
 
 add_compile_failure_test_with_values(wrong_shape_duplicate_key_policy_noalloc
     expected_failures/wrong_shape_duplicate_key_policy_noalloc.cpp LABELS policy
+    EXPECT "KeyPolicy must provide static bool on_duplicate")
+
+add_compile_failure_test_with_values(wrong_shape_keep_last_duplicate_key_sax
+    expected_failures/wrong_shape_keep_last_duplicate_key_sax.cpp LABELS policy
     EXPECT "KeyPolicy must provide static bool on_duplicate")
 
 add_compile_failure_test_with_values(ergonomics_get_unregistered_type

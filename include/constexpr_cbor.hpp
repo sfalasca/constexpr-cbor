@@ -385,6 +385,111 @@ constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_
   }
 }
 
+// Walks exactly one CBOR item structurally (definite or indefinite form)
+// and reports how many bytes it occupies, without building any value or
+// allocating anything -- shared by the no-malloc decoder (which must
+// pre-count an indefinite-length array/map's items before reserving their
+// contiguous slot, since that reservation has to happen before any child
+// is actually decoded) and the SAX decoder (which uses it to skip past an
+// item a consumer doesn't step into, without emitting its events).
+// Deliberately duplicates some of decode_value's own structure rather than
+// sharing it: unifying "count bytes only" with "materialize a value" into
+// one templated walk would add real complexity for a marginal gain here.
+template <std::size_t MaxDepth = 32>
+constexpr std::optional<std::size_t> skip_item(std::span<const std::uint8_t> bytes, std::size_t depth = 0) {
+  if (bytes.empty()) return std::nullopt;
+  const std::uint8_t major_type = bytes[0] >> 5;
+  switch (major_type) {
+    case 0:
+    case 1: {
+      const auto len = decode_length(bytes);
+      return len ? std::optional<std::size_t>(len->bytes_consumed) : std::nullopt;
+    }
+    case 2:
+    case 3: {
+      if (is_indefinite_or_break(bytes)) {
+        std::size_t consumed = 1;
+        while (true) {
+          if (consumed >= bytes.size()) return std::nullopt;
+          if (bytes[consumed] == 0xff) return consumed + 1;
+          const auto chunk_len = decode_length(bytes.subspan(consumed));
+          if (!chunk_len) return std::nullopt;
+          if (bytes.size() < consumed + chunk_len->bytes_consumed + chunk_len->value) return std::nullopt;
+          consumed += chunk_len->bytes_consumed + chunk_len->value;
+        }
+      }
+      const auto len = decode_length(bytes);
+      if (!len) return std::nullopt;
+      if (bytes.size() < len->bytes_consumed + len->value) return std::nullopt;
+      return len->bytes_consumed + len->value;
+    }
+    case 4: {
+      if (depth >= MaxDepth) return std::nullopt;
+      std::size_t consumed = 1;
+      if (is_indefinite_or_break(bytes)) {
+        while (true) {
+          if (consumed >= bytes.size()) return std::nullopt;
+          if (bytes[consumed] == 0xff) return consumed + 1;
+          const auto item_len = skip_item<MaxDepth>(bytes.subspan(consumed), depth + 1);
+          if (!item_len) return std::nullopt;
+          consumed += *item_len;
+        }
+      }
+      const auto len = decode_length(bytes);
+      if (!len) return std::nullopt;
+      consumed = len->bytes_consumed;
+      for (std::uint64_t i = 0; i < len->value; ++i) {
+        if (consumed > bytes.size()) return std::nullopt;
+        const auto item_len = skip_item<MaxDepth>(bytes.subspan(consumed), depth + 1);
+        if (!item_len) return std::nullopt;
+        consumed += *item_len;
+      }
+      return consumed;
+    }
+    case 5: {
+      if (depth >= MaxDepth) return std::nullopt;
+      std::size_t consumed = 1;
+      const bool indefinite = is_indefinite_or_break(bytes);
+      std::optional<std::uint64_t> pair_count;
+      if (!indefinite) {
+        const auto len = decode_length(bytes);
+        if (!len) return std::nullopt;
+        consumed = len->bytes_consumed;
+        pair_count = len->value;
+      }
+      std::uint64_t pairs_read = 0;
+      while (indefinite ? true : pairs_read < *pair_count) {
+        if (indefinite) {
+          if (consumed >= bytes.size()) return std::nullopt;
+          if (bytes[consumed] == 0xff) return consumed + 1;
+        }
+        const auto key_len = skip_item<MaxDepth>(bytes.subspan(consumed), depth + 1);
+        if (!key_len) return std::nullopt;
+        consumed += *key_len;
+        const auto value_len = skip_item<MaxDepth>(bytes.subspan(consumed), depth + 1);
+        if (!value_len) return std::nullopt;
+        consumed += *value_len;
+        ++pairs_read;
+      }
+      return consumed;
+    }
+    case 6: {
+      if (depth >= MaxDepth) return std::nullopt;
+      const auto len = decode_length(bytes);
+      if (!len) return std::nullopt;
+      const auto nested_len = skip_item<MaxDepth>(bytes.subspan(len->bytes_consumed), depth + 1);
+      if (!nested_len) return std::nullopt;
+      return len->bytes_consumed + *nested_len;
+    }
+    case 7: {
+      const auto s = decode_simple(bytes);
+      return s ? std::optional<std::size_t>(s->bytes_consumed) : std::nullopt;
+    }
+    default:
+      return std::nullopt;
+  }
+}
+
 // Forward declaration only: CborValue's own templated constructor/.get<T>()
 // fall back to this (ADL user-type hook dispatch, see the definition below
 // this class) for any T that isn't one of the built-in CBOR alternatives.
@@ -940,6 +1045,13 @@ struct RejectDuplicateKeys {
                                       NoAlloc::Node* /*new_value*/) {
     return false;
   }
+  // SAX-shaped overload (constexpr_cbor_sax.hpp): the decision never
+  // depends on the already-decoded key/value the other two overloads see,
+  // since the SAX decoder has no tree to hand back -- just the same
+  // reject-or-continue verdict, by raw byte-span equality of the keys'
+  // encodings instead of structural value equality (see SaxRange's own
+  // header comment for why that's a deliberate, documented difference).
+  static constexpr bool on_duplicate() { return false; }
 };
 struct KeepFirstDuplicateKey {
   static constexpr bool on_duplicate(std::vector<std::pair<CborValue, CborValue>>&, CborValue, CborValue) {
@@ -950,6 +1062,7 @@ struct KeepFirstDuplicateKey {
                                       NoAlloc::Node* /*new_value*/) {
     return true;  // first occurrence's pair is left exactly where it is; drop this one
   }
+  static constexpr bool on_duplicate() { return true; }  // SAX: drop the new pair's events, emit nothing for it
 };
 struct KeepLastDuplicateKey {
   static constexpr bool on_duplicate(std::vector<std::pair<CborValue, CborValue>>& entries, CborValue key,
@@ -971,7 +1084,53 @@ struct KeepLastDuplicateKey {
   static constexpr bool on_duplicate(NoAlloc::NodePool& pool, NoAlloc::Node** first_pair,
                                       std::size_t existing_pair_index, NoAlloc::Node* new_key,
                                       NoAlloc::Node* new_value);
+  // Deliberately NO 0-arg SAX-shaped overload: "keep the last value for
+  // this key" means retroactively overwriting an already-emitted event,
+  // which a push-forward event stream cannot do without buffering the
+  // whole map first (defeating the point of being a SAX decoder at all).
+  // Selecting this policy with SaxRange is a compile error (see
+  // is_sax_duplicate_key_policy_v's static_assert in constexpr_cbor_sax.hpp)
+  // rather than a silent behavior change.
 };
+
+// A fourth policy, added for the SAX decoder (constexpr_cbor_sax.hpp): "don't
+// track keys at all." For the heap/NoAlloc decoders this is behaviorally
+// identical to KeepFirstDuplicateKey -- both of them already pay for the
+// per-pair duplicate scan every map decode does regardless of policy, so
+// there's no cost to avoid here, only a choice of what happens once a
+// duplicate is found. It earns its keep on the SAX path, which has no
+// per-map entries container to scan in the first place: there, selecting
+// this policy means genuinely skipping the key-tracking buffer altogether
+// (see SaxRange's MaxTrackedKeys), not just "don't reject."
+struct NoDuplicateKeyCheck {
+  static constexpr bool on_duplicate(std::vector<std::pair<CborValue, CborValue>>&, CborValue, CborValue) {
+    return true;
+  }
+  static constexpr bool on_duplicate(NoAlloc::NodePool&, NoAlloc::Node** /*first_pair*/,
+                                      std::size_t /*existing_pair_index*/, NoAlloc::Node* /*new_key*/,
+                                      NoAlloc::Node* /*new_value*/) {
+    return true;
+  }
+  // SAX: never actually called (dedup tracking is skipped outright when
+  // this policy is selected), but still provided so the type satisfies
+  // is_sax_duplicate_key_policy_v and can be named as SaxRange's default.
+  static constexpr bool on_duplicate() { return true; }
+};
+
+// SAX-shaped counterpart of ::ConstexprCbor::is_duplicate_key_policy_v,
+// pinning the 0-arg on_duplicate() overload the same static_cast way (see
+// that trait's own comment for why a plain std::is_invocable_r_v on a bare
+// decltype(&P::on_duplicate) won't compile once a policy has more than one
+// overload of the name).
+template <typename P, typename = void>
+struct is_sax_duplicate_key_policy : std::false_type {};
+
+template <typename P>
+struct is_sax_duplicate_key_policy<P, std::void_t<decltype(static_cast<bool (*)()>(&P::on_duplicate))>>
+    : std::true_type {};
+
+template <typename P>
+inline constexpr bool is_sax_duplicate_key_policy_v = is_sax_duplicate_key_policy<P>::value;
 
 namespace detail {
 // Structural equality for the map-key-comparison case above. Only the
