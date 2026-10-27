@@ -244,14 +244,14 @@ namespace detail {
 // decode below reserve the right-sized contiguous slot before decoding
 // any child, instead of after.
 template <std::size_t MaxDepth>
-constexpr std::optional<std::uint64_t> count_indefinite_array_items(std::span<const std::uint8_t> body) {
+constexpr Expected<std::uint64_t, Error> count_indefinite_array_items(std::span<const std::uint8_t> body) {
   std::uint64_t count = 0;
   std::size_t consumed = 0;
   while (true) {
-    if (consumed >= body.size()) return std::nullopt;
+    if (consumed >= body.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
     if (body[consumed] == 0xff) return count;
     const auto len = skip_item<MaxDepth>(body.subspan(consumed));
-    if (!len) return std::nullopt;
+    if (!len) return unexpected(rebase_error(len.error(), consumed));
     consumed += *len;
     ++count;
   }
@@ -259,17 +259,17 @@ constexpr std::optional<std::uint64_t> count_indefinite_array_items(std::span<co
 
 // Same idea, but walks key+value pairs.
 template <std::size_t MaxDepth>
-constexpr std::optional<std::uint64_t> count_indefinite_map_pairs(std::span<const std::uint8_t> body) {
+constexpr Expected<std::uint64_t, Error> count_indefinite_map_pairs(std::span<const std::uint8_t> body) {
   std::uint64_t count = 0;
   std::size_t consumed = 0;
   while (true) {
-    if (consumed >= body.size()) return std::nullopt;
+    if (consumed >= body.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
     if (body[consumed] == 0xff) return count;
     const auto key_len = skip_item<MaxDepth>(body.subspan(consumed));
-    if (!key_len) return std::nullopt;
+    if (!key_len) return unexpected(rebase_error(key_len.error(), consumed));
     consumed += *key_len;
     const auto value_len = skip_item<MaxDepth>(body.subspan(consumed));
-    if (!value_len) return std::nullopt;
+    if (!value_len) return unexpected(rebase_error(value_len.error(), consumed));
     consumed += *value_len;
     ++count;
   }
@@ -287,11 +287,11 @@ constexpr std::optional<std::uint64_t> count_indefinite_map_pairs(std::span<cons
 // `multiplier` additionally guards the *2 the map case needs for its
 // key+value slot pairs. Returns nullopt (the same refusal every other
 // contract violation in this codec uses) instead of truncating.
-constexpr std::optional<std::size_t> checked_node_count(std::uint64_t count, std::size_t multiplier = 1) {
+constexpr Expected<std::size_t, Error> checked_node_count(std::uint64_t count, std::size_t multiplier = 1) {
   const std::uint64_t size_max = std::numeric_limits<std::size_t>::max();
   const std::uint64_t wide_multiplier = multiplier;
-  if (multiplier > 1 && count > size_max / wide_multiplier) return std::nullopt;
-  if (count > size_max) return std::nullopt;
+  if (multiplier > 1 && count > size_max / wide_multiplier) return unexpected(Error{ErrorReason::CountOverflow});
+  if (count > size_max) return unexpected(Error{ErrorReason::CountOverflow});
   // ConstexprCbor::detail::narrow, not a plain copy-init: size_t and
   // uint64_t are the identical type on a 64-bit target (where an explicit
   // static_cast between them is a literal no-op GCC's -Wuseless-cast
@@ -399,24 +399,24 @@ struct DecodedNode {
 // indistinguishable from a malformed-input one, exactly like
 // NodePool::allocate_node/reserve_refs/allocate_bytes already do.
 template <std::size_t MaxDepth = 32, typename Utf8Policy = NoUtf8Validation, typename KeyPolicy = RejectDuplicateKeys>
-constexpr std::optional<DecodedNode> decode_value(NodePool& pool, std::span<const std::uint8_t> bytes,
-                                                    std::size_t depth = 0) {
-  if (bytes.empty()) return std::nullopt;
+constexpr Expected<DecodedNode, Error> decode_value(NodePool& pool, std::span<const std::uint8_t> bytes,
+                                                      std::size_t depth = 0) {
+  if (bytes.empty()) return unexpected(Error{ErrorReason::TruncatedInput});
   const std::uint8_t major_type = bytes[0] >> 5;
 
   switch (major_type) {
     case 0: {
       const auto u = decode_uint(bytes);
-      if (!u) return std::nullopt;
+      if (!u) return unexpected(u.error());
       const auto node = pool.allocate_node(Node{.data = u->value});
-      if (!node) return std::nullopt;
+      if (!node) return unexpected(Error{ErrorReason::NodeCapacityExhausted});
       return DecodedNode{.node = node, .bytes_consumed = u->bytes_consumed};
     }
     case 1: {
       const auto n = decode_negint(bytes);
-      if (!n) return std::nullopt;
+      if (!n) return unexpected(n.error());
       const auto node = pool.allocate_node(Node{.data = n->value});
-      if (!node) return std::nullopt;
+      if (!node) return unexpected(Error{ErrorReason::NodeCapacityExhausted});
       return DecodedNode{.node = node, .bytes_consumed = n->bytes_consumed};
     }
     case 2:
@@ -426,47 +426,47 @@ constexpr std::optional<DecodedNode> decode_value(NodePool& pool, std::span<cons
         const std::uint8_t* start = pool.bytes_begin_ + pool.byte_count_;
         std::size_t consumed = 1;
         while (true) {
-          if (consumed >= bytes.size()) return std::nullopt;
+          if (consumed >= bytes.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
           if (bytes[consumed] == 0xff) { ++consumed; break; }
           const auto chunk = (major_type == 2) ? decode_byte_string(bytes.subspan(consumed))
                                                 : decode_text_string<Utf8Policy>(bytes.subspan(consumed));
-          if (!chunk) return std::nullopt;
-          if (!pool.allocate_bytes(chunk->bytes)) return std::nullopt;
+          if (!chunk) return unexpected(rebase_error(chunk.error(), consumed));
+          if (!pool.allocate_bytes(chunk->bytes)) return unexpected(Error{ErrorReason::ByteCapacityExhausted, consumed});
           consumed += chunk->bytes_consumed;
         }
         const std::size_t length = static_cast<std::size_t>((pool.bytes_begin_ + pool.byte_count_) - start);
         const auto node =
             pool.allocate_node(Node{.data = StringRef{.kind = kind, .data = start, .length = length}});
-        if (!node) return std::nullopt;
+        if (!node) return unexpected(Error{ErrorReason::NodeCapacityExhausted, consumed});
         return DecodedNode{.node = node, .bytes_consumed = consumed};
       }
       const auto result = (major_type == 2) ? decode_byte_string(bytes) : decode_text_string<Utf8Policy>(bytes);
-      if (!result) return std::nullopt;
+      if (!result) return unexpected(result.error());
       const auto data = pool.allocate_bytes(result->bytes);
-      if (!data) return std::nullopt;
+      if (!data) return unexpected(Error{ErrorReason::ByteCapacityExhausted});
       const auto node =
           pool.allocate_node(Node{.data = StringRef{.kind = kind, .data = data, .length = result->bytes.size()}});
-      if (!node) return std::nullopt;
+      if (!node) return unexpected(Error{ErrorReason::NodeCapacityExhausted});
       return DecodedNode{.node = node, .bytes_consumed = result->bytes_consumed};
     }
     case 4: {
-      if (depth >= MaxDepth) return std::nullopt;
+      if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
       std::size_t consumed = 1;
       std::uint64_t count;
       if (is_indefinite_or_break(bytes)) {
         const auto maybe_count = detail::count_indefinite_array_items<MaxDepth>(bytes.subspan(1));
-        if (!maybe_count) return std::nullopt;
+        if (!maybe_count) return unexpected(rebase_error(maybe_count.error(), 1));
         count = *maybe_count;
       } else {
         const auto len = decode_length(bytes);
-        if (!len) return std::nullopt;
+        if (!len) return unexpected(len.error());
         consumed = len->bytes_consumed;
         count = len->value;
       }
       const auto safe_count = detail::checked_node_count(count);
-      if (!safe_count) return std::nullopt;
+      if (!safe_count) return unexpected(safe_count.error());
       const auto first_slot = pool.reserve_refs(*safe_count);
-      if (!first_slot) return std::nullopt;
+      if (!first_slot) return unexpected(Error{ErrorReason::RefCapacityExhausted, consumed});
       // size_t loop counter, not uint64_t: count == *safe_count numerically
       // (checked_node_count already proved count fits in size_t), so
       // iterating directly in size_t avoids ever narrowing a uint64_t loop
@@ -474,22 +474,24 @@ constexpr std::optional<DecodedNode> decode_value(NodePool& pool, std::span<cons
       // is what a 32-bit size_t target (e.g. wasm32 via Emscripten) flags,
       // even though the value was always in range.
       for (std::size_t i = 0; i < *safe_count; ++i) {
-        if (consumed > bytes.size()) return std::nullopt;
+        if (consumed > bytes.size()) return unexpected(Error{ErrorReason::TruncatedPayload, consumed});
         const auto item = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(pool, bytes.subspan(consumed), depth + 1);
-        if (!item) return std::nullopt;
+        if (!item) return unexpected(rebase_error(item.error(), consumed));
         first_slot[i] = item->node;
         consumed += item->bytes_consumed;
       }
       if (is_indefinite_or_break(bytes)) {
-        if (consumed >= bytes.size() || bytes[consumed] != 0xff) return std::nullopt;
+        if (consumed >= bytes.size() || bytes[consumed] != 0xff) {
+          return unexpected(Error{ErrorReason::TruncatedInput, consumed});
+        }
         ++consumed;
       }
       const auto node = pool.allocate_node(Node{.data = ArrayRef{.first_child = first_slot, .count = *safe_count}});
-      if (!node) return std::nullopt;
+      if (!node) return unexpected(Error{ErrorReason::NodeCapacityExhausted, consumed});
       return DecodedNode{.node = node, .bytes_consumed = consumed};
     }
     case 5: {
-      if (depth >= MaxDepth) return std::nullopt;
+      if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
       static_assert(is_duplicate_key_policy_v<KeyPolicy>,
                     "KeyPolicy must provide static bool on_duplicate(NodePool&, Node** first_pair, "
                     "size_t existing_pair_index, Node* new_key, Node* new_value)");
@@ -497,11 +499,11 @@ constexpr std::optional<DecodedNode> decode_value(NodePool& pool, std::span<cons
       std::uint64_t pair_count;
       if (is_indefinite_or_break(bytes)) {
         const auto maybe_count = detail::count_indefinite_map_pairs<MaxDepth>(bytes.subspan(1));
-        if (!maybe_count) return std::nullopt;
+        if (!maybe_count) return unexpected(rebase_error(maybe_count.error(), 1));
         pair_count = *maybe_count;
       } else {
         const auto len = decode_length(bytes);
-        if (!len) return std::nullopt;
+        if (!len) return unexpected(len.error());
         consumed = len->bytes_consumed;
         pair_count = len->value;
       }
@@ -516,18 +518,18 @@ constexpr std::optional<DecodedNode> decode_value(NodePool& pool, std::span<cons
       // undersized block for a count the loop below still iterates in
       // full, the same shape as libcbor PR #387).
       const auto safe_pair_count = detail::checked_node_count(pair_count, 2);
-      if (!safe_pair_count) return std::nullopt;
+      if (!safe_pair_count) return unexpected(safe_pair_count.error());
       const auto first_pair = pool.reserve_refs(*safe_pair_count);
-      if (!first_pair) return std::nullopt;
+      if (!first_pair) return unexpected(Error{ErrorReason::RefCapacityExhausted, consumed});
       std::size_t written = 0;
       for (std::uint64_t i = 0; i < pair_count; ++i) {
-        if (consumed > bytes.size()) return std::nullopt;
+        if (consumed > bytes.size()) return unexpected(Error{ErrorReason::TruncatedPayload, consumed});
         const auto key = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(pool, bytes.subspan(consumed), depth + 1);
-        if (!key) return std::nullopt;
+        if (!key) return unexpected(rebase_error(key.error(), consumed));
         consumed += key->bytes_consumed;
-        if (consumed > bytes.size()) return std::nullopt;
+        if (consumed > bytes.size()) return unexpected(Error{ErrorReason::TruncatedPayload, consumed});
         const auto value = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(pool, bytes.subspan(consumed), depth + 1);
-        if (!value) return std::nullopt;
+        if (!value) return unexpected(rebase_error(value.error(), consumed));
         consumed += value->bytes_consumed;
 
         std::optional<std::size_t> duplicate_at;
@@ -539,7 +541,7 @@ constexpr std::optional<DecodedNode> decode_value(NodePool& pool, std::span<cons
         }
         if (duplicate_at) {
           if (!KeyPolicy::on_duplicate(pool, first_pair, *duplicate_at, key->node, value->node)) {
-            return std::nullopt;
+            return unexpected(Error{ErrorReason::DuplicateKey, consumed});
           }
         } else {
           first_pair[2 * written] = key->node;
@@ -548,36 +550,38 @@ constexpr std::optional<DecodedNode> decode_value(NodePool& pool, std::span<cons
         }
       }
       if (is_indefinite_or_break(bytes)) {
-        if (consumed >= bytes.size() || bytes[consumed] != 0xff) return std::nullopt;
+        if (consumed >= bytes.size() || bytes[consumed] != 0xff) {
+          return unexpected(Error{ErrorReason::TruncatedInput, consumed});
+        }
         ++consumed;
       }
       const auto node = pool.allocate_node(Node{.data = MapRef{.first_pair = first_pair, .count = written}});
-      if (!node) return std::nullopt;
+      if (!node) return unexpected(Error{ErrorReason::NodeCapacityExhausted, consumed});
       return DecodedNode{.node = node, .bytes_consumed = consumed};
     }
     case 6: {
-      if (depth >= MaxDepth) return std::nullopt;
+      if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
       const auto len = decode_length(bytes);
-      if (!len) return std::nullopt;
+      if (!len) return unexpected(len.error());
       const auto nested = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(pool, bytes.subspan(len->bytes_consumed), depth + 1);
-      if (!nested) return std::nullopt;
+      if (!nested) return unexpected(rebase_error(nested.error(), len->bytes_consumed));
       if (len->value == 2 || len->value == 3) {
         if (const auto* string_ref = std::get_if<StringRef>(&nested->node->data);
             string_ref && string_ref->kind == CborValue::StringKind::Bytes) {
           const auto node = pool.allocate_node(Node{.data = BigNumRef{.negative = (len->value == 3),
                                                                        .data = string_ref->data,
                                                                        .length = string_ref->length}});
-          if (!node) return std::nullopt;
+          if (!node) return unexpected(Error{ErrorReason::NodeCapacityExhausted, len->bytes_consumed});
           return DecodedNode{.node = node, .bytes_consumed = len->bytes_consumed + nested->bytes_consumed};
         }
       }
       const auto node = pool.allocate_node(Node{.data = TagRef{.number = len->value, .child = nested->node}});
-      if (!node) return std::nullopt;
+      if (!node) return unexpected(Error{ErrorReason::NodeCapacityExhausted, len->bytes_consumed});
       return DecodedNode{.node = node, .bytes_consumed = len->bytes_consumed + nested->bytes_consumed};
     }
     case 7: {
       const auto s = decode_simple(bytes);
-      if (!s) return std::nullopt;
+      if (!s) return unexpected(s.error());
       using K = DecodedSimple::Kind;
       Node* node = nullptr;
       switch (s->kind) {
@@ -600,11 +604,11 @@ constexpr std::optional<DecodedNode> decode_value(NodePool& pool, std::span<cons
           node = pool.allocate_node(Node{.data = CborValue::SimpleValue{.number = s->simple_value}});
           break;
       }
-      if (!node) return std::nullopt;
+      if (!node) return unexpected(Error{ErrorReason::NodeCapacityExhausted});
       return DecodedNode{.node = node, .bytes_consumed = s->bytes_consumed};
     }
     default:
-      return std::nullopt;
+      return unexpected(Error{ErrorReason::MalformedHeader});
   }
 }
 
@@ -684,79 +688,90 @@ constexpr bool append_float_into(std::span<std::uint8_t> out, std::size_t& pos, 
 // caller-supplied fixed buffer and returns how many bytes it used, or
 // nullopt if the value doesn't fit -- never allocates, same discipline as
 // decode_value above.
-constexpr std::optional<std::size_t> encode_value(const NodePool& pool, const Node* node, std::span<std::uint8_t> out,
-                                                    std::size_t pos = 0) {
+constexpr Expected<std::size_t, Error> encode_value(const NodePool& pool, const Node* node, std::span<std::uint8_t> out,
+                                                      std::size_t pos = 0) {
   NOALLOC_ASSERT(pool.owns(node));
   return std::visit(
-      [&](const auto& v) -> std::optional<std::size_t> {
+      [&](const auto& v) -> Expected<std::size_t, Error> {
         using T = std::decay_t<decltype(v)>;
         if constexpr (std::is_same_v<T, std::monostate>) {
-          if (out.size() < pos + 1) return std::nullopt;
+          if (out.size() < pos + 1) return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
           out[pos++] = 0xf7;
           return pos;
         } else if constexpr (std::is_same_v<T, std::nullptr_t>) {
-          if (out.size() < pos + 1) return std::nullopt;
+          if (out.size() < pos + 1) return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
           out[pos++] = 0xf6;
           return pos;
         } else if constexpr (std::is_same_v<T, bool>) {
-          if (out.size() < pos + 1) return std::nullopt;
+          if (out.size() < pos + 1) return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
           out[pos++] = v ? std::uint8_t{0xf5} : std::uint8_t{0xf4};
           return pos;
         } else if constexpr (std::is_same_v<T, std::uint64_t>) {
-          if (!detail::append_header_into(out, pos, 0, v)) return std::nullopt;
+          if (!detail::append_header_into(out, pos, 0, v)) return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
           return pos;
         } else if constexpr (std::is_same_v<T, NegativeInt>) {
-          if (!detail::append_header_into(out, pos, 1, v.n)) return std::nullopt;
+          if (!detail::append_header_into(out, pos, 1, v.n)) return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
           return pos;
         } else if constexpr (std::is_same_v<T, double>) {
-          if (!detail::append_float_into(out, pos, v)) return std::nullopt;
+          if (!detail::append_float_into(out, pos, v)) return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
           return pos;
         } else if constexpr (std::is_same_v<T, StringRef>) {
           const auto content = pool.bytes_of(v);
           const std::uint8_t mt = (v.kind == CborValue::StringKind::Bytes) ? 2 : 3;
-          if (!detail::append_header_into(out, pos, mt, content.size())) return std::nullopt;
-          if (!detail::append_bytes_into(out, pos, content)) return std::nullopt;
+          if (!detail::append_header_into(out, pos, mt, content.size())) {
+            return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
+          }
+          if (!detail::append_bytes_into(out, pos, content)) return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
           return pos;
         } else if constexpr (std::is_same_v<T, BigNumRef>) {
           const auto content = pool.bytes_of(v);
-          if (!detail::append_header_into(out, pos, 6, v.negative ? std::uint64_t{3} : std::uint64_t{2}))
-            return std::nullopt;
-          if (!detail::append_header_into(out, pos, 2, content.size())) return std::nullopt;
-          if (!detail::append_bytes_into(out, pos, content)) return std::nullopt;
+          if (!detail::append_header_into(out, pos, 6, v.negative ? std::uint64_t{3} : std::uint64_t{2})) {
+            return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
+          }
+          if (!detail::append_header_into(out, pos, 2, content.size())) {
+            return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
+          }
+          if (!detail::append_bytes_into(out, pos, content)) return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
           return pos;
         } else if constexpr (std::is_same_v<T, CborValue::SimpleValue>) {
           if (v.number <= 23) {
-            if (out.size() < pos + 1) return std::nullopt;
+            if (out.size() < pos + 1) return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
             out[pos++] = static_cast<std::uint8_t>(0xe0 | v.number);
           } else {
-            if (out.size() < pos + 2) return std::nullopt;
+            if (out.size() < pos + 2) return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
             out[pos++] = 0xf8;
             out[pos++] = v.number;
           }
           return pos;
         } else if constexpr (std::is_same_v<T, ArrayRef>) {
-          if (!detail::append_header_into(out, pos, 4, v.count)) return std::nullopt;
+          if (!detail::append_header_into(out, pos, 4, v.count)) {
+            return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
+          }
           for (std::size_t i = 0; i < v.count; ++i) {
             const auto written = encode_value(pool, v.first_child[i], out, pos);
-            if (!written) return std::nullopt;
+            if (!written) return unexpected(written.error());
             pos = *written;
           }
           return pos;
         } else if constexpr (std::is_same_v<T, MapRef>) {
-          if (!detail::append_header_into(out, pos, 5, v.count)) return std::nullopt;
+          if (!detail::append_header_into(out, pos, 5, v.count)) {
+            return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
+          }
           for (std::size_t i = 0; i < v.count; ++i) {
             const auto key_written = encode_value(pool, v.first_pair[2 * i], out, pos);
-            if (!key_written) return std::nullopt;
+            if (!key_written) return unexpected(key_written.error());
             pos = *key_written;
             const auto value_written = encode_value(pool, v.first_pair[2 * i + 1], out, pos);
-            if (!value_written) return std::nullopt;
+            if (!value_written) return unexpected(value_written.error());
             pos = *value_written;
           }
           return pos;
         } else {  // TagRef
-          if (!detail::append_header_into(out, pos, 6, v.number)) return std::nullopt;
+          if (!detail::append_header_into(out, pos, 6, v.number)) {
+            return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
+          }
           const auto written = encode_value(pool, v.child, out, pos);
-          if (!written) return std::nullopt;
+          if (!written) return unexpected(written.error());
           return *written;
         }
       },

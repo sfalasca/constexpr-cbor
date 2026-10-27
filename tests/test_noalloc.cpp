@@ -636,4 +636,30 @@ consteval bool test_huge_map_count_is_refused_not_truncated() {
 }
 static_assert(test_huge_map_count_is_refused_not_truncated());
 
+// Proves Error.offset telescopes to an absolute position here too, the
+// same as the heap decoder's own equivalent test (test_array.cpp):
+// [1, <truncated uint>] with the truncated element starting at byte 2.
+constexpr ErrorReason noalloc_decode_error_reason(std::span<const std::uint8_t> bytes) {
+  NoAllocStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
+  const auto result = decode_value(pool, bytes);
+  return result ? ErrorReason::TruncatedInput /* unreachable in this test's own usage */ : result.error().reason;
+}
+
+constexpr std::size_t noalloc_decode_error_offset(std::span<const std::uint8_t> bytes) {
+  NoAllocStorage<32, 32, 48> storage;
+  auto pool = storage.make_pool();
+  const auto result = decode_value(pool, bytes);
+  return result ? std::size_t{0} : result.error().offset;
+}
+
+consteval bool test_decode_error_offset_points_at_the_failing_element() {
+  constexpr std::uint8_t vec[] = {0x83, 0x01, 0x18};  // [1, <truncated>] (array announces 3, only 2 present)
+  expect_false<noalloc_decode_ok(vec)>();
+  expect_eq<noalloc_decode_error_reason(vec), ErrorReason::TruncatedInput>();
+  expect_eq<noalloc_decode_error_offset(vec), std::size_t{2}>();
+  return true;
+}
+static_assert(test_decode_error_offset_points_at_the_failing_element());
+
 int main() { return 0; }
