@@ -528,6 +528,14 @@ turn up repeatedly). `decode_value<MaxDepth, ...>`'s `MaxDepth` (default `32`)
 bounds it; exceeding it is a refusal, not a crash, the same as every other
 contract violation in this codec.
 
+## Examples
+
+`examples/` has one standalone, runnable `.cpp` file per decode mode
+(heap, `NoAlloc`, `Sax`), each commented to stand on its own. Build and
+run any of them with `cmake --build build --target heap_example
+noalloc_example sax_example`. They're also compile-checked across the
+entire compiler/platform matrix below, the same as `tests/`.
+
 ## Browser viewer
 
 `webapp/` is a standalone static page that decodes a `.cbor` file to

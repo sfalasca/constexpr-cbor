@@ -7,6 +7,17 @@
 # the right message) -- used by the embedded Dockerfiles, which have no
 # CMake/ctest to do this for them.
 #
+# Also compiles every examples/*.cpp file, expecting success, the same
+# no-CMake equivalent of what the desktop/wasm matrix's `cmake --build`
+# step does automatically once examples/ became a CMake subdirectory --
+# this is the embedded-targets' equivalent proof that the example files
+# are real, working code against each cross-compiler, not just against
+# the one compiler someone happened to write them with. Compile-only
+# (-c, no link), same as the tests loop above and for the same reason:
+# this is validating a header against a cross-compiler, not producing
+# runnable firmware. Guarded on the directory existing so this script
+# still works for any caller that doesn't copy examples/ in.
+#
 # Usage: compile-all-tests.sh <out-suffix> <compiler> <flag> [<flag> ...]
 set -e
 
@@ -19,6 +30,13 @@ for f in tests/*.cpp; do
   echo "=== compiling (expect success) $f ==="
   "$compiler" "$@" -c "$f" -o "/tmp/$(basename "$f" .cpp).${out_suffix}.o"
 done
+
+if [ -d examples ]; then
+  for f in examples/*.cpp; do
+    echo "=== compiling (expect success) $f ==="
+    "$compiler" "$@" -c "$f" -o "/tmp/$(basename "$f" .cpp).${out_suffix}.o"
+  done
+fi
 
 for f in tests/expected_failures/*.cpp; do
   echo "=== compiling (expect failure) $f ==="
@@ -45,4 +63,4 @@ for f in tests/expected_failures/*.cpp; do
   fi
 done
 
-echo "all tests/*.cpp compiled; all tests/expected_failures/*.cpp correctly failed to compile"
+echo "all tests/*.cpp and examples/*.cpp compiled; all tests/expected_failures/*.cpp correctly failed to compile"
