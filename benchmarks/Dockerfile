@@ -56,6 +56,7 @@ RUN g++ -std=c++20 -O2 -I../include -Itinycbor/src -Iqcbor/inc \
 # pulls in, not a whole translation unit's worth of unused functions.
 RUN g++ -std=c++20 -Os -ffunction-sections -fdata-sections -I../include -c size/size_cc.cpp -o size_cc.o && \
     g++ -std=c++20 -Os -ffunction-sections -fdata-sections -I../include -c size/size_noalloc.cpp -o size_noalloc.o && \
+    g++ -std=c++20 -Os -ffunction-sections -fdata-sections -I../include -c size/size_sax.cpp -o size_sax.o && \
     gcc -std=c11 -Os -ffunction-sections -fdata-sections -Itinycbor/src -c size/size_tc.c -o size_tc.o && \
     gcc -std=c11 -Os -ffunction-sections -fdata-sections -Itinycbor/src -c tinycbor/src/cborparser.c -o tp_gc.o && \
     gcc -std=c11 -Os -ffunction-sections -fdata-sections -Iqcbor/inc -c size/size_qc.c -o size_qc.o && \
@@ -67,8 +68,9 @@ RUN g++ -std=c++20 -Os -ffunction-sections -fdata-sections -I../include -c size/
     gcc -std=c11 -Os -ffunction-sections -fdata-sections -c size/size_main.c -o size_main.o && \
     g++ -Os -Wl,--gc-sections size_main.o size_cc.o -o exe_cc && \
     g++ -Os -Wl,--gc-sections size_main.o size_noalloc.o -o exe_noalloc && \
+    g++ -Os -Wl,--gc-sections size_main.o size_sax.o -o exe_sax && \
     gcc -Os -Wl,--gc-sections size_main.o size_tc.o tp_gc.o -o exe_tc && \
     gcc -Os -Wl,--gc-sections size_main.o size_qc.o qd_gc.o ub_gc.o ie_gc.o -o exe_qc -lm && \
     gcc -Os -Wl,--gc-sections size_main.o size_libcbor.o libcbor/build/src/libcbor.a -o exe_libcbor -lm
 
-CMD ["bash", "-c", "echo '=== CPU performance + memory ===' && ./bench && echo && echo '=== correctness corpus ===' && ./correctness && echo && echo '=== code size (single decode entry point, dead-code-eliminated) ===' && echo constexpr-cbor_heap: && size exe_cc && echo constexpr-cbor_noalloc: && size exe_noalloc && echo tinycbor: && size exe_tc && echo qcbor: && size exe_qc && echo libcbor: && size exe_libcbor"]
+CMD ["bash", "-c", "echo '=== CPU performance + memory ===' && ./bench && echo && echo '=== correctness corpus ===' && ./correctness && echo && echo '=== code size (single decode entry point, dead-code-eliminated) ===' && echo constexpr-cbor_heap: && size exe_cc && echo constexpr-cbor_noalloc: && size exe_noalloc && echo constexpr-cbor_sax: && size exe_sax && echo tinycbor: && size exe_tc && echo qcbor: && size exe_qc && echo libcbor: && size exe_libcbor"]

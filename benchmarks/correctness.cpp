@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "constexpr_cbor.hpp"
+#include "constexpr_cbor_sax.hpp"
 
 extern "C" {
 #include <cbor.h>  // tinycbor
@@ -34,6 +35,17 @@ struct Vector {
 
 bool accepted_by_constexpr_cbor(const std::vector<std::uint8_t>& bytes) {
   return ConstexprCbor::decode_value(std::span<const std::uint8_t>(bytes)).has_value();
+}
+
+// SaxRange's default KeyPolicy (NoDuplicateKeyCheck) never rejects a
+// duplicate key, so it naturally agrees with should_accept=true on the
+// duplicate_keys_1_1 vector below -- unlike accepted_by_constexpr_cbor,
+// no special-casing is needed here.
+bool accepted_by_sax(const std::vector<std::uint8_t>& bytes) {
+  for (auto ev : ConstexprCbor::Sax::SaxRange<32>{std::span<const std::uint8_t>(bytes)}) {
+    if (ev.kind == ConstexprCbor::Sax::EventKind::Error) return false;
+  }
+  return true;
 }
 
 bool accepted_by_tinycbor(const std::vector<std::uint8_t>& bytes) {
@@ -141,9 +153,11 @@ int main() {
   };
 
   int mismatches = 0;
-  std::printf("%-42s %-8s %-10s %-10s %-10s %-10s\n", "vector", "expect", "cbor", "tinycbor", "qcbor", "libcbor");
+  std::printf("%-42s %-8s %-10s %-10s %-10s %-10s %-10s\n", "vector", "expect", "cbor", "sax", "tinycbor", "qcbor",
+              "libcbor");
   for (const auto& v : corpus) {
     const bool cc = accepted_by_constexpr_cbor(v.bytes);
+    const bool sc = accepted_by_sax(v.bytes);
     const bool tc = accepted_by_tinycbor(v.bytes);
     const bool qc = accepted_by_qcbor(v.bytes);
     const bool lc = accepted_by_libcbor(std::span<const std::uint8_t>(v.bytes));
@@ -155,10 +169,14 @@ int main() {
     // special-cased out of the plain accept/reject diff below.
     const bool is_dup_key_policy_case = std::string(v.name) == "duplicate_keys_1_1";
     const bool cc_matches = is_dup_key_policy_case || (cc == v.should_accept);
-    if (!cc_matches || tc != v.should_accept || qc != v.should_accept || lc != v.should_accept) ++mismatches;
-    std::printf("%-42s %-8s %-10s %-10s %-10s %-10s%s\n", v.name, v.should_accept ? "accept" : "reject",
-                cc ? "accept" : "reject", tc ? "accept" : "reject", qc ? "accept" : "reject",
-                lc ? "accept" : "reject", is_dup_key_policy_case ? "  (policy choice, see note)" : "");
+    if (!cc_matches || sc != v.should_accept || tc != v.should_accept || qc != v.should_accept ||
+        lc != v.should_accept) {
+      ++mismatches;
+    }
+    std::printf("%-42s %-8s %-10s %-10s %-10s %-10s %-10s%s\n", v.name, v.should_accept ? "accept" : "reject",
+                cc ? "accept" : "reject", sc ? "accept" : "reject", tc ? "accept" : "reject",
+                qc ? "accept" : "reject", lc ? "accept" : "reject",
+                is_dup_key_policy_case ? "  (policy choice, see note)" : "");
   }
   std::printf("\n%d / %zu vectors disagree with the RFC-correct expectation (excluding the policy-choice case)\n",
               mismatches, corpus.size());
