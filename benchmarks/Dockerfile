@@ -34,6 +34,7 @@ RUN cmake -S libcbor -B libcbor/build -DCMAKE_BUILD_TYPE=Release \
 
 RUN gcc -std=c11 -O2 -Itinycbor/src -c tinycbor/src/cborparser.c -o tinycbor_parser.o && \
     gcc -std=c11 -O2 -Iqcbor/inc -c qcbor/src/qcbor_decode.c -o qcbor_decode.o && \
+    gcc -std=c11 -O2 -Iqcbor/inc -c qcbor/src/qcbor_encode.c -o qcbor_encode.o && \
     gcc -std=c11 -O2 -Iqcbor/inc -c qcbor/src/UsefulBuf.c -o usefulbuf.o && \
     gcc -std=c11 -O2 -Iqcbor/inc -c qcbor/src/ieee754.c -o ieee754.o
 
@@ -42,13 +43,28 @@ RUN gcc -std=c11 -O2 -Itinycbor/src -c tinycbor/src/cborparser.c -o tinycbor_par
 # names tinycbor uses for different purposes (cbor_encode_uint and
 # friends), a genuine extern "C" symbol collision if both ever appear in
 # one TU. bench.cpp/correctness.cpp only ever see libcbor_adapter.hpp.
-RUN g++ -std=c++20 -O2 -Ilibcbor/src -Ilibcbor/build/src -Ilibcbor/build \
+RUN g++ -std=c++20 -O2 -I../include -Ilibcbor/src -Ilibcbor/build/src -Ilibcbor/build \
     -c libcbor_adapter.cpp -o libcbor_adapter.o
 
 RUN g++ -std=c++20 -O2 -I../include -Itinycbor/src -Iqcbor/inc \
-    bench.cpp tinycbor_parser.o qcbor_decode.o usefulbuf.o ieee754.o libcbor_adapter.o libcbor/build/src/libcbor.a -o bench
+    bench.cpp tinycbor_parser.o qcbor_decode.o qcbor_encode.o usefulbuf.o ieee754.o \
+    libcbor_adapter.o libcbor/build/src/libcbor.a -o bench
 RUN g++ -std=c++20 -O2 -I../include -Itinycbor/src -Iqcbor/inc \
-    correctness.cpp tinycbor_parser.o qcbor_decode.o usefulbuf.o ieee754.o libcbor_adapter.o libcbor/build/src/libcbor.a -o correctness
+    correctness.cpp tinycbor_parser.o qcbor_decode.o qcbor_encode.o usefulbuf.o ieee754.o \
+    libcbor_adapter.o libcbor/build/src/libcbor.a -o correctness
+
+# tinycbor's *encoder* (cborencoder.c, as opposed to the decoder above)
+# cannot be linked into the same executable as libcbor at all: both
+# export a couple of identically-named C functions for unrelated purposes
+# (cbor_encode_uint, cbor_encode_tag) -- a genuine object-level symbol
+# collision, confirmed by an actual link attempt, that only ever became
+# live once tinycbor's encoder needed linking alongside libcbor (the
+# decoder above shares no such names). See bench_tinycbor_encode.cpp's
+# own comment for why this is a separate program rather than another
+# translation-unit split.
+RUN gcc -std=c11 -O2 -Itinycbor/src -c tinycbor/src/cborencoder.c -o tinycbor_encoder.o && \
+    g++ -std=c++20 -O2 -I../include -Itinycbor/src \
+    bench_tinycbor_encode.cpp tinycbor_encoder.o -o bench_tinycbor_encode
 
 # Code-size comparison: dead-code-eliminated (-ffunction-sections +
 # --gc-sections) single-entry-point executable per library, so each
@@ -73,4 +89,4 @@ RUN g++ -std=c++20 -Os -ffunction-sections -fdata-sections -I../include -c size/
     gcc -Os -Wl,--gc-sections size_main.o size_qc.o qd_gc.o ub_gc.o ie_gc.o -o exe_qc -lm && \
     gcc -Os -Wl,--gc-sections size_main.o size_libcbor.o libcbor/build/src/libcbor.a -o exe_libcbor -lm
 
-CMD ["bash", "-c", "echo '=== CPU performance + memory ===' && ./bench && echo && echo '=== correctness corpus ===' && ./correctness && echo && echo '=== code size (single decode entry point, dead-code-eliminated) ===' && echo constexpr-cbor_heap: && size exe_cc && echo constexpr-cbor_noalloc: && size exe_noalloc && echo constexpr-cbor_sax: && size exe_sax && echo tinycbor: && size exe_tc && echo qcbor: && size exe_qc && echo libcbor: && size exe_libcbor"]
+CMD ["bash", "-c", "echo '=== CPU performance + memory ===' && ./bench && echo && echo '=== tinycbor encode (separate program -- see bench_tinycbor_encode.cpp) ===' && ./bench_tinycbor_encode && echo && echo '=== correctness corpus ===' && ./correctness && echo && echo '=== code size (single decode entry point, dead-code-eliminated) ===' && echo constexpr-cbor_heap: && size exe_cc && echo constexpr-cbor_noalloc: && size exe_noalloc && echo constexpr-cbor_sax: && size exe_sax && echo tinycbor: && size exe_tc && echo qcbor: && size exe_qc && echo libcbor: && size exe_libcbor"]

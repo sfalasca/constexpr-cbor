@@ -144,6 +144,28 @@ Six decode paths are measured:
   symbol collision, not just an include-path ambiguity, that only a
   separate translation unit avoids.
 
+For CPU performance, **encoding is measured too**, separately from
+decoding: each library encodes the same already-decoded value back to
+bytes, so the comparison isolates pure encode cost from however that
+library's decoder (or constexpr-cbor's own heap decoder, for the three
+libraries that don't persist a tree of their own) got the data in. heap
+and NoAlloc already have their own native decoded value sitting there
+from the decode step (`CborValue`, `NodePool`+`Node`); QCBOR and libcbor
+have no persisted tree, so each builds its own native representation
+from the one shared heap `CborValue` instead, via its own encoder API
+(`QCBOREncode_*`/libcbor's `cbor_build_*` + `cbor_serialize`) — the
+fairest way to measure "how fast is this library's own encoder,"
+independent of which decoder produced the data. **tinycbor's encoder is
+measured by a separate program** (`bench_tinycbor_encode`, see "Files"
+below) for a genuine, unavoidable reason: tinycbor's encoder and libcbor
+both export a couple of identically-named C functions for unrelated
+purposes (`cbor_encode_uint`, `cbor_encode_tag`) — a real object-level
+symbol collision, confirmed by an actual link attempt, not assumed, that
+only ever became live once tinycbor's *encoder* (as opposed to its
+decoder, which shares no such names) needed linking alongside libcbor.
+**SAX has no encoder at all** — it's a decode-only design — and is
+excluded from the encode comparison, not forgotten.
+
 ### A bug this methodology actually caught
 
 The first version of the libcbor adapter used `cbor_get_uint64(item)` for
@@ -171,10 +193,10 @@ now land within a few percent of these.
 
 | payload | heap | NoAlloc | SAX | tinycbor | QCBOR | libcbor |
 |---|---|---|---|---|---|---|
-| small (45 B) | 778 ns / 57.8 MB/s | 364 ns / 123.6 MB/s | 435 ns / 103.5 MB/s | 447 ns / 100.6 MB/s | 445 ns / 101.1 MB/s | 635 ns / 70.9 MB/s |
-| medium (10.8 KB) | 315,162 ns / 34.2 MB/s | 63,225 ns / 170.5 MB/s | 72,572 ns / 148.5 MB/s | 84,427 ns / 127.7 MB/s | 74,987 ns / 143.7 MB/s | 259,673 ns / 41.5 MB/s |
-| deep (91 B, depth 30) | 74,392 ns / 1.2 MB/s | 49,440 ns / 1.8 MB/s | 49,953 ns / 1.8 MB/s | 49,809 ns / 1.8 MB/s | 24,516 ns / 3.7 MB/s *(when accepted — see Correctness)* | 52,285 ns / 1.7 MB/s |
-| strings (8.8 KB) | 11,150 ns / 788.5 MB/s | 2,588 ns / 3,396.7 MB/s | 3,215 ns / 2,735.1 MB/s | 4,650 ns / 1,890.6 MB/s | 3,884 ns / 2,263.5 MB/s | 23,985 ns / 366.6 MB/s |
+| small (45 B) | 793 ns / 56.8 MB/s | 363 ns / 123.9 MB/s | 395 ns / 113.8 MB/s | 447 ns / 100.7 MB/s | 446 ns / 100.9 MB/s | 646 ns / 69.7 MB/s |
+| medium (10.8 KB) | 323,397 ns / 33.3 MB/s | 62,786 ns / 171.7 MB/s | 61,263 ns / 175.9 MB/s | 81,345 ns / 132.5 MB/s | 74,044 ns / 145.6 MB/s | 260,063 ns / 41.4 MB/s |
+| deep (91 B, depth 30) | 93,893 ns / 1.0 MB/s | 68,790 ns / 1.3 MB/s | 68,788 ns / 1.3 MB/s | 69,154 ns / 1.3 MB/s | 34,203 ns / 2.7 MB/s *(when accepted — see Correctness)* | 71,435 ns / 1.3 MB/s |
+| strings (8.8 KB) | 11,650 ns / 754.7 MB/s | 2,570 ns / 3,420.5 MB/s | 2,861 ns / 3,073.3 MB/s | 4,937 ns / 1,781.0 MB/s | 3,956 ns / 2,222.6 MB/s | 24,824 ns / 354.2 MB/s |
 
 **How to read this table — tradeoffs by payload shape, not a ranking:**
 - On `small`, `medium`, and `strings`, both constexpr-cbor paths that
@@ -218,6 +240,96 @@ now land within a few percent of these.
   usage below) showing up differently depending on how much of a given
   payload is strings versus structure, since per-item refcounting and
   heap's own allocation pattern scale differently with that ratio.
+- **A real, measured cost of migrating from `std::optional` to
+  `Expected<T, Error>` (see the top-level README's own section on this):
+  all three constexpr-cbor decode paths got consistently slower on
+  `deep` specifically** — heap 74,392 → 93,893 ns (+26%), NoAlloc
+  49,440 → 68,790 ns (+39%), SAX 49,953 → 68,788 ns (+38%) — while
+  `small`/`medium`/`strings` moved by only a few percent, within this
+  benchmark's own established noise band. `deep` is the one payload
+  that's almost entirely recursion (30 levels, 91 bytes total, no real
+  work per level), so a small added cost *per primitive call*
+  (`decode_length`/`decode_uint`/`decode_simple`/...) multiplies up
+  exactly where it would matter least for a real-world payload and most
+  for this specific synthetic one. **A methodological caveat that
+  matters here**: every binary in this benchmark builds at the plain
+  `-std=c++20` this Dockerfile hard-codes, meaning every one of these
+  numbers reflects `ConstexprCbor::Expected`'s C++20 *fallback* backend
+  (`std::variant`-based) — not real `std::expected`, which only activates
+  at C++23 (see the top-level README's "Why `Expected`, not
+  `std::optional` or `std::expected` directly"). Whether this specific
+  slowdown shrinks, persists, or is specific to the fallback's own
+  `std::variant`-based dispatch is an open question this benchmark
+  doesn't currently answer — doing so would mean building `bench`/`size/`
+  at both standards the way `docker/`'s compiler matrix already does,
+  not just the library's own test suite.
+
+### CPU performance, encode (ns/encode, lower is better; MB/s, higher is better)
+
+| payload | heap | NoAlloc | tinycbor | QCBOR | libcbor |
+|---|---|---|---|---|---|
+| small (45 B) | 757 ns / 51.5 MB/s | 298 ns / 130.9 MB/s | 99 ns / 453.7 MB/s | 225 ns / 173.7 MB/s | 594 ns / 85.8 MB/s |
+| medium (10.8 KB) | 176,565 ns / 60.8 MB/s | 29,021 ns / 370.1 MB/s | 31,409 ns / 343.2 MB/s | 61,321 ns / 175.2 MB/s | 245,181 ns / 49.8 MB/s |
+| deep (91 B, depth 30) | 70,602 ns / 1.3 MB/s | 67,772 ns / 1.3 MB/s | 879 ns / 103.5 MB/s | *refused — QCBOR's encoder enforces the same fixed nesting limit as its decoder, see Flexibility* | 69,972 ns / 1.4 MB/s |
+| strings (8.8 KB) | 9,482 ns / 927.2 MB/s | 14,452 ns / 608.4 MB/s | 1,348 ns / 6,520.7 MB/s | 2,651 ns / 3,316.8 MB/s | 24,442 ns / 359.7 MB/s |
+
+(tinycbor's figures come from the separate `bench_tinycbor_encode`
+program — see Methodology above for why — using the same `kRounds = 9`
+minimum-of-interleaved-rounds technique, just not interleaved with the
+other four since it can't share a process with libcbor.)
+
+**Takeaways:**
+- **tinycbor's encoder is the fastest of all five on every payload here
+  by a wide margin**, `deep` included — unlike its decoder (which has to
+  do real work parsing variable-length headers), its encoder is close to
+  "write a known small number of bytes," and with no dynamic dispatch or
+  generic value representation to go through, that shows. This isn't
+  "tinycbor is the fastest library" in general — it's the fastest
+  *encoder* among these for data shapes that are cheap to walk once
+  already decoded, which is exactly the situation every one of these
+  numbers is measuring.
+- **QCBOR's encoder refuses `deep` outright**, the same way its decoder
+  already does (see Correctness/Flexibility) — `QCBOREncode_OpenArray`
+  tracks nesting against the same fixed `QCBOR_MAX_ARRAY_NESTING = 15`
+  internal limit its decoder uses, so a 30-level-deep structure can't be
+  *produced* by QCBOR any more than it can be *consumed* by it. A
+  genuinely new, previously-undocumented finding from adding encode to
+  this benchmark: the nesting limit isn't just a decode-side guard
+  against adversarial input, it's symmetric.
+- **NoAlloc's encoder is consistently faster than heap's** on every
+  payload except `strings` (where heap's zero-copy `OwnedString::content`
+  being already-owned bytes it just appends, versus NoAlloc re-deriving
+  each string's span from the pool on every recursive call, evidently
+  costs more than the allocation heap itself avoids) — the same general
+  shape the decode-side numbers already showed, for the same structural
+  reason (no allocation, no `std::vector` growth).
+- **libcbor is the slowest encoder of the five on `small`/`medium`/
+  `strings`**, consistent with encoding via libcbor meaning "build a
+  whole tree via its own API, then serialize it" (see its own comment in
+  `libcbor_adapter.cpp`) rather than a genuine streaming encode the way
+  tinycbor/QCBOR/heap/NoAlloc all do directly from an already-decoded
+  value — the DOM-style cost shows up on the encode side exactly as it
+  already did on decode.
+- **heap, NoAlloc, tinycbor, and QCBOR all converge on the identical
+  encoded byte count** for every payload they accept — including `small`
+  encoding to 39 bytes, smaller than its 45-byte input, since
+  `gen_payloads.py`'s raw dict literal isn't itself written in canonical
+  form; every one of these four independently derives the same shortest
+  encoding, itself a correctness signal. **libcbor is consistently
+  larger** (51 vs. 39 on `small`, 12,202 vs. 10,742 on `medium`) for a
+  real, disclosable reason, not a bug in this benchmark's walk: libcbor's
+  items carry an explicit, fixed width chosen at construction time
+  (`cbor_build_uint64` always stores -- and therefore serializes -- the
+  8-byte-following form, regardless of the value) rather than
+  re-deriving the shortest encoding at `cbor_serialize` time the way
+  every other library here does. This is the same width-is-explicit
+  behavior "A bug this methodology actually caught" above already
+  surfaced on the decode side (`cbor_get_uint64` requiring
+  `CBOR_INT_64` width specifically) -- this benchmark's builder walk
+  calls `cbor_build_uint64` unconditionally for every unsigned integer
+  rather than hand-picking the narrowest `cbor_build_uintN`, so it's
+  measuring libcbor's API as most callers would actually use it, not
+  libcbor's best case.
 
 ### NoAlloc internals: from index-based to pointer-based
 
@@ -327,28 +439,41 @@ optimized away.
 
 | | .text | .data | .bss | total |
 |---|---|---|---|---|
-| constexpr-cbor (heap) | 18,133 | 1,408 | 16 | 19,557 |
-| constexpr-cbor (NoAlloc) | 20,693 | 2,056 | 3,112 | 25,861 |
-| constexpr-cbor (SAX) | 4,803 | 592 | 16 | 5,411 |
+| constexpr-cbor (heap) | 20,059 | 1,408 | 16 | 21,483 |
+| constexpr-cbor (NoAlloc) | 23,837 | 2,192 | 3,112 | 29,141 |
+| constexpr-cbor (SAX) | 6,862 | 704 | 16 | 7,582 |
 | tinycbor | 6,517 | 600 | 16 | 7,133 |
 | QCBOR | 6,013 | 616 | 16 | 6,645 |
 | libcbor | 15,317 | 640 | 16 | 15,973 |
 
 **Takeaways:**
-- **SAX is the smallest of all six paths measured here**, including
-  tinycbor and QCBOR — worth knowing if code size specifically, not
-  throughput or allocation behavior, is the actual constraint. The
-  structural reason is straightforward: SAX carries no tree-shaped data
-  type, no allocator/bookkeeping object, and no owned-value
-  representation at all — just the shared byte-parsing primitives this
-  whole library already has, plus a small, fixed-size frame stack. It
-  reuses constexpr-cbor's existing `decode_length`/`decode_uint`/
-  `decode_negint`/`decode_byte_string`/`decode_text_string`/
-  `decode_simple` unchanged, so almost none of its `.text` is new code
-  this benchmark hasn't already measured elsewhere (heap and NoAlloc
-  both pull in those same primitives too).
+- **All three constexpr-cbor code-size figures above are larger than
+  they were before the `std::optional` → `Expected<T, Error>` migration**
+  (heap 18,133→20,059 B, +10.6%; NoAlloc 20,693→23,837 B, +15.2%; SAX
+  4,803→6,862 B, +42.9%), and this is the dominant, more recent effect
+  layered on top of the IndexCell-removal story below — not noise.
+  Carrying a `reason` enum plus a byte offset through every refusal path
+  (instead of collapsing straight to `nullopt`), and (for SAX
+  specifically) giving every `set_error()` call site in `Event` its own
+  specific `ErrorReason`, is real additional code. As with the CPU-size
+  caveat above, every number in this table is built at plain
+  `-std=c++20`, so it reflects `Expected`'s `std::variant`-based C++20
+  fallback backend, not real `std::expected` (C++23-only) — whether the
+  size delta shrinks under the real backend is an open question this
+  benchmark doesn't answer.
+- **SAX is no longer the smallest of the six paths measured here.**
+  Before the migration it was the smallest by a wide margin (4,803 B,
+  beating both tinycbor and QCBOR). Enriching its `Event` with a full
+  `Error{reason, offset}` field pushed it past both: it now sits at
+  6,862 B, between QCBOR (6,013 B, still the smallest overall) and
+  tinycbor (6,517 B). SAX still has no tree-shaped data type, no
+  allocator/bookkeeping object, and no owned-value representation —
+  just the shared byte-parsing primitives plus a small, fixed-size frame
+  stack — so it's still structurally the leanest of constexpr-cbor's own
+  three paths; it has simply lost its lead over the two independent C
+  libraries to the cost of the richer error type.
 - **libcbor lands between the two extremes, as expected for a DOM-style C
-  library**: 15,317 B — smaller than constexpr-cbor's heap path (18,133 B,
+  library**: 15,317 B — smaller than constexpr-cbor's heap path (20,059 B,
   no `std::variant`/template instantiation overhead, it's plain C), but
   more than double tinycbor/QCBOR's size, since it still needs to build
   and tear down (`cbor_decref`) a real tree with reference counting,
@@ -365,29 +490,31 @@ optimized away.
   tinycbor, QCBOR, or constexpr-cbor's own SAX path instead of heap/
   NoAlloc — this benchmark isn't trying to argue that gap away, only to
   measure it honestly, and to show that a design *within the same
-  library* (SAX) closes it almost entirely without changing language or
-  compiler.
+  library* (SAX) narrows it substantially, even if (per above) the
+  `Expected` migration has eaten into that margin too.
 - **Removing `IndexCell` and replacing it with pointer-based reference
   slots** (see "NoAlloc internals" above) shrank NoAlloc's `.text`/`.data`
   noticeably versus the original index-based design (22,252/2,504 B), but
   this build also adds the `NodePool::owns(const Node*)` checks' own
   branches on top of that saving, since these binaries aren't built with
-  `-DNDEBUG` — the two effects partly offset, landing at 20,693/2,056 B
-  rather than showing the full size of either change in isolation. `.bss`
-  grew versus the original design (2,616 B to 3,112 B) for an unrelated
+  `-DNDEBUG` — the two effects partly offset, landing at (pre-`Expected`)
+  20,693/2,056 B rather than showing the full size of either change in
+  isolation; the `Expected` migration has since added further growth on
+  top, to the 23,837/2,192 B shown in the table above. `.bss` grew versus
+  the original IndexCell design (2,616 B to 3,112 B) for an unrelated
   reason: the three separately-typed, independently-sized `NoAllocStorage`
   arrays (`Node[]`, the new `Node*[]` reference-slot array, `uint8_t[]`)
   don't pack as tightly as the old design's two NTTP-sized arrays did for
   this entry point's particular chosen capacities — a caller sizing
   `MaxRefs` tightly for their own data shape would see a smaller number
   than this generic single-entry-point benchmark shows.
-- **NoAlloc is still larger than heap** in this measurement (20,693 vs.
-  18,133 B) — the larger `Node` variant, the separate reference-slot
+- **NoAlloc is still larger than heap** in this measurement (23,837 vs.
+  20,059 B) — the larger `Node` variant, the separate reference-slot
   array, and the `owns()` checks still cost more code than the removed
   allocator calls save, for a single entry point. The zero-heap-allocation
-  property doesn't come free in `.text` for a tree-building mode; SAX is
-  the path that gets zero allocation *and* a smaller `.text` footprint
-  than heap, at the cost of not building a tree at all.
+  property doesn't come free in `.text` for a tree-building mode; SAX
+  still gets zero allocation *and* a smaller `.text` footprint than heap
+  (6,862 vs. 20,059 B), at the cost of not building a tree at all.
 
 ## Correctness
 
@@ -463,9 +590,10 @@ specifically for).
 | Exception-free | Yes (`Expected<T, Error>`, proven to compile under `-fno-exceptions`) | Yes (C) | Yes (C) | Yes (C) | varies |
 | Bignum (tag 2/3) as a native value, not an opaque tag | Yes (heap/NoAlloc; SAX surfaces it as `Tag` + `ByteString`, the same shape tinycbor/libcbor already use) | No (generic tag) | Yes (`QCBOR_TYPE_POSBIGNUM`/`NEGBIGNUM`) | No (generic tag) | varies |
 | Browser/WebAssembly target proven in CI | Yes (`docker/wasm.Dockerfile`, `webapp/`) | Not out of the box | Not out of the box | Not out of the box | No |
-| Code size (this benchmark, full decode+walk) | 5.4-21 KB `.text` for one call, depending on decode path | 6.5 KB | 6.0 KB | 15.3 KB | — |
+| Code size (this benchmark, full decode+walk) | 6.9-23.8 KB `.text` for one call, depending on decode path | 6.5 KB | 6.0 KB | 15.3 KB | — |
 | Memory allocated/decode (this benchmark) | 0 (NoAlloc/SAX) to ~158 KB (heap) | 0 | 0 | ~0.7-234 KB — allocates on every payload | — |
 | Raw decode throughput (this benchmark) | 1-3,397 MB/s depending on mode/payload — see CPU performance above for the breakdown by payload shape | 2-1,891 MB/s | 2-2,264 MB/s (refused on `deep` in some runs) | 2-367 MB/s | — |
+| Raw encode throughput (this benchmark) | 1-941 MB/s depending on mode/payload (SAX has no encoder, see CPU performance, encode above) | 103-6,519 MB/s (measured separately, see Methodology) | 173-3,401 MB/s (refuses `deep`, same nesting limit as decode) | 49-363 MB/s | — |
 
 **How to read this table**: none of the above is meant to crown one
 library "better" — it's meant to make the tradeoffs legible enough that
@@ -508,11 +636,19 @@ itself.
 - `gen_payloads.py` — regenerates `data/*.cbor` and `payloads.h` (the
   payload bytes embedded into the C++ benchmark, so the Docker build
   doesn't need Python).
-- `bench.cpp` — the CPU/memory benchmark described above.
+- `bench.cpp` — the CPU/memory decode-and-encode benchmark described
+  above (tinycbor's encoder excluded, see next item).
+- `bench_tinycbor_encode.cpp` — tinycbor's encoder, measured as its own
+  single-purpose program: it cannot be linked into the same executable
+  as libcbor at all (a real object-level symbol collision, see
+  Methodology above), so this is the standalone fix, not another
+  translation-unit split.
 - `correctness.cpp` — the cross-library correctness corpus.
 - `libcbor_adapter.hpp`/`.cpp` — the only translation unit that includes
   libcbor's own header, isolating its `extern "C"` symbol collision with
   tinycbor from `bench.cpp`/`correctness.cpp` (see "Methodology" above).
+  Also where libcbor's own tree-builder walk (`build_libcbor`) and
+  `encode_libcbor` live, for the same reason.
 - `size/` — the six minimal single-entry-point sources used for the
   code-size comparison (`size_cc.cpp`/`size_noalloc.cpp`/`size_sax.cpp`
   for constexpr-cbor's three modes, `size_tc.c`/`size_qc.c`/

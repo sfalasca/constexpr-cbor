@@ -15,6 +15,7 @@
 #include <sched.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -35,6 +36,7 @@ extern "C" {
 #include <cbor.h>  // tinycbor
 }
 #include "qcbor/qcbor_decode.h"  // QCBOR
+#include "qcbor/qcbor_encode.h"  // QCBOR
 
 namespace {
 
@@ -47,6 +49,17 @@ struct Checksum {
   friend bool operator==(const Checksum& a, const Checksum& b) {
     return a.items == b.items && a.isum == b.isum && a.strbytes == b.strbytes && std::fabs(a.fsum - b.fsum) < 1e-6;
   }
+};
+
+// Shared shape for every encode-side result below: did it fit in the
+// given output buffer, how many bytes did it actually produce, and (only
+// meaningful for libcbor, which has to build a tree before it can
+// serialize at all -- see libcbor_adapter.cpp) how much that construction
+// allocated.
+struct EncodeResult {
+  bool ok;
+  std::size_t bytes_written;
+  long long bytes_allocated;
 };
 
 long long alloc_delta_begin() { return static_cast<long long>(mallinfo2().uordblks); }
@@ -102,6 +115,16 @@ HeapResult decode_heap(std::span<const std::uint8_t> bytes) {
   return {true, sum, after - before};
 }
 
+// encode_value always succeeds for an already-valid CborValue (there's no
+// output-buffer limit -- it grows a std::vector), so the only thing worth
+// measuring here is the allocation its own growth does.
+EncodeResult encode_heap(const ConstexprCbor::CborValue& value) {
+  const long long before = alloc_delta_begin();
+  const auto out = ConstexprCbor::encode_value(value);
+  const long long after = alloc_delta_begin();
+  return {true, out.size(), after - before};
+}
+
 // ---------------------------------------------------------------------
 // constexpr-cbor, no-malloc NoAlloc
 // ---------------------------------------------------------------------
@@ -151,6 +174,19 @@ HeapResult decode_noalloc(ConstexprCbor::NoAlloc::NodePool& pool, std::span<cons
   walk_noalloc_node(pool, *decoded->node, sum);
   const long long after = alloc_delta_begin();
   return {true, sum, after - before};
+}
+
+// `node` must belong to `pool` -- the caller decodes into it first (see
+// run_payload), exactly as the no-malloc API is actually meant to be used:
+// decode once, encode from the same pool's own tree, never a heap
+// allocation anywhere in either direction.
+EncodeResult encode_noalloc(const ConstexprCbor::NoAlloc::NodePool& pool, const ConstexprCbor::NoAlloc::Node* node,
+                             std::span<std::uint8_t> out) {
+  const long long before = alloc_delta_begin();
+  const auto written = ConstexprCbor::NoAlloc::encode_value(pool, node, out);
+  const long long after = alloc_delta_begin();
+  if (!written) return {false, 0, 0};
+  return {true, *written, after - before};
 }
 
 // ---------------------------------------------------------------------
@@ -267,6 +303,21 @@ HeapResult decode_tinycbor(std::span<const std::uint8_t> bytes) {
   return {true, sum, after - before};
 }
 
+// tinycbor's *encoder* (as opposed to the decoder used above) is
+// deliberately NOT linked into this executable at all: cborencoder.c and
+// libcbor both export a handful of identically-named C functions for
+// unrelated purposes (cbor_encode_uint, cbor_encode_tag -- confirmed via
+// an actual link attempt, not assumed), a genuine object-level symbol
+// collision distinct from the header-level one libcbor_adapter.cpp
+// already isolates. This one isn't fixable by moving code into a
+// separate translation unit, since the final executable links both
+// static libraries' object code either way -- the only clean fix is to
+// never link tinycbor's encoder and libcbor into the same process.
+// tinycbor's encode numbers are therefore measured by a separate,
+// single-purpose program (bench_tinycbor_encode.cpp), the same "isolated
+// single-purpose binary" pattern this project's size/ directory already
+// uses -- see that file and benchmarks/README.md for its numbers.
+
 // ---------------------------------------------------------------------
 // QCBOR
 // ---------------------------------------------------------------------
@@ -323,6 +374,70 @@ QcborResult decode_qcbor(std::span<const std::uint8_t> bytes) {
   return {{true, sum, after - before}, 0};
 }
 
+// Same rationale as tinycbor's encoder above: QCBOR has no tree of its
+// own either, so this builds straight off the shared, already-decoded
+// CborValue.
+void qcbor_encode_value(const ConstexprCbor::CborValue& v, QCBOREncodeContext& enc) {
+  using CV = ConstexprCbor::CborValue;
+  std::visit(
+      [&](const auto& x) {
+        using T = std::decay_t<decltype(x)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+          QCBOREncode_AddUndef(&enc);
+        } else if constexpr (std::is_same_v<T, std::nullptr_t>) {
+          QCBOREncode_AddNULL(&enc);
+        } else if constexpr (std::is_same_v<T, bool>) {
+          QCBOREncode_AddBool(&enc, x);
+        } else if constexpr (std::is_same_v<T, std::uint64_t>) {
+          QCBOREncode_AddUInt64(&enc, x);
+        } else if constexpr (std::is_same_v<T, ConstexprCbor::NegativeInt>) {
+          const auto i = x.to_int64();
+          // QCBOR's basic int API can't represent a magnitude past
+          // INT64_MIN -- not exercised by this benchmark's payloads (see
+          // gen_payloads.py); silently skipping here would under-count,
+          // so this is the one spot that can't cleanly fail per-value and
+          // instead just doesn't emit anything for it if it's ever hit.
+          if (i) QCBOREncode_AddInt64(&enc, *i);
+        } else if constexpr (std::is_same_v<T, CV::OwnedString>) {
+          const UsefulBufC buf{x.content.data(), x.content.size()};
+          if (x.kind == CV::StringKind::Text) {
+            QCBOREncode_AddText(&enc, buf);
+          } else {
+            QCBOREncode_AddBytes(&enc, buf);
+          }
+        } else if constexpr (std::is_same_v<T, double>) {
+          QCBOREncode_AddDouble(&enc, x);
+        } else if constexpr (std::is_same_v<T, std::vector<CV>>) {
+          QCBOREncode_OpenArray(&enc);
+          for (const auto& e : x) qcbor_encode_value(e, enc);
+          QCBOREncode_CloseArray(&enc);
+        } else if constexpr (std::is_same_v<T, std::vector<std::pair<CV, CV>>>) {
+          QCBOREncode_OpenMap(&enc);
+          for (const auto& [k, val] : x) {
+            qcbor_encode_value(k, enc);
+            qcbor_encode_value(val, enc);
+          }
+          QCBOREncode_CloseMap(&enc);
+        } else if constexpr (std::is_same_v<T, CV::Tag>) {
+          QCBOREncode_AddTag(&enc, x.number);
+          qcbor_encode_value(x.value.front(), enc);
+        }
+        // BigNum/SimpleValue: not exercised by this benchmark's payloads.
+      },
+      v.data);
+}
+
+EncodeResult encode_qcbor(const ConstexprCbor::CborValue& value, std::span<std::uint8_t> out) {
+  QCBOREncodeContext enc;
+  const UsefulBuf storage{out.data(), out.size()};
+  QCBOREncode_Init(&enc, storage);
+  qcbor_encode_value(value, enc);
+  UsefulBufC encoded;
+  const QCBORError err = QCBOREncode_Finish(&enc, &encoded);
+  if (err != QCBOR_SUCCESS) return {false, 0, 0};
+  return {true, encoded.len, 0};
+}
+
 // ---------------------------------------------------------------------
 // libcbor -- the DOM-style C competitor (cbor_load builds an owned,
 // ref-counted cbor_item_t tree, the same shape of thing constexpr-cbor's
@@ -337,6 +452,15 @@ HeapResult decode_libcbor_checksum(std::span<const std::uint8_t> bytes) {
   if (!r.ok) return {false, {}, 0};
   Checksum sum{r.items, r.isum, r.fsum, r.strbytes};
   return {true, sum, r.bytes_allocated};
+}
+
+// encode_libcbor (libcbor_adapter.cpp) builds libcbor's own tree from the
+// shared, already-decoded CborValue and serializes it -- see that file's
+// own comment for why tree-construction time genuinely counts as encode
+// cost for libcbor specifically (it has no streaming encoder at all).
+EncodeResult encode_libcbor_checksum(const ConstexprCbor::CborValue& value, std::span<std::uint8_t> out) {
+  const LibcborEncodeResult r = encode_libcbor(value, out);
+  return {r.ok, r.bytes_written, r.bytes_allocated};
 }
 
 // ---------------------------------------------------------------------
@@ -475,6 +599,82 @@ void run_payload(const Payload& p) {
   std::printf("  MB/s (from min): heap=%.1f noalloc=%.1f sax=%.1f tinycbor=%.1f qcbor=%.1f libcbor=%.1f\n",
               p.len / (heap_t.min_ns * 1e-3), p.len / (noalloc_t.min_ns * 1e-3), p.len / (sax_t.min_ns * 1e-3),
               p.len / (tiny_t.min_ns * 1e-3), p.len / (qcbor_t.min_ns * 1e-3), p.len / (libcbor_t.min_ns * 1e-3));
+
+  // ---------------------------------------------------------------------
+  // Encode: each library encodes the SAME already-decoded value back to
+  // bytes (built once here, outside the timed region, exactly like
+  // NoAlloc's pool above) -- isolating pure encode cost from however that
+  // library got its data in the first place. constexpr-cbor's own two
+  // tree modes already have their own native decoded value sitting there
+  // from the decode section above; QCBOR/libcbor have no persisted tree
+  // of their own, so each builds its native representation from the one
+  // shared heap CborValue instead (see each encoder's own comment for why
+  // that's the fair, apples-to-apples choice -- and why it's genuinely
+  // "encoding," not decode cost smuggled in, for libcbor specifically).
+  // tinycbor's encoder is measured separately (see decode_tinycbor's own
+  // comment above for why it can't be linked into this executable at
+  // all); SAX has no encoder at all -- it's decode-only by design -- and
+  // is excluded here, not forgotten.
+  pool.node_count_ = 0;
+  pool.ref_count_ = 0;
+  pool.byte_count_ = 0;
+  const auto heap_decoded = ConstexprCbor::decode_value(bytes);
+  const auto noalloc_decoded = ConstexprCbor::NoAlloc::decode_value(pool, bytes);
+  if (!heap_decoded || !noalloc_decoded) {
+    std::printf("  encode: skipped (decode for encode setup failed unexpectedly)\n");
+    return;
+  }
+  const ConstexprCbor::CborValue& value = heap_decoded->first;
+  const ConstexprCbor::NoAlloc::Node* noalloc_node = noalloc_decoded->node;
+
+  static std::array<std::uint8_t, 1 << 20> out_buf;  // 1 MiB, comfortably larger than any payload here
+
+  const auto heap_e = encode_heap(value);
+  const auto noalloc_e = encode_noalloc(pool, noalloc_node, out_buf);
+  const auto qcbor_e = encode_qcbor(value, out_buf);
+  const auto libcbor_e = encode_libcbor_checksum(value, out_buf);
+
+  std::printf("  encode ok:  heap=%d noalloc=%d qcbor=%d libcbor=%d\n", heap_e.ok, noalloc_e.ok, qcbor_e.ok,
+              libcbor_e.ok);
+  std::printf("  encoded bytes: heap=%zu noalloc=%zu qcbor=%zu libcbor=%zu (input was %zu; tinycbor measured "
+              "separately, see bench_tinycbor_encode)\n",
+              heap_e.bytes_written, noalloc_e.bytes_written, qcbor_e.bytes_written, libcbor_e.bytes_written, p.len);
+  std::printf("  libcbor bytes allocated/encode (tree build -- no streaming encoder): %lld\n",
+              libcbor_e.bytes_allocated);
+
+  TimingStats heap_et{std::numeric_limits<double>::infinity(), 0.0};
+  TimingStats noalloc_et = heap_et, qcbor_et = heap_et, libcbor_et = heap_et;
+
+  for (int i = 0; i < 5; ++i) {
+    (void)encode_heap(value);
+    (void)encode_noalloc(pool, noalloc_node, out_buf);
+    (void)encode_qcbor(value, out_buf);
+    (void)encode_libcbor_checksum(value, out_buf);
+  }
+
+  for (int round = 0; round < kRounds; ++round) {
+    const double h = time_one_round_ns_per_call([&] { (void)encode_heap(value); }, iters);
+    heap_et.min_ns = std::min(heap_et.min_ns, h);
+    heap_et.max_ns = std::max(heap_et.max_ns, h);
+    const double a = time_one_round_ns_per_call([&] { (void)encode_noalloc(pool, noalloc_node, out_buf); }, iters);
+    noalloc_et.min_ns = std::min(noalloc_et.min_ns, a);
+    noalloc_et.max_ns = std::max(noalloc_et.max_ns, a);
+    const double q = time_one_round_ns_per_call([&] { (void)encode_qcbor(value, out_buf); }, iters);
+    qcbor_et.min_ns = std::min(qcbor_et.min_ns, q);
+    qcbor_et.max_ns = std::max(qcbor_et.max_ns, q);
+    const double l = time_one_round_ns_per_call([&] { (void)encode_libcbor_checksum(value, out_buf); }, iters);
+    libcbor_et.min_ns = std::min(libcbor_et.min_ns, l);
+    libcbor_et.max_ns = std::max(libcbor_et.max_ns, l);
+  }
+
+  std::printf("  ns/encode (min, over %d rounds of %d calls): heap=%.0f noalloc=%.0f qcbor=%.0f libcbor=%.0f\n",
+              kRounds, iters, heap_et.min_ns, noalloc_et.min_ns, qcbor_et.min_ns, libcbor_et.min_ns);
+  std::printf("  ns/encode (max, same rounds -- spread vs. min is this run's noise):"
+              " heap=%.0f noalloc=%.0f qcbor=%.0f libcbor=%.0f\n",
+              heap_et.max_ns, noalloc_et.max_ns, qcbor_et.max_ns, libcbor_et.max_ns);
+  std::printf("  MB/s encode (from min, output bytes): heap=%.1f noalloc=%.1f qcbor=%.1f libcbor=%.1f\n",
+              heap_e.bytes_written / (heap_et.min_ns * 1e-3), noalloc_e.bytes_written / (noalloc_et.min_ns * 1e-3),
+              qcbor_e.bytes_written / (qcbor_et.min_ns * 1e-3), libcbor_e.bytes_written / (libcbor_et.min_ns * 1e-3));
 }
 
 }  // namespace

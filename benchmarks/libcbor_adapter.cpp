@@ -92,3 +92,92 @@ bool accepted_by_libcbor(std::span<const std::uint8_t> bytes) {
   if (root) cbor_decref(&root);
   return ok;
 }
+
+namespace {
+
+// Builds libcbor's own cbor_item_t tree from a CborValue -- libcbor has no
+// streaming encoder the way tinycbor/QCBOR do, so "encode via libcbor"
+// genuinely means "build a tree, then serialize it," the same DOM-only
+// shape its decode side already has. Each cbor_array_push/cbor_map_add
+// call increments its own reference to the child it's given (per
+// libcbor's own documented contract), so this decref's its local
+// reference immediately after handing it to the parent -- the parent's
+// own reference is what keeps it alive from here on.
+cbor_item_t* build_libcbor(const ConstexprCbor::CborValue& v) {
+  using CV = ConstexprCbor::CborValue;
+  return std::visit(
+      [](const auto& x) -> cbor_item_t* {
+        using T = std::decay_t<decltype(x)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+          return cbor_new_undef();
+        } else if constexpr (std::is_same_v<T, std::nullptr_t>) {
+          return cbor_new_null();
+        } else if constexpr (std::is_same_v<T, bool>) {
+          return cbor_build_bool(x);
+        } else if constexpr (std::is_same_v<T, std::uint64_t>) {
+          return cbor_build_uint64(x);
+        } else if constexpr (std::is_same_v<T, ConstexprCbor::NegativeInt>) {
+          return cbor_build_negint64(x.n);
+        } else if constexpr (std::is_same_v<T, CV::OwnedString>) {
+          if (x.kind == CV::StringKind::Text) {
+            return cbor_build_stringn(reinterpret_cast<const char*>(x.content.data()), x.content.size());
+          }
+          return cbor_build_bytestring(x.content.data(), x.content.size());
+        } else if constexpr (std::is_same_v<T, double>) {
+          return cbor_build_float8(x);
+        } else if constexpr (std::is_same_v<T, std::vector<CV>>) {
+          cbor_item_t* arr = cbor_new_definite_array(x.size());
+          for (const auto& e : x) {
+            cbor_item_t* child = build_libcbor(e);
+            if (!child) {
+              cbor_decref(&arr);
+              return nullptr;
+            }
+            cbor_array_push(arr, child);
+            cbor_decref(&child);
+          }
+          return arr;
+        } else if constexpr (std::is_same_v<T, std::vector<std::pair<CV, CV>>>) {
+          cbor_item_t* m = cbor_new_definite_map(x.size());
+          for (const auto& [k, val] : x) {
+            cbor_item_t* key = build_libcbor(k);
+            cbor_item_t* value = key ? build_libcbor(val) : nullptr;
+            if (!key || !value) {
+              if (key) cbor_decref(&key);
+              if (value) cbor_decref(&value);
+              cbor_decref(&m);
+              return nullptr;
+            }
+            cbor_map_add(m, cbor_pair{key, value});
+            cbor_decref(&key);
+            cbor_decref(&value);
+          }
+          return m;
+        } else if constexpr (std::is_same_v<T, CV::Tag>) {
+          cbor_item_t* child = build_libcbor(x.value.front());
+          if (!child) return nullptr;
+          cbor_item_t* tag = cbor_build_tag(x.number, child);
+          cbor_decref(&child);
+          return tag;
+        } else {
+          // BigNum/SimpleValue: not exercised by this benchmark's
+          // payloads (see gen_payloads.py) -- fail loud rather than
+          // silently encode something wrong if that ever changes.
+          return nullptr;
+        }
+      },
+      v.data);
+}
+
+}  // namespace
+
+LibcborEncodeResult encode_libcbor(const ConstexprCbor::CborValue& value, std::span<std::uint8_t> out) {
+  const long long before = alloc_delta_begin();
+  cbor_item_t* root = build_libcbor(value);
+  if (!root) return {false, 0, 0};
+  const std::size_t written = cbor_serialize(root, out.data(), out.size());
+  const long long after = alloc_delta_begin();  // root (and its whole subtree) is still alive here
+  cbor_decref(&root);
+  if (written == 0) return {false, 0, 0};
+  return {true, written, after - before};
+}

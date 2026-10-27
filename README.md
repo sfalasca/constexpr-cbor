@@ -592,9 +592,10 @@ bignums, tags, non-string map keys) are rendered.
 
 `benchmarks/` compares this library's three decode paths (heap,
 no-malloc `NoAlloc`, and event-based `Sax`) against tinycbor, QCBOR, and
-libcbor on CPU performance, memory usage, correctness, and flexibility,
-with real numbers from a reproducible Docker build (`docker build -t
-cbor-bench -f benchmarks/Dockerfile . && docker run --rm cbor-bench`).
+libcbor on CPU performance (decode *and* encode), memory usage,
+correctness, and flexibility, with real numbers from a reproducible
+Docker build (`docker build -t cbor-bench -f benchmarks/Dockerfile . &&
+docker run --rm cbor-bench`).
 This isn't a statistically rigorous benchmark (one container run, not a
 sampled distribution across hosts) and it isn't trying to crown one
 library "better" — the point is to make real tradeoffs (code size vs.

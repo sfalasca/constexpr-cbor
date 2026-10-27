@@ -11,6 +11,11 @@
 #include <cstdint>
 #include <span>
 
+// constexpr_cbor.hpp itself is fine to include here -- the symbol
+// collision above is specifically with tinycbor's header, not with this
+// project's own code.
+#include "constexpr_cbor.hpp"
+
 struct LibcborDecodeResult {
   bool ok;
   std::uint64_t items;
@@ -23,3 +28,18 @@ struct LibcborDecodeResult {
 LibcborDecodeResult decode_libcbor(std::span<const std::uint8_t> bytes);
 
 bool accepted_by_libcbor(std::span<const std::uint8_t> bytes);
+
+struct LibcborEncodeResult {
+  bool ok;
+  std::size_t bytes_written;
+  long long bytes_allocated;  // building libcbor's own tree from `value` -- libcbor has no
+                               // streaming encoder, so this is genuinely part of "encoding"
+                               // via its API, not a decode cost being smuggled in
+};
+
+// Builds libcbor's own cbor_item_t tree from `value` (the same shared,
+// already-decoded ConstexprCbor::CborValue every other library's encode
+// benchmark builds its native representation from) and serializes it into
+// `out` -- see libcbor_adapter.cpp for why tree-construction time counts
+// as encode cost here specifically.
+LibcborEncodeResult encode_libcbor(const ConstexprCbor::CborValue& value, std::span<std::uint8_t> out);
