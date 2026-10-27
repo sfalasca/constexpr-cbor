@@ -179,9 +179,24 @@ consteval bool test_tag_chain_respects_max_depth() {
 static_assert(test_tag_chain_respects_max_depth());
 
 // Malformed input (truncated array header) is a clean refusal, not UB.
+// Returns the ErrorReason of the first Error event in the stream, or
+// MaxDepthExceeded (an arbitrary sentinel distinct from TruncatedInput)
+// if decode actually succeeded -- used only by tests that already assert
+// failure via sax_decode_ok() first, so this fallback is never exercised.
+constexpr ErrorReason sax_first_error_reason(std::span<const std::uint8_t> bytes) {
+  for (auto ev : SaxRange<32>{bytes}) {
+    if (ev.kind == EventKind::Error) return ev.error.reason;
+  }
+  return ErrorReason::MaxDepthExceeded;
+}
+
 consteval bool test_decode_refuses_truncated_input() {
   constexpr std::uint8_t vec[] = {0x9f, 0x01};  // indefinite array, never closed
   expect_false<sax_decode_ok(vec)>();
+  // All three decode paths (heap/NoAlloc/SAX) now share one error
+  // vocabulary -- this is the same ErrorReason the heap/NoAlloc decoders
+  // would report for the same shape of truncation.
+  expect_eq<sax_first_error_reason(vec), ErrorReason::TruncatedInput>();
   return true;
 }
 static_assert(test_decode_refuses_truncated_input());
@@ -196,6 +211,13 @@ constexpr bool sax_decode_ok_with_policy_reject(std::span<const std::uint8_t> by
     if (ev.kind == EventKind::Error) return false;
   }
   return true;
+}
+
+constexpr ErrorReason sax_reject_error_reason(std::span<const std::uint8_t> bytes) {
+  for (auto ev : (SaxRange<32, 4, NoUtf8Validation, RejectDuplicateKeys>{bytes})) {
+    if (ev.kind == EventKind::Error) return ev.error.reason;
+  }
+  return ErrorReason::MaxDepthExceeded;  // unreachable given this test's own usage
 }
 
 constexpr std::size_t sax_event_count_keep_first(std::span<const std::uint8_t> bytes) {
@@ -221,6 +243,7 @@ constexpr std::uint64_t sax_nth_uint_value_keep_first(std::span<const std::uint8
 consteval bool test_duplicate_key_policies() {
   constexpr std::uint8_t vec[] = {0xa2, 0x01, 0x02, 0x01, 0x03};  // {1: 2, 1: 3}
   expect_false<sax_decode_ok_with_policy_reject(vec)>();
+  expect_eq<sax_reject_error_reason(vec), ErrorReason::DuplicateKey>();
   // KeepFirstDuplicateKey: the second pair's events are dropped entirely --
   // BeginMap, key 1, value 2, EndMap (the duplicate pair never surfaces).
   expect_eq<sax_event_count_keep_first(vec), std::size_t{4}>();
@@ -239,9 +262,17 @@ constexpr bool sax_decode_ok_tiny_key_capacity(std::span<const std::uint8_t> byt
   return true;
 }
 
+constexpr ErrorReason sax_tiny_key_capacity_error_reason(std::span<const std::uint8_t> bytes) {
+  for (auto ev : (SaxRange<32, 1, NoUtf8Validation, RejectDuplicateKeys>{bytes})) {
+    if (ev.kind == EventKind::Error) return ev.error.reason;
+  }
+  return ErrorReason::MaxDepthExceeded;  // unreachable given this test's own usage
+}
+
 consteval bool test_duplicate_key_tracking_capacity_exhausted() {
   constexpr std::uint8_t vec[] = {0xa2, 0x01, 0x02, 0x03, 0x04};  // {1: 2, 3: 4}, two distinct keys
   expect_false<sax_decode_ok_tiny_key_capacity(vec)>();
+  expect_eq<sax_tiny_key_capacity_error_reason(vec), ErrorReason::KeyTrackingCapacityExhausted>();
   return true;
 }
 static_assert(test_duplicate_key_tracking_capacity_exhausted());

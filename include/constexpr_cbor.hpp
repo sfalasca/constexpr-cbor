@@ -57,6 +57,7 @@ enum class ErrorReason {
   ByteCapacityExhausted,  // NoAlloc only (decode-side storage, or NoAllocBuilder's
                           // make_text/make_bytes)
   CountOverflow,          // NoAlloc only -- checked_node_count's uint64_t->size_t / *2 guard
+  KeyTrackingCapacityExhausted,  // Sax only -- SaxRange's MaxTrackedKeys exhausted
   OutputBufferTooSmall,   // encode_value (NoAlloc only -- heap's std::vector can't fail this way)
 };
 

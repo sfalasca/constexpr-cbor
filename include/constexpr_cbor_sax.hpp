@@ -77,6 +77,8 @@ struct Event {
   double float_value = 0.0;            // Float
   std::span<const std::uint8_t> bytes{};  // TextString/ByteString content -- zero-copy, same as decode_byte_string
   std::uint8_t simple_value = 0;       // Simple
+  Error error{};                       // Error only -- the same reason+offset type the heap/NoAlloc
+                                        // decoders report, so all three paths share one error vocabulary
 };
 
 namespace detail {
@@ -185,9 +187,9 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
     constexpr bool operator==(Sentinel) const { return at_end; }
 
    private:
-    constexpr void set_error() {
+    constexpr void set_error(ErrorReason reason, std::size_t offset) {
       errored = true;
-      current = Event{.kind = EventKind::Error};
+      current = Event{.kind = EventKind::Error, .error = Error{.reason = reason, .offset = offset}};
     }
 
     // Returns true if `key_span`'s bytes match one of the keys already
@@ -230,19 +232,19 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
     // (a tag, a scalar, or a container-begin) and writes it into `current`.
     constexpr void decode_one_item(EventContext ctx) {
       if (pos >= bytes.size()) {
-        set_error();
+        set_error(ErrorReason::TruncatedInput, pos);
         return;
       }
       const auto rest = bytes.subspan(pos);
       const std::uint8_t major_type = rest[0] >> 5;
       if (major_type == 6) {
         if (nesting_budget_used >= MaxDepth) {
-          set_error();
+          set_error(ErrorReason::MaxDepthExceeded, pos);
           return;
         }
         const auto len = decode_length(rest);
         if (!len) {
-          set_error();
+          set_error(len.error().reason, pos + len.error().offset);
           return;
         }
         ++pending_tag_depth;
@@ -255,7 +257,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
         case 0: {
           const auto u = decode_uint(rest);
           if (!u) {
-            set_error();
+            set_error(u.error().reason, pos + u.error().offset);
             return;
           }
           pos += u->bytes_consumed;
@@ -267,7 +269,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
         case 1: {
           const auto n = decode_negint(rest);
           if (!n) {
-            set_error();
+            set_error(n.error().reason, pos + n.error().offset);
             return;
           }
           pos += n->bytes_consumed;
@@ -279,7 +281,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
         case 2: {
           const auto b = decode_byte_string(rest);
           if (!b) {
-            set_error();
+            set_error(b.error().reason, pos + b.error().offset);
             return;
           }
           pos += b->bytes_consumed;
@@ -291,7 +293,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
         case 3: {
           const auto s = decode_text_string<Utf8Policy>(rest);
           if (!s) {
-            set_error();
+            set_error(s.error().reason, pos + s.error().offset);
             return;
           }
           pos += s->bytes_consumed;
@@ -303,7 +305,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
         case 4:
         case 5: {
           if (nesting_budget_used >= MaxDepth || depth >= MaxDepth) {
-            set_error();
+            set_error(ErrorReason::MaxDepthExceeded, pos);
             return;
           }
           std::uint64_t count = 0;
@@ -314,7 +316,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
           } else {
             const auto len = decode_length(rest);
             if (!len) {
-              set_error();
+              set_error(len.error().reason, pos + len.error().offset);
               return;
             }
             count = len->value;
@@ -341,7 +343,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
         case 7: {
           const auto s = decode_simple(rest);
           if (!s) {
-            set_error();
+            set_error(s.error().reason, pos + s.error().offset);
             return;
           }
           pos += s->bytes_consumed;
@@ -371,7 +373,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
           return;
         }
         default:
-          set_error();
+          set_error(ErrorReason::MalformedHeader, pos);
           return;
       }
     }
@@ -408,13 +410,14 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
       for (;;) {
         const auto key_len = skip_item<MaxDepth>(bytes.subspan(pos));
         if (!key_len) {
-          set_error();
+          set_error(key_len.error().reason, pos + key_len.error().offset);
           return false;
         }
         const auto key_span = bytes.subspan(pos, *key_len);
         if (!is_tracked_duplicate(frame, key_span)) {
           if (tracked_keys_used >= MaxTrackedKeys) {
-            set_error();  // capacity exhaustion is a clean refusal, same stance as NodePool's
+            // capacity exhaustion is a clean refusal, same stance as NodePool's
+            set_error(ErrorReason::KeyTrackingCapacityExhausted, pos);
             return false;
           }
           tracked_keys[tracked_keys_used] = detail::KeySpan{.offset = pos, .length = *key_len};
@@ -424,11 +427,11 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
         }
         const auto value_len = skip_item<MaxDepth>(bytes.subspan(pos + *key_len));
         if (!value_len) {
-          set_error();
+          set_error(value_len.error().reason, pos + *key_len + value_len.error().offset);
           return false;
         }
         if (!KeyPolicy::on_duplicate()) {
-          set_error();  // RejectDuplicateKeys
+          set_error(ErrorReason::DuplicateKey, pos);  // RejectDuplicateKeys
           return false;
         }
         pos += *key_len + *value_len;
@@ -455,7 +458,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
             bool exhausted;
             if (top.indefinite) {
               if (pos >= bytes.size()) {
-                set_error();
+                set_error(ErrorReason::TruncatedInput, pos);
                 return;
               }
               exhausted = bytes[pos] == 0xff;
