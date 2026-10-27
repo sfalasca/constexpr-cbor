@@ -40,6 +40,7 @@ set(positive_test_sources
     test_ergonomics_builder.cpp
     test_ergonomics_get.cpp
     test_ergonomics_adl.cpp
+    test_ergonomics_cbor_fields.cpp
     test_noalloc_view.cpp
     test_noalloc_builder.cpp
     test_sax.cpp
@@ -138,7 +139,7 @@ add_compile_failure_test_with_values(wrong_shape_keep_last_duplicate_key_sax
 
 add_compile_failure_test_with_values(ergonomics_get_unregistered_type
     expected_failures/ergonomics_get_unregistered_type.cpp LABELS policy
-    EXPECT "No from_cbor(const CborValue&, T&) found via ADL and no CborSerializer<T> specialization provided")
+    EXPECT "No from_cbor(const CborValue&, T&) found via ADL, no cbor_fields<T>() specialization, and no CborSerializer<T> specialization provided")
 
 add_compile_failure_test(expect_eq_wrong_decoded_value
     expected_failures/expect_eq_wrong_decoded_value.cpp LABELS sanity)

@@ -662,6 +662,23 @@ constexpr Expected<std::size_t, Error> skip_item(std::span<const std::uint8_t> b
 template <typename T, typename = void>
 struct CborSerializer;
 
+// Reflection-style customization point, declaration only: a user specializes
+// this (inside namespace ConstexprCbor, mirroring how CborSerializer<T>
+// itself is specialized) to describe T's fields as a tuple of (name, member
+// pointer) pairs, e.g.:
+//
+//   namespace ConstexprCbor {
+//   template <> constexpr auto cbor_fields<mylib::Point>() {
+//     return std::tuple{std::pair{"x", &mylib::Point::x},
+//                        std::pair{"y", &mylib::Point::y}};
+//   }
+//   }
+//
+// CborSerializer<T>'s default implementation builds a generic to_cbor/
+// from_cbor from it when T has no ADL to_cbor/from_cbor hook -- see below.
+template <typename T>
+auto cbor_fields();
+
 struct CborValue;
 
 // ---------------------------------------------------------------------------
@@ -1126,26 +1143,112 @@ template <typename T>
 constexpr bool call_from_cbor(const CborValue& in, T& value) {
   return from_cbor(in, value);
 }
+
+// cbor_fields<T>() reflection: a second, lower-priority fallback behind the
+// ADL hooks above. HasCborFields<T> is true exactly when a user has
+// specialized cbor_fields<T>() for T (the unspecialized primary template
+// declared above has no definition, so calling it for any other T is a
+// substitution failure here, not a link error).
+template <typename T>
+concept HasCborFields = requires { cbor_fields<T>(); };
+
+// Pulls the member's value type out of a `Member T::*` pointer type, so
+// cbor_fields_from_cbor knows what to .get<>() for each field.
+template <typename M>
+struct member_pointer_value_type;
+template <typename C, typename M>
+struct member_pointer_value_type<M C::*> {
+  using type = M;
+};
+template <typename M>
+using member_pointer_value_type_t = typename member_pointer_value_type<std::remove_cvref_t<M>>::type;
+
+template <typename T>
+constexpr bool cbor_fields_to_cbor(CborValue& out, const T& value) {
+  std::vector<std::pair<CborValue, CborValue>> entries;
+  std::apply(
+      [&](auto const&... field) {
+        (entries.emplace_back(CborValue(std::string_view(field.first)), CborValue(value.*(field.second))), ...);
+      },
+      cbor_fields<T>());
+  out = CborValue(std::move(entries));
+  return true;
+}
+
+template <typename T>
+constexpr bool cbor_fields_from_cbor(const CborValue& in, T& value) {
+  // CborValue::get<T>() only recognizes a fixed set of canonical scalar
+  // types (bool/uint64_t/int64_t/double/string/vector<uint8_t>/...), not
+  // every arithmetic type a member might actually be declared as (e.g.
+  // `int`, `float`, `unsigned short`) -- the same reason the hand-written
+  // ADL fixtures decode through std::int64_t and narrow afterwards instead
+  // of calling .get<int>() directly. Mirror that here per field.
+  bool ok = true;
+  std::apply(
+      [&](auto const&... field) {
+        ([&] {
+           using Member = member_pointer_value_type_t<decltype(field.second)>;
+           const CborValue& field_value = in[std::string_view(field.first)];
+           if constexpr (std::same_as<Member, bool>) {
+             auto decoded = field_value.get<bool>();
+             if (!decoded) {
+               ok = false;
+               return;
+             }
+             value.*(field.second) = *decoded;
+           } else if constexpr (std::integral<Member>) {
+             auto decoded = field_value.get<std::int64_t>();
+             if (!decoded) {
+               ok = false;
+               return;
+             }
+             value.*(field.second) = static_cast<Member>(*decoded);
+           } else if constexpr (std::floating_point<Member>) {
+             auto decoded = field_value.get<double>();
+             if (!decoded) {
+               ok = false;
+               return;
+             }
+             value.*(field.second) = static_cast<Member>(*decoded);
+           } else {
+             auto decoded = field_value.template get<Member>();
+             if (!decoded) {
+               ok = false;
+               return;
+             }
+             value.*(field.second) = *decoded;
+           }
+         }(),
+         ...);
+      },
+      cbor_fields<T>());
+  return ok;
+}
 }  // namespace detail
 
 template <typename T, typename>
 struct CborSerializer {
   static constexpr bool to_cbor(CborValue& out, const T& value) {
-    static_assert(detail::HasFreeToCbor<T>,
-                  "No to_cbor(CborValue&, const T&) found via ADL and no CborSerializer<T> specialization provided");
     if constexpr (detail::HasFreeToCbor<T>) {
       return detail::call_to_cbor(out, value);
+    } else if constexpr (detail::HasCborFields<T>) {
+      return detail::cbor_fields_to_cbor(out, value);
     } else {
+      static_assert(detail::HasFreeToCbor<T> || detail::HasCborFields<T>,
+                    "No to_cbor(CborValue&, const T&) found via ADL, no cbor_fields<T>() specialization, and no "
+                    "CborSerializer<T> specialization provided");
       return false;
     }
   }
   static constexpr bool from_cbor(const CborValue& in, T& value) {
-    static_assert(
-        detail::HasFreeFromCbor<T>,
-        "No from_cbor(const CborValue&, T&) found via ADL and no CborSerializer<T> specialization provided");
     if constexpr (detail::HasFreeFromCbor<T>) {
       return detail::call_from_cbor(in, value);
+    } else if constexpr (detail::HasCborFields<T>) {
+      return detail::cbor_fields_from_cbor(in, value);
     } else {
+      static_assert(detail::HasFreeFromCbor<T> || detail::HasCborFields<T>,
+                    "No from_cbor(const CborValue&, T&) found via ADL, no cbor_fields<T>() specialization, and no "
+                    "CborSerializer<T> specialization provided");
       return false;
     }
   }

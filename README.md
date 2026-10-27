@@ -494,34 +494,71 @@ CborValue bytes = CborValue::binary(some_span);  // byte strings need an explici
                                                    // same ambiguity nlohmann's json::binary solves
 ```
 
-**User types**, via ADL hooks mirroring nlohmann's `adl_serializer`
-(`to_cbor`/`from_cbor` found unqualified in the type's own namespace, or a
-`CborSerializer<T>` specialization for types you can't attach a free
-function to):
+**User types**, via three customization points, tried in this order —
+mirroring nlohmann's `adl_serializer` pattern, extended with one more
+option for the common case of a plain aggregate struct:
 
-```cpp
-namespace mylib {
-struct Point { int x, y; };
-constexpr bool to_cbor(CborValue& out, const Point& p) {
-  out = CborValue::object({{"x", p.x}, {"y", p.y}});
-  return true;
-}
-constexpr bool from_cbor(const CborValue& in, Point& p) {
-  auto x = in["x"].get<std::int64_t>(), y = in["y"].get<std::int64_t>();
-  if (!x || !y) return false;
-  p = {static_cast<int>(*x), static_cast<int>(*y)};
-  return true;
-}
-}
+1. **`cbor_fields<T>()` reflection** (recommended for plain aggregate
+   structs with no custom (de)serialization logic): specialize this
+   function template to list each field as a `(name, member pointer)`
+   pair, and `CborSerializer<T>`'s default implementation builds a
+   working `to_cbor`/`from_cbor` pair from it on its own — no hand-written
+   conversion code at all:
 
-CborValue v = mylib::Point{3, 4};
-auto p = v.get<mylib::Point>();  // Expected<mylib::Point, Error>
-```
+   ```cpp
+   namespace mylib {
+   struct Point { int x, y; };
+   }
 
-A `.get<T>()` call for a `T` with no built-in support, no ADL hook, and no
-`CborSerializer<T>` specialization is a **compile error** — the one place
-this interface is allowed to hard-fail at compile time (a template
-instantiation failure, not a runtime/consteval-execution-time one).
+   namespace ConstexprCbor {
+   template <>
+   constexpr auto cbor_fields<mylib::Point>() {
+     return std::tuple{std::pair{"x", &mylib::Point::x}, std::pair{"y", &mylib::Point::y}};
+   }
+   }
+
+   CborValue v = mylib::Point{3, 4};
+   auto p = v.get<mylib::Point>();  // Expected<mylib::Point, Error>
+   ```
+
+2. **ADL hooks** (`to_cbor`/`from_cbor` found unqualified in the type's
+   own namespace): reach for this when a type needs custom logic, or when
+   the CBOR shape shouldn't mirror the struct's fields one-to-one:
+
+   ```cpp
+   namespace mylib {
+   struct Point { int x, y; };
+   constexpr bool to_cbor(CborValue& out, const Point& p) {
+     out = CborValue::object({{"x", p.x}, {"y", p.y}});
+     return true;
+   }
+   constexpr bool from_cbor(const CborValue& in, Point& p) {
+     auto x = in["x"].get<std::int64_t>(), y = in["y"].get<std::int64_t>();
+     if (!x || !y) return false;
+     p = {static_cast<int>(*x), static_cast<int>(*y)};
+     return true;
+   }
+   }
+
+   CborValue v = mylib::Point{3, 4};
+   auto p = v.get<mylib::Point>();  // Expected<mylib::Point, Error>
+   ```
+
+3. **`CborSerializer<T>` specialization** — the escape hatch for a type
+   you can't attach a free function to at all (third-party/std types):
+   specialize `ConstexprCbor::CborSerializer<T>` directly with static
+   `to_cbor`/`from_cbor` members matching the same signatures.
+
+**Precedence**: if a type has both an ADL hook and a `cbor_fields<T>()`
+specialization, the ADL hook wins — `cbor_fields` is only consulted when
+no ADL hook is found. A `CborSerializer<T>` full specialization bypasses
+both (it's never reached through the default implementation at all).
+
+A `.get<T>()` call for a `T` with no built-in support, no ADL hook, no
+`cbor_fields<T>()` specialization, and no `CborSerializer<T>`
+specialization is a **compile error** — the one place this interface is
+allowed to hard-fail at compile time (a template instantiation failure,
+not a runtime/consteval-execution-time one).
 
 **NoAlloc (`ConstexprCbor::NoAlloc::NoAllocView`)**: the same read-only surface
 (`is_*()`/`operator[]`/`.get<T>()`/iteration/`.items()`), via

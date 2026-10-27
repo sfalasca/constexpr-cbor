@@ -40,6 +40,29 @@ constexpr bool from_cbor(const CborValue& in, Point& p) {
   return true;
 }
 
+// A second user type, this one hooked in via cbor_fields<T>() reflection
+// instead of hand-written to_cbor/from_cbor: specializing cbor_fields<T>()
+// to list each field's name and member pointer is enough for
+// CborSerializer<T>'s default implementation to build a working to_cbor/
+// from_cbor pair on its own. The right choice for plain aggregate structs
+// with no custom (de)serialization logic -- reach for the ADL hook above
+// instead when a type needs its own logic, or when the CBOR shape
+// shouldn't mirror the struct's fields one-to-one.
+struct Vec3 {
+  double x, y, z;
+};
+
+}  // namespace
+
+namespace ConstexprCbor {
+template <>
+constexpr auto cbor_fields<Vec3>() {
+  return std::tuple{std::pair{"x", &Vec3::x}, std::pair{"y", &Vec3::y}, std::pair{"z", &Vec3::z}};
+}
+}  // namespace ConstexprCbor
+
+namespace {
+
 void decode_and_inspect() {
   std::cout << "--- decode + ergonomic access ---\n";
 
@@ -94,6 +117,14 @@ void user_type_hook() {
   std::cout << "Point round-trip: (" << p->x << ", " << p->y << ")\n";
 }
 
+void user_type_cbor_fields() {
+  std::cout << "\n--- user-type reflection hook (cbor_fields<T>()) ---\n";
+
+  const CborValue encoded = Vec3{1.0, 2.0, 3.0};  // implicit conversion, no hand-written to_cbor
+  const auto v = encoded.get<Vec3>();             // explicit conversion, no hand-written from_cbor
+  std::cout << "Vec3 round-trip: (" << v->x << ", " << v->y << ", " << v->z << ")\n";
+}
+
 void policy_choices() {
   std::cout << "\n--- pluggable UTF-8 / duplicate-key policies ---\n";
 
@@ -144,6 +175,7 @@ int main() {
   decode_and_inspect();
   build_and_encode();
   user_type_hook();
+  user_type_cbor_fields();
   policy_choices();
   inspect_a_decode_error();
   return 0;

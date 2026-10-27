@@ -5,8 +5,9 @@ stand on its own (not just a cross-reference into the main README):
 
 - `heap_example.cpp` — `ConstexprCbor::decode_value`/`CborValue`: the
   default, most ergonomic mode. Decode + ergonomic access, brace-init
-  construction + canonical re-encode, a user-type ADL hook
-  (`to_cbor`/`from_cbor`), and the pluggable UTF-8/duplicate-key policies.
+  construction + canonical re-encode, two user-type hooks (an ADL
+  `to_cbor`/`from_cbor` pair and the `cbor_fields<T>()` reflection
+  shortcut), and the pluggable UTF-8/duplicate-key policies.
 - `noalloc_example.cpp` — `ConstexprCbor::NoAlloc`: zero heap allocation,
   decoding into caller-owned storage. The same ergonomic access via
   `NoAllocView`, the raw `NodePool`/`Node*` API underneath it,
