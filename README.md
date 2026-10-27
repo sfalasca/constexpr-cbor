@@ -138,19 +138,19 @@ UTF-8 policy above:
 - `KeepFirstDuplicateKey` — first occurrence wins.
 - `KeepLastDuplicateKey` — last occurrence wins (overwrite semantics).
 
-## No-malloc decoding/encoding (`ConstexprCbor::Arena`)
+## No-malloc decoding/encoding (`ConstexprCbor::NoAlloc`)
 
 `decode_value`/`encode_value` above rely on `std::vector<CborValue>` permitting
 an incomplete element type, which is exactly what makes a recursive value type
 possible without a heap pointer indirection of some kind — but it does mean a
-heap. For environments without one at all, `ConstexprCbor::Arena` (in its own
+heap. For environments without one at all, `ConstexprCbor::NoAlloc` (in its own
 header, `include/constexpr_cbor_noalloc.hpp`) is the no-malloc counterpart: every
 decoded value is a `Node` living in storage the *caller* owns and sizes —
-`ArenaStorage<MaxNodes, MaxRefs, MaxBytes>` bundles a `Node[]`, a `Node*[]`
+`NoAllocStorage<MaxNodes, MaxRefs, MaxBytes>` bundles a `Node[]`, a `Node*[]`
 reference-slot array (see below), and a flat byte array for string/bignum
 content. `NodePool` is a small, non-owning view over those three spans — the
 actual allocator, not the storage itself — so the one thing this whole design
-rests on is that the caller's `ArenaStorage` outlives every decoded reference
+rests on is that the caller's `NoAllocStorage` outlives every decoded reference
 into it; see "Running out of capacity, and the buffer-lifetime precondition"
 below for exactly what that means and how `NodePool` defensively checks for it.
 
@@ -164,10 +164,10 @@ including one and never touching the other costs nothing: unused templates
 generate no code. A project that wants both just includes both (or includes
 only `constexpr_cbor_noalloc.hpp`, since that already gets both) — doing so is
 exactly how `RejectDuplicateKeys`/`KeepFirstDuplicateKey`/`KeepLastDuplicateKey`
-end up usable with *both* `decode_value` and `Arena::decode_value`: each is
+end up usable with *both* `decode_value` and `NoAlloc::decode_value`: each is
 the same type in both headers (see "Pluggable duplicate-map-key policies" above
-for the Arena-shaped overload each one also provides), not a parallel
-Arena-only copy of each.
+for the NoAlloc-shaped overload each one also provides), not a parallel
+NoAlloc-only copy of each.
 
 ```cpp
 #include "constexpr_cbor_noalloc.hpp"
@@ -177,14 +177,14 @@ using namespace ConstexprCbor;
 constexpr std::uint8_t bytes[] = {0x83, 0x01, 0x02, 0x03};  // [1, 2, 3]
 
 consteval bool round_trips() {
-    Arena::ArenaStorage<16, 16, 16> storage;     // 16 nodes, 16 ref slots, 16 content bytes -- sized by the caller
+    NoAlloc::NoAllocStorage<16, 16, 16> storage;     // 16 nodes, 16 ref slots, 16 content bytes -- sized by the caller
     auto pool = storage.make_pool();
-    const auto decoded = Arena::decode_value(pool, bytes);
+    const auto decoded = NoAlloc::decode_value(pool, bytes);
     if (!decoded) return false;
-    const auto& items = std::get<Arena::ArrayRef>(decoded->node->data);
+    const auto& items = std::get<NoAlloc::ArrayRef>(decoded->node->data);
     if (items.count != 3) return false;
     std::array<std::uint8_t, 16> out{};
-    const auto written = Arena::encode_value(pool, decoded->node, out);
+    const auto written = NoAlloc::encode_value(pool, decoded->node, out);
     return written && std::equal(out.begin(), out.begin() + *written, bytes);
 }
 
@@ -199,7 +199,7 @@ What's structurally different from the heap-based API, and why:
   matter how it's declared. Here that's a pointer into caller-owned storage
   rather than a heap pointer: a `Node` never contains another `Node` by value,
   only by pointer (`ArrayRef`/`MapRef`/`TagRef` hold pointers, not nested
-  values) — safe precisely because the caller's `ArenaStorage` is guaranteed
+  values) — safe precisely because the caller's `NoAllocStorage` is guaranteed
   not to move or be destroyed while any decoded tree into it is alive (see
   below).
 - **Arrays and maps need their N children as a contiguous run of slots**, so a
@@ -208,13 +208,13 @@ What's structurally different from the heap-based API, and why:
   decoded, and a child's own node count isn't known until it's actually decoded
   (a nested array needs however many nodes its own subtree needs). The fix is
   a dedicated reference-slot array, separate from the `Node` storage itself
-  (`ArenaStorage`'s `Node*[]`, sized independently via `MaxRefs`): each slot is
+  (`NoAllocStorage`'s `Node*[]`, sized independently via `MaxRefs`): each slot is
   a bare 8-byte pointer, resolved directly by `NodePool::child`/`map_key`/
   `map_value` with no further indirection, and the child's real (possibly
   far-away, possibly many-node) subtree lives wherever it was actually decoded.
 - **Indefinite-length arrays/maps don't know their count upfront at all** (no
   length marker, just items until a `0xFF` break), yet still need that same
-  contiguous reservation before decoding any child. `Arena::skip_item` is a
+  contiguous reservation before decoding any child. `NoAlloc::skip_item` is a
   non-allocating structural walker that pre-counts them in a first pass, so
   the real decode can reserve the right-sized block before its second pass.
   This is a genuine extra cost indefinite-length forms pay here that they
@@ -222,32 +222,32 @@ What's structurally different from the heap-based API, and why:
   **O(n) extra structural work**, not a second allocation pass — `skip_item`
   never calls into `NodePool` at all.
 - **Chunked (indefinite-length) byte/text strings** still work: each chunk is
-  appended directly into the pool's flat byte arena via repeated
+  appended directly into the pool's flat byte storage via repeated
   `allocate_bytes` calls, the same incremental-append discipline the
   heap-based decoder's `content.insert()` uses, just writing into a
   fixed-capacity array instead of growing a `std::vector`.
 - **Duplicate-map-key policies work here too, via a different mechanism.** The
   heap-based `KeyPolicy` re-scans a flat `std::vector<pair<CborValue, CborValue>>`
-  of entries seen so far; an arena map has no such flat, directly-comparable
+  of entries seen so far; a no-malloc map has no such flat, directly-comparable
   container (keys/values are scattered across whatever subtrees their own
-  recursive decode needed), so `Arena::decode_value` instead compares each new
-  key structurally (`Arena::node_equal`, a recursive by-pointer equality covering
+  recursive decode needed), so `NoAlloc::decode_value` instead compares each new
+  key structurally (`NoAlloc::node_equal`, a recursive by-pointer equality covering
   every alternative, including composite Array/Map/Tag keys) against the keys
   already written, and calls the same `KeyPolicy::on_duplicate` — through its
-  Arena-shaped overload — on a match. `KeepFirstDuplicateKey` simply doesn't
+  NoAlloc-shaped overload — on a match. `KeepFirstDuplicateKey` simply doesn't
   advance the write cursor for the dropped pair; `KeepLastDuplicateKey`
   overwrites the earlier pair's value slot in place. Reserved-but-unused
   trailing slots from dropped pairs are harmless (`MapRef.count` only ever
   covers the pairs actually written).
 - **Running out of `MaxNodes`, `MaxRefs`, or `MaxBytes` is a refusal**
   (`std::nullopt`), exactly like a malformed-input refusal elsewhere in this
-  library — never a crash or a silent truncation. Sizing `ArenaStorage` is the
-  caller's job, the same way sizing an output buffer for `Arena::encode_value`
+  library — never a crash or a silent truncation. Sizing `NoAllocStorage` is the
+  caller's job, the same way sizing an output buffer for `NoAlloc::encode_value`
   is. `MaxRefs` is independent of `MaxNodes`: every node that's ever an
   array/map child needs one reference slot, so `MaxRefs == MaxNodes` is a safe
   default, but a caller decoding shallow, mostly-scalar data can size it
   smaller.
-- **`Arena::encode_value` writes into a caller-supplied `std::span<std::uint8_t>`**
+- **`NoAlloc::encode_value` writes into a caller-supplied `std::span<std::uint8_t>`**
   instead of returning a `std::vector`, returning how many bytes it used or
   `std::nullopt` if the buffer was too small — never a truncated or
   out-of-bounds write. Like the heap-based encoder, it always emits the
@@ -257,44 +257,44 @@ What's structurally different from the heap-based API, and why:
 - **A CBOR length field is checked before it's ever cast to `std::size_t`.**
   The wire format allows an array/map to claim up to 2^64-1 items, but the
   reference-slot array indexes with `std::size_t`, which can be narrower than
-  64 bits (32 on common embedded targets). `Arena::decode_value` reserves
+  64 bits (32 on common embedded targets). `NoAlloc::decode_value` reserves
   reference slots for a whole array/map's children *before* decoding any of
   them, so a silently-truncating cast there would be the exact shape of
   libcbor PR #387's bug: a huge count wraps to a small one, the reservation
   "succeeds" against that undersized number, and the loop — which still
   iterates the real, untruncated count — writes past it.
-  `Arena::detail::checked_node_count` refuses (`std::nullopt`) instead, the
+  `NoAlloc::detail::checked_node_count` refuses (`std::nullopt`) instead, the
   same contract every other refusal in this codec uses; it also guards the
   `*2` a map's key+value slot pairs need.
 - **Running out of capacity, and the buffer-lifetime precondition.** Every
   `Node*` this file ever hands back is a raw, unchecked pointer into whatever
-  `ArenaStorage` the caller constructed `NodePool` over — safe as long as that
+  `NoAllocStorage` the caller constructed `NodePool` over — safe as long as that
   storage outlives every decoded reference into it, which is a precondition
   the caller upholds, not something `NodePool` can enforce structurally (a
   `unique_ptr` doesn't help here: it implies heap ownership, which doesn't
-  apply to a stack-resident `ArenaStorage` at all, and the actual contract —
+  apply to a stack-resident `NoAllocStorage` at all, and the actual contract —
   "don't move or destroy this while a decoded tree points into it" — isn't
   something any smart pointer adds over a plain reference; a moving-buffer
   content check doesn't help either, since the content just moves with it).
   As a defensive, best-effort check against a narrower, genuinely catchable
   mistake, `NodePool::owns(const Node*)` checks — via pure address-range
   comparison, never a dereference — whether a given pointer actually falls
-  inside *this* pool's own node storage, and `ARENA_ASSERT(owns(...))` (a
+  inside *this* pool's own node storage, and `NOALLOC_ASSERT(owns(...))` (a
   thin `assert()` wrapper, stripped under `NDEBUG`) guards every place a
   `Node*` crosses back into the library (`child`/`map_key`/`map_value`/
-  `tag_child`, `encode_value`, `node_equal`, `ArenaBuilder::make_array`/
+  `tag_child`, `encode_value`, `node_equal`, `NoAllocBuilder::make_array`/
   `make_map`). This catches a `Node*` that never belonged to this pool at
   all — one left over from an unrelated or already-destroyed pool, bad
   pointer arithmetic, a stray null. It does **not** catch the pool's own
   storage having moved: `nodes_`/`node_capacity_` are themselves just
-  members captured once, and if the whole arena relocates without this
+  members captured once, and if the whole buffer relocates without this
   `NodePool`'s members being updated, every pointer involved — `nodes_`
   included — is equally stale, so the range check can't notice anything
   is wrong. That category of mistake is the one genuinely uncatchable
   precondition violation here, same as dereferencing any other dangling
   pointer in C++.
 
-See `tests/test_arena.cpp` for the full suite (round-trips against the same
+See `tests/test_noalloc.cpp` for the full suite (round-trips against the same
 official vectors `tests/test_array.cpp`/`test_map.cpp`/`test_tag.cpp` use for
 the heap-based decoder, plus pool-exhaustion and buffer-too-small refusal
 cases). It *is* fully `compile_time_ut`-based, same as every other test file:
@@ -305,9 +305,101 @@ and consumes its own `NodePool` entirely inside its own body is a
 self-contained expression, usable directly as an `expect_eq<>()`/
 `expect_true<>()` argument.
 
+## Event-based SAX decoding (`ConstexprCbor::Sax`)
+
+A third decode strategy, alongside the heap and no-malloc tree-builders
+above: `ConstexprCbor::Sax::SaxRange` (its own header,
+`include/constexpr_cbor_sax.hpp`) doesn't build any value at all — it
+pulls one CBOR *event* at a time directly off the wire (`BeginArray`,
+`Uint`, `TextString`, `EndMap`, ...), the same shape tinycbor and
+QCBOR's own pull-style APIs already expose. It reuses every one of
+this library's byte-level primitives unchanged (`decode_length`,
+`decode_uint`/`decode_negint`, `decode_byte_string`/`decode_text_string`,
+`decode_simple`, `skip_item`) — nothing in `SaxRange` reimplements wire
+parsing, only the control flow deciding which primitive to call next and
+when to pause does.
+
+```cpp
+#include "constexpr_cbor_sax.hpp"
+
+using namespace ConstexprCbor;
+using namespace ConstexprCbor::Sax;
+
+constexpr std::uint8_t bytes[] = {0x83, 0x01, 0x02, 0x03};  // [1, 2, 3]
+
+consteval bool sums_to_six() {
+    std::uint64_t sum = 0;
+    for (auto ev : SaxRange<32>{bytes}) {
+        if (ev.kind == EventKind::Error) return false;
+        if (ev.kind == EventKind::Uint) sum += ev.uint_value;
+    }
+    return sum == 6;
+}
+
+static_assert(sums_to_six());
+```
+
+**Why new control flow was unavoidable, not just new API surface**: both
+the heap and no-malloc decoders always decode one fully-contained
+subtree per recursive call and return only once it's done — there's no
+"decode just the next event and suspend" shape to borrow from either.
+The obvious tool for that shape, a C++20 coroutine (`co_yield` per
+event), was considered and rejected: coroutines cannot be evaluated in a
+constant expression, and this library's whole point is `consteval`-
+provable decoding, so a mode that can't run at compile time would
+contradict its own reason for existing. `SaxRange::Iterator` instead
+keeps an explicit frame stack bounded by `MaxDepth` — the same
+nesting-depth contract `decode_value` already enforces, just checked
+against an array index instead of a recursive call's own stack depth.
+
+**Fully range-compatible, not just "has `begin()`/`end()`"**: every byte
+of `SaxRange`'s iteration state (byte position, the frame stack, the
+duplicate-key tracking buffer below) lives *by value* inside the
+iterator itself — there's no hidden shared external cursor the way
+`istream_iterator` has. Two copies of the same iterator genuinely
+support independent, non-interfering advancement, which is what makes
+`SaxRange` a real `std::ranges::forward_range` rather than only
+`input_range`. It also implements `std::ranges::view_interface`, so it
+composes directly with range adaptors (`| std::views::take(10)`, and so
+on).
+
+**Policy reuse, and where it structurally can't carry over unchanged**:
+`Utf8Policy` (`NoUtf8Validation`/`RoughUtf8Validation`/
+`CompleteUtf8Validation`/`AsciiOnlyValidation`) is reused exactly as-is —
+it's invoked once per fully-assembled string payload with zero retained
+state, the same as every other decode path. `KeyPolicy` needed more
+thought: duplicate-key detection fundamentally needs to remember "keys
+seen so far in the current open map," which a single-pass event stream
+doesn't have for free the way the tree decoders' already-materialized
+entries do.
+- A new, fully shared policy, `NoDuplicateKeyCheck` (pass every pair
+  through, no bookkeeping at all), is `SaxRange`'s default — the only
+  sensible default for a mode whose whole point is not retaining state.
+- `RejectDuplicateKeys`/`KeepFirstDuplicateKey` work with `SaxRange`
+  too, opted into via a `MaxTrackedKeys` template parameter (a capacity,
+  exactly like `NoAllocStorage`'s `MaxNodes`/`MaxRefs`/`MaxBytes` —
+  exceeding it is a clean refusal, not UB). Detection compares keys by
+  **raw encoded bytes**, not decoded structural value equality the way
+  `node_equal`/`CborValue::operator==` do: a documented, deliberate
+  simplification (two non-canonically-but-value-equal encodings of the
+  same integer key, `0x00` vs. `0x18 0x00`, won't be caught here, unlike
+  in the tree decoders) that avoids needing to decode a key into a
+  comparable value just to check it, which would mean building exactly
+  the kind of tree this mode exists to avoid.
+- `KeepLastDuplicateKey` is **not supported** here, deliberately: "keep
+  the last value for this key" means retroactively overwriting an
+  already-emitted event, which a push-forward event stream cannot do
+  without buffering the whole map first — the thing SAX exists not to
+  do. Selecting it with `SaxRange` is a compile error (a named
+  `static_assert`), not a silent behavior change.
+
+See `tests/test_sax.cpp` for the full suite, including a
+`std::ranges::forward_range`/`std::ranges::view` conformance check and
+the duplicate-key-policy cases above.
+
 ## nlohmann::json-style ergonomics
 
-Both `CborValue` and the Arena's `ArenaView` support an nlohmann::json-style
+Both `CborValue` and the NoAlloc's `NoAllocView` support an nlohmann::json-style
 ergonomic interface on top of the raw `std::get`/`std::visit` access shown
 above — entirely additive, and kept exception-free throughout: a miss or
 type mismatch returns a shared sentinel or `std::optional`, never throws,
@@ -386,38 +478,38 @@ A `.get<T>()` call for a `T` with no built-in support, no ADL hook, and no
 this interface is allowed to hard-fail at compile time (a template
 instantiation failure, not a runtime/consteval-execution-time one).
 
-**Arena (`ConstexprCbor::Arena::ArenaView`)**: the same read-only surface
+**NoAlloc (`ConstexprCbor::NoAlloc::NoAllocView`)**: the same read-only surface
 (`is_*()`/`operator[]`/`.get<T>()`/iteration/`.items()`), via
 `#include "constexpr_cbor_noalloc_ergonomics.hpp"` — a third, separately
 includable header (depends on both existing ones), so a minimal embedded
-consumer who only wants raw `Arena::decode_value` never pays for it:
+consumer who only wants raw `NoAlloc::decode_value` never pays for it:
 
 ```cpp
 #include "constexpr_cbor_noalloc_ergonomics.hpp"
-using namespace ConstexprCbor::Arena;
+using namespace ConstexprCbor::NoAlloc;
 
-ArenaStorage<32, 32, 32> storage;
+NoAllocStorage<32, 32, 32> storage;
 auto pool = storage.make_pool();
-const auto view = decode_view(pool, bytes);  // std::optional<ArenaView>
+const auto view = decode_view(pool, bytes);  // std::optional<NoAllocView>
 view->operator[]("name").get<std::string>();
 for (const auto& v : (*view)["thresholds"]) { /* ... */ }
 ```
 
-`ArenaView` bundles a `(pool, node)` pair so `view["a"][2]["b"]` chains
+`NoAllocView` bundles a `(pool, node)` pair so `view["a"][2]["b"]` chains
 without re-threading `pool` at every step; a non-template, concrete type
 (the pool it points into is no longer sized via template parameters either —
 see "No-malloc decoding/encoding" above). It also provides a minimal,
-explicitly pool-exhaustion-aware **builder** (`ArenaBuilder`, `make_null`/
+explicitly pool-exhaustion-aware **builder** (`NoAllocBuilder`, `make_null`/
 `make_bool`/`make_uint`/`make_int`/`make_float`/`make_text`/`make_bytes`/
 `make_array`/`make_map`) that writes new nodes into an *existing* pool's remaining
 capacity — every write returns `std::optional`, since pool exhaustion is an
 ordinary, expected failure here (unlike the heap builder, where `std::vector`
 growth can't fail). `make_array`/`make_map` take already-built (post-order)
-child `ArenaView`s into the *same* pool; `make_map` does no duplicate-key
+child `NoAllocView`s into the *same* pool; `make_map` does no duplicate-key
 handling of its own (the builder isn't policy-templated — a caller needing
 dedup resolves it in their own pair list first). A **mutable `operator[]`**
 and **brace-initializer construction** are deliberately out of scope for
-Arena: both would need the exact same optional-returning grow/promote
+NoAlloc: both would need the exact same optional-returning grow/promote
 machinery the builder already has, just duplicated under a value-type
 syntax that can't naturally express "this might fail" — not a small
 addition once pool exhaustion is taken seriously, and read-only view
@@ -445,36 +537,53 @@ bignums, tags, non-string map keys) are rendered.
 
 ## Benchmarks
 
-`benchmarks/` compares this library against tinycbor, QCBOR, and libcbor
-on CPU performance, memory usage, correctness, and flexibility, with real
-numbers from a reproducible Docker build (`docker build -t cbor-bench -f
-benchmarks/Dockerfile . && docker run --rm cbor-bench`). tinycbor/QCBOR
-are pull-parsers, like this library's own no-malloc Arena mode; libcbor
-was added specifically because it's a DOM-style C library — the same
-owned-tree shape as this library's heap `CborValue` path — which turns
-out to be a useful control: libcbor pays a real, measured cost in every
-dimension (allocation, code size, speed) for that DOM-style shape, in
-plain C, confirming it's a cost of the *design*, not of C++ or
-`std::variant` specifically. Short version: tinycbor/QCBOR are still
-smaller in code size, consistently and by a wide margin (hand-tuned C
-state machines, no dynamic dispatch); raw decode throughput among the
-pull-parsers and Arena is now a settled, reproducible result (an earlier
-version of this benchmark reported it as swinging wildly between runs,
-which turned out to be a measurement-robustness bug, not a real finding
-— see `benchmarks/README.md`'s "On timing trustworthiness"): the
-no-malloc Arena mode consistently beats both tinycbor and QCBOR on 3 of
-4 payloads, and consistently trails QCBOR specifically on deeply-nested
-input. libcbor is consistently slower than tinycbor/QCBOR specifically
-(it being the one other library here that also allocates), though not
-consistently slower than constexpr-cbor's own heap path — it beats heap
-on three of the four payloads, only trailing it on the string-heavy one.
-constexpr-cbor's
-case is compile-time-proven correctness, a real zero-malloc mode *and* a
-generic owned-tree mode as equally first-class options, and
-caller-tunable nesting depth/UTF-8 validation/duplicate-key policy where
-the others hard-code one behavior. See
-`benchmarks/README.md` for the full numbers and methodology, including
-how Arena's internals moved from index-based to pointer-based
+`benchmarks/` compares this library's three decode paths (heap,
+no-malloc `NoAlloc`, and event-based `Sax`) against tinycbor, QCBOR, and
+libcbor on CPU performance, memory usage, correctness, and flexibility,
+with real numbers from a reproducible Docker build (`docker build -t
+cbor-bench -f benchmarks/Dockerfile . && docker run --rm cbor-bench`).
+This isn't a statistically rigorous benchmark (one container run, not a
+sampled distribution across hosts) and it isn't trying to crown one
+library "better" — the point is to make real tradeoffs (code size vs.
+throughput vs. allocation behavior vs. what's provable at compile time)
+legible enough that picking a library for your own constraints doesn't
+have to be a guess.
+
+tinycbor/QCBOR are pull-parsers; this library's own `Sax` mode was added
+specifically to give them a structurally fair comparison point (heap and
+`NoAlloc` both build a tree, which was always an extra variable
+alongside whatever the raw numbers were measuring). libcbor was added as
+a different kind of control: it's a DOM-style C library — the same
+owned-tree shape as this library's heap `CborValue` path — and it pays a
+real, measured cost in every dimension (allocation, code size, speed)
+for that shape, in plain C, confirming that cost belongs to the *design*,
+not to C++ or `std::variant` specifically.
+
+What the numbers actually show: tinycbor and QCBOR have the smallest
+code-size footprint of the libraries compared, consistently — mature,
+hand-tuned C state machines with no dynamic dispatch and no generic
+value representation to carry. This library's own `Sax` mode closes
+most of that gap from within the same codebase (smaller `.text` than
+either tinycbor or QCBOR in this benchmark, in fact, while reusing the
+exact same byte-parsing primitives `NoAlloc`/heap use), without
+switching language or giving up `consteval`-provability. Raw throughput
+varies by payload shape more than by library: `NoAlloc` and `Sax`
+measure faster than tinycbor/QCBOR on three of the four payload shapes
+tested, while QCBOR is clearly fastest on the deeply-nested one, where
+its fixed-size nesting tracker is a structurally cheap fit for that one
+access pattern. libcbor's numbers land behind tinycbor/QCBOR on every
+payload and unevenly against this library's own heap path, consistent
+with its DOM-style allocation cost showing up differently depending on
+how string-heavy a given payload is. constexpr-cbor's own differentiators
+are structural rather than timing-dependent: compile-time-proven
+correctness via `consteval`, a generic owned-tree mode and two
+zero-allocation modes (tree-shaped and event-shaped) as equally
+first-class options rather than being limited to whichever one a design
+happened to pick, and caller-tunable nesting depth/UTF-8 validation/
+duplicate-key policy — shared across all three decode paths — where the
+others hard-code one behavior. See `benchmarks/README.md` for the full
+numbers, methodology, and the complete tradeoff discussion, including
+how `NoAlloc`'s internals moved from index-based to pointer-based
 indirection and what that did to code size.
 
 ## Building and testing this library
