@@ -404,7 +404,11 @@ ergonomic interface on top of the raw `std::get`/`std::visit` access shown
 above — entirely additive, and kept exception-free throughout: a miss or
 type mismatch returns a shared sentinel or `std::optional`, never throws,
 preserving `-fno-exceptions` compatibility and `consteval`-safety for every
-path.
+path. Their iteration is a genuine `std::ranges::forward_range` too, the
+same bar `SaxRange` is held to below (`.begin()`/`.end()`/`.items()` all
+return copyable iterators with no shared external cursor) — proven, not
+just asserted, via a `static_assert(std::ranges::forward_range<...>)` in
+`tests/test_ergonomics_iteration.cpp`/`tests/test_noalloc_view.cpp`.
 
 ```cpp
 #include "constexpr_cbor.hpp"

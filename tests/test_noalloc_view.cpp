@@ -1,9 +1,18 @@
+#include <ranges>
+
 #include "compile_time_ut.hpp"
 #include "constexpr_cbor_noalloc_ergonomics.hpp"
 
 using namespace ConstexprCbor;
 using namespace ConstexprCbor::NoAlloc;
 using namespace CompileTimeUnitTesting;
+
+// NoAllocView is a genuine std::ranges::forward_range too, the same bar
+// CborValue and SaxRange are held to -- NoAllocView::const_iterator/
+// ItemsProxy::iterator are copyable value types with no shared external
+// cursor, so two copies can advance independently.
+static_assert(std::ranges::forward_range<NoAllocView>);
+static_assert(std::ranges::forward_range<NoAllocView::ItemsProxy>);
 
 // Decode the same bytes via both the heap decoder and NoAlloc::decode_view,
 // prove every predicate/operator[]/.get<T>()/iteration result agrees

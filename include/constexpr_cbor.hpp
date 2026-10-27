@@ -6,6 +6,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -801,6 +802,10 @@ struct CborValue {
   // (matching nlohmann's own `for (auto& v : j)` default). No primitive
   // iteration arm -- iterating a scalar is simply not supported here.
   struct const_iterator {
+    using value_type = CborValue;
+    using difference_type = std::ptrdiff_t;
+    using iterator_category = std::forward_iterator_tag;
+
     std::variant<std::vector<CborValue>::const_iterator, std::vector<std::pair<CborValue, CborValue>>::const_iterator>
         it;
     constexpr const CborValue& operator*() const {
@@ -818,6 +823,11 @@ struct CborValue {
     constexpr const_iterator& operator++() {
       std::visit([](auto& i) { ++i; }, it);
       return *this;
+    }
+    constexpr const_iterator operator++(int) {
+      const_iterator tmp = *this;
+      ++*this;
+      return tmp;
     }
     constexpr bool operator==(const const_iterator& other) const { return it == other.it; }
   };
@@ -844,11 +854,20 @@ struct CborValue {
       CborValue& value;
     };
     struct iterator {
+      using value_type = Item;
+      using difference_type = std::ptrdiff_t;
+      using iterator_category = std::forward_iterator_tag;
+
       std::vector<std::pair<CborValue, CborValue>>::iterator it;
       constexpr Item operator*() const { return Item{it->first, it->second}; }
       constexpr iterator& operator++() {
         ++it;
         return *this;
+      }
+      constexpr iterator operator++(int) {
+        iterator tmp = *this;
+        ++*this;
+        return tmp;
       }
       constexpr bool operator==(const iterator& other) const { return it == other.it; }
     };

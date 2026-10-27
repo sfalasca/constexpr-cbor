@@ -1,8 +1,17 @@
+#include <ranges>
+
 #include "compile_time_ut.hpp"
 #include "constexpr_cbor.hpp"
 
 using namespace ConstexprCbor;
 using namespace CompileTimeUnitTesting;
+
+// CborValue is a genuine std::ranges::forward_range (not just "has
+// begin()/end()"), the same bar SaxRange is held to in test_sax.cpp --
+// CborValue::const_iterator/ItemsProxy::iterator are copyable value types
+// with no shared external cursor, so two copies can advance independently.
+static_assert(std::ranges::forward_range<CborValue>);
+static_assert(std::ranges::forward_range<CborValue::ItemsProxy>);
 
 constexpr std::uint64_t sum_array() {
   std::uint64_t total = 0;

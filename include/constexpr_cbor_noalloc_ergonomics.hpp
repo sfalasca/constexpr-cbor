@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <iterator>
 #include <string>
 #include <string_view>
 
@@ -208,6 +209,10 @@ struct NoAllocView {
 };
 
 struct NoAllocView::const_iterator {
+  using value_type = NoAllocView;
+  using difference_type = std::ptrdiff_t;
+  using iterator_category = std::forward_iterator_tag;
+
   const NoAllocView* owner;
   std::size_t index;
   constexpr NoAllocView operator*() const {
@@ -221,6 +226,11 @@ struct NoAllocView::const_iterator {
     ++index;
     return *this;
   }
+  constexpr const_iterator operator++(int) {
+    const_iterator tmp = *this;
+    ++*this;
+    return tmp;
+  }
   constexpr bool operator==(const const_iterator& other) const { return index == other.index; }
 };
 
@@ -231,6 +241,10 @@ struct NoAllocView::ItemsProxy {
     NoAllocView value;
   };
   struct iterator {
+    using value_type = Item;
+    using difference_type = std::ptrdiff_t;
+    using iterator_category = std::forward_iterator_tag;
+
     const NoAllocView* owner;
     std::size_t index;
     constexpr Item operator*() const {
@@ -241,6 +255,11 @@ struct NoAllocView::ItemsProxy {
     constexpr iterator& operator++() {
       ++index;
       return *this;
+    }
+    constexpr iterator operator++(int) {
+      iterator tmp = *this;
+      ++*this;
+      return tmp;
     }
     constexpr bool operator==(const iterator& other) const { return index == other.index; }
   };
