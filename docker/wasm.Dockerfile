@@ -22,7 +22,15 @@ FROM emscripten/emsdk:latest
 WORKDIR /src
 COPY . .
 
-RUN emcmake cmake -S . -B build -DCMAKE_CXX_STANDARD=23 -DCMAKE_BUILD_TYPE=Debug \
+# Built and tested at both C++20 (this project's documented floor) and
+# C++23 explicitly -- see the gcc-*/clang-* Dockerfiles' own comment on
+# this same two-pass pattern for why (ConstexprCbor::Expected<T, E>
+# resolves to a fallback at C++20, real std::expected at C++23).
+RUN emcmake cmake -S . -B build-cxx20 -DCMAKE_CXX_STANDARD=20 -DCMAKE_BUILD_TYPE=Debug \
         -DCMAKE_CROSSCOMPILING_EMULATOR=node \
-    && emmake cmake --build build -j \
-    && cd build && ctest --output-on-failure
+    && emmake cmake --build build-cxx20 -j \
+    && cd build-cxx20 && ctest --output-on-failure && cd ..
+RUN emcmake cmake -S . -B build-cxx23 -DCMAKE_CXX_STANDARD=23 -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_CROSSCOMPILING_EMULATOR=node \
+    && emmake cmake --build build-cxx23 -j \
+    && cd build-cxx23 && ctest --output-on-failure

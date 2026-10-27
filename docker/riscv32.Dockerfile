@@ -51,8 +51,17 @@ COPY docker/compile-all-tests.sh compile-all-tests.sh
 
 # rv32imac/ilp32: base integer + multiply/divide + atomics + compressed
 # instructions, the common baseline for real rv32 MCUs.
+# Compiled at both C++20 (this project's documented floor) and C++23 --
+# see the gcc-*/clang-* Dockerfiles' own comment on why (Expected<T, E>
+# resolves to a fallback at C++20, real std::expected at C++23); this is
+# the only way to prove the fallback actually works against a real
+# embedded cross-compiler's own, more constrained standard library.
 RUN riscv-none-elf-g++ --version \
-    && sh compile-all-tests.sh riscv32 riscv-none-elf-g++ \
+    && sh compile-all-tests.sh riscv32-cxx20 riscv-none-elf-g++ \
+         -std=c++20 -march=rv32imac -mabi=ilp32 \
+         -fno-exceptions -fno-rtti -Wall -Wextra -Wpedantic \
+         -Iinclude -I/tmp/ctut/include \
+    && sh compile-all-tests.sh riscv32-cxx23 riscv-none-elf-g++ \
          -std=c++23 -march=rv32imac -mabi=ilp32 \
          -fno-exceptions -fno-rtti -Wall -Wextra -Wpedantic \
          -Iinclude -I/tmp/ctut/include

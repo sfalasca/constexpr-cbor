@@ -19,6 +19,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends git python3-pip
 WORKDIR /src
 COPY . .
 
-RUN cmake -S . -B build -G Ninja -DCMAKE_CXX_STANDARD=23 -DCMAKE_BUILD_TYPE=Debug \
-    && cmake --build build -j \
-    && ctest --test-dir build --output-on-failure
+# Built and tested at both C++20 (this project's documented floor) and
+# C++23 explicitly, into separate build directories -- not just a single
+# "request 23, let CMake cap it down" pass. The two differ in one real
+# way: ConstexprCbor::Expected<T, E> resolves to a small, variant-backed
+# fallback at C++20 (std::expected is gated to C++23 in libstdc++) and to
+# real std::expected at C++23 -- this is the only way to prove the
+# fallback actually works against a real toolchain, not just locally.
+RUN cmake -S . -B build-cxx20 -G Ninja -DCMAKE_CXX_STANDARD=20 -DCMAKE_BUILD_TYPE=Debug \
+    && cmake --build build-cxx20 -j \
+    && ctest --test-dir build-cxx20 --output-on-failure
+RUN cmake -S . -B build-cxx23 -G Ninja -DCMAKE_CXX_STANDARD=23 -DCMAKE_BUILD_TYPE=Debug \
+    && cmake --build build-cxx23 -j \
+    && ctest --test-dir build-cxx23 --output-on-failure

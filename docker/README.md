@@ -12,12 +12,21 @@ docker/build-matrix.sh --list                 # list target names, do nothing
 
 ## Desktop compilers (gcc-\*, clang-\*)
 
-Each image configures, builds, and runs the **full ctest suite**
-(`ctest --test-dir build`), so a passing `docker build` means the whole
-library-behavior suite — including every RFC 8949 Appendix A vector —
-passed on that exact compiler version. `CMAKE_CXX_STANDARD=23` is
-requested everywhere; CMake caps it to whatever the compiler actually
-supports (down to GCC 10, which gets silently capped to `gnu++2a`).
+Each image configures, builds, and runs the **full ctest suite**, at
+**both C++20 and C++23 explicitly** (`ctest --test-dir build-cxx20` then
+`--test-dir build-cxx23`, two separate RUN layers) — so a passing
+`docker build` means the whole library-behavior suite — including every
+RFC 8949 Appendix A vector — passed on that exact compiler version at
+*both* standards this library documents support for, not just one. This
+matters specifically because `ConstexprCbor::Expected<T, E>` resolves to
+a different implementation at each standard: a small, variant-backed
+fallback at C++20 (`std::expected` is gated to C++23 in libstdc++ — a
+language-mode restriction, confirmed empirically, not a compiler-version
+problem), and real `std::expected` at C++23. Testing only one standard
+would leave the other backend unverified against a real toolchain.
+`CMAKE_CXX_STANDARD=20`/`=23` are both *requests*; CMake caps either to
+whatever the compiler actually supports (down to GCC 10, which gets
+silently capped on the C++23 pass specifically).
 
 | Family | Versions | Base image |
 |---|---|---|
@@ -54,15 +63,22 @@ to fail, each for a distinct, checked reason, not left as noise:
 
 ## Embedded / bare-metal targets
 
-These compile-check every file in `tests/` with `-c`: object files only,
-**no link**. That includes `tests/expected_failures/`: each embedded
-image also verifies those still fail to compile with the right
-diagnostic (`docker/compile-all-tests.sh` is the no-CMake equivalent of
-what `ctest`'s `try_compile.cmake`/`try_compile_grep.cmake` check on the
-desktop matrix), rather than silently skipping them just because they're
-supposed to fail. Producing a flashable image needs a linker script,
-startup code, and a vendor HAL/BSP/project structure (ESP-IDF project,
-STM32Cube, etc.), none
+These compile-check every file in `tests/` and `examples/` with `-c`:
+object files only, **no link**. That includes `tests/expected_failures/`:
+each embedded image also verifies those still fail to compile with the
+right diagnostic (`docker/compile-all-tests.sh` is the no-CMake
+equivalent of what `ctest`'s `try_compile.cmake`/`try_compile_grep.cmake`
+check on the desktop matrix), rather than silently skipping them just
+because they're supposed to fail. Each image runs `compile-all-tests.sh`
+**twice, at `-std=c++20` and `-std=c++23` explicitly** — the same
+two-standard reasoning as the desktop matrix above
+(`ConstexprCbor::Expected<T, E>`'s fallback vs. real `std::expected`
+backend), and arguably more important here: a real embedded
+cross-compiler's bundled standard library is exactly the kind of more
+constrained, slower-to-update implementation where the C++20 fallback
+path is actually likely to matter in practice. Producing a flashable
+image needs a linker script, startup code, and a vendor HAL/BSP/project
+structure (ESP-IDF project, STM32Cube, etc.), none
 of which is this header-only library's concern. `-c` against the real
 cross-compiler is the standard way to validate portability without that
 machinery. None of these images use CMake, so each one clones
@@ -82,7 +98,8 @@ capable target that can link and run, so this one builds via `emcmake`/
 `emmake` and runs the **full ctest suite** under Node
 (`CMAKE_CROSSCOMPILING_EMULATOR=node`) through `emscripten/emsdk`'s
 bundled Clang -- the same end-to-end proof the desktop gcc-*/clang-*
-images give, not just a compile-check.
+images give, not just a compile-check. Also built and tested at both
+C++20 and C++23 explicitly, same reasoning as the desktop matrix above.
 
 This is also the target that first caught a real, pre-existing
 portability bug: `std::size_t` is 32 bits wide on `wasm32` while

@@ -37,8 +37,16 @@ COPY docker/compile-all-tests.sh compile-all-tests.sh
 RUN git clone --depth 1 --branch v1.0.1 \
     https://github.com/sfalasca/compile-time-unit-testing.git /tmp/ctut
 
+# Compiled at both C++20 (this project's documented floor) and C++23 --
+# see the gcc-*/clang-* Dockerfiles' own comment on why (Expected<T, E>
+# resolves to a fallback at C++20, real std::expected at C++23); this is
+# the only way to prove the fallback actually works against a real
+# embedded cross-compiler's own, more constrained standard library.
 RUN . /opt/esp/idf/export.sh > /dev/null \
     && xtensa-esp32-elf-g++ --version \
-    && sh compile-all-tests.sh esp32 xtensa-esp32-elf-g++ \
+    && sh compile-all-tests.sh esp32-cxx20 xtensa-esp32-elf-g++ \
+         -std=c++20 -fno-exceptions -fno-rtti -Wall -Wextra -Wpedantic \
+         -Iinclude -I/tmp/ctut/include \
+    && sh compile-all-tests.sh esp32-cxx23 xtensa-esp32-elf-g++ \
          -std=c++23 -fno-exceptions -fno-rtti -Wall -Wextra -Wpedantic \
          -Iinclude -I/tmp/ctut/include

@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 # Builds every Dockerfile in this directory and reports PASS/FAIL per
-# image. Desktop matrix images (gcc-*, clang-*) run the full ctest suite
-# as part of `docker build`; embedded targets (esp32, stm32, riscv32)
-# compile-check tests/noexcept_tests.cpp against the real cross-compiler
-# (no link — see the comment at the top of each embedded Dockerfile for
-# why). A Dockerfile's build succeeding IS the test passing.
+# image. Desktop matrix images (gcc-*, clang-*) and wasm run the full
+# ctest suite as part of `docker build`, each at BOTH C++20 (this
+# project's documented floor) and C++23 explicitly, in two separate RUN
+# layers -- not just a single "request 23, let CMake cap it down" pass,
+# since ConstexprCbor::Expected<T, E> resolves to a different backend at
+# each standard (a small fallback at C++20, real std::expected at C++23)
+# and this is the only way to prove both actually work. Embedded targets
+# (esp32, stm32, riscv32) compile-check every file in tests/ and
+# examples/ against the real cross-compiler (no link -- see the comment
+# at the top of each embedded Dockerfile for why), also at both
+# standards. A Dockerfile's build succeeding means BOTH standards passed
+# for that image; if only one fails, `docker build`'s own output (surfaced
+# in the tail of the captured log on failure, below) shows which RUN
+# layer it was.
 #
 # Usage:
 #   docker/build-matrix.sh              # build + report on everything

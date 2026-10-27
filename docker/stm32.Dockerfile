@@ -55,8 +55,17 @@ COPY examples/ examples/
 COPY docker/compile-all-tests.sh compile-all-tests.sh
 
 # cortex-m4/hard-float/fpv4-sp-d16: the common STM32F4 configuration.
+# Compiled at both C++20 (this project's documented floor) and C++23 --
+# see the gcc-*/clang-* Dockerfiles' own comment on why (Expected<T, E>
+# resolves to a fallback at C++20, real std::expected at C++23); this is
+# the only way to prove the fallback actually works against a real
+# embedded cross-compiler's own, more constrained standard library.
 RUN arm-none-eabi-g++ --version \
-    && sh compile-all-tests.sh stm32 arm-none-eabi-g++ \
+    && sh compile-all-tests.sh stm32-cxx20 arm-none-eabi-g++ \
+         -std=c++20 -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 \
+         -fno-exceptions -fno-rtti -Wall -Wextra -Wpedantic \
+         -Iinclude -I/tmp/ctut/include \
+    && sh compile-all-tests.sh stm32-cxx23 arm-none-eabi-g++ \
          -std=c++23 -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 \
          -fno-exceptions -fno-rtti -Wall -Wextra -Wpedantic \
          -Iinclude -I/tmp/ctut/include
