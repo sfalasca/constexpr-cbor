@@ -25,7 +25,7 @@ RUN git clone --quiet --depth 1 --branch v0.14.0 https://github.com/PJK/libcbor.
 # build is reused for both the CPU/memory/correctness programs below and
 # the code-size comparison (unlike tinycbor/QCBOR, which get a *second*,
 # -Os-specific compile of their .c files for the size comparison -- see
-# benchmarks/README.md's "Arena internals"-adjacent methodology notes for
+# benchmarks/README.md's "NoAlloc internals"-adjacent methodology notes for
 # why libcbor's size number carries this one asymmetry honestly rather
 # than silently matching the others' rebuild-at--Os treatment).
 RUN cmake -S libcbor -B libcbor/build -DCMAKE_BUILD_TYPE=Release \
@@ -55,7 +55,7 @@ RUN g++ -std=c++20 -O2 -I../include -Itinycbor/src -Iqcbor/inc \
 # binary's .text reflects only what calling its decoder once actually
 # pulls in, not a whole translation unit's worth of unused functions.
 RUN g++ -std=c++20 -Os -ffunction-sections -fdata-sections -I../include -c size/size_cc.cpp -o size_cc.o && \
-    g++ -std=c++20 -Os -ffunction-sections -fdata-sections -I../include -c size/size_arena.cpp -o size_arena.o && \
+    g++ -std=c++20 -Os -ffunction-sections -fdata-sections -I../include -c size/size_noalloc.cpp -o size_noalloc.o && \
     gcc -std=c11 -Os -ffunction-sections -fdata-sections -Itinycbor/src -c size/size_tc.c -o size_tc.o && \
     gcc -std=c11 -Os -ffunction-sections -fdata-sections -Itinycbor/src -c tinycbor/src/cborparser.c -o tp_gc.o && \
     gcc -std=c11 -Os -ffunction-sections -fdata-sections -Iqcbor/inc -c size/size_qc.c -o size_qc.o && \
@@ -66,9 +66,9 @@ RUN g++ -std=c++20 -Os -ffunction-sections -fdata-sections -I../include -c size/
         -c size/size_libcbor.c -o size_libcbor.o && \
     gcc -std=c11 -Os -ffunction-sections -fdata-sections -c size/size_main.c -o size_main.o && \
     g++ -Os -Wl,--gc-sections size_main.o size_cc.o -o exe_cc && \
-    g++ -Os -Wl,--gc-sections size_main.o size_arena.o -o exe_arena && \
+    g++ -Os -Wl,--gc-sections size_main.o size_noalloc.o -o exe_noalloc && \
     gcc -Os -Wl,--gc-sections size_main.o size_tc.o tp_gc.o -o exe_tc && \
     gcc -Os -Wl,--gc-sections size_main.o size_qc.o qd_gc.o ub_gc.o ie_gc.o -o exe_qc -lm && \
     gcc -Os -Wl,--gc-sections size_main.o size_libcbor.o libcbor/build/src/libcbor.a -o exe_libcbor -lm
 
-CMD ["bash", "-c", "echo '=== CPU performance + memory ===' && ./bench && echo && echo '=== correctness corpus ===' && ./correctness && echo && echo '=== code size (single decode entry point, dead-code-eliminated) ===' && echo constexpr-cbor_heap: && size exe_cc && echo constexpr-cbor_arena: && size exe_arena && echo tinycbor: && size exe_tc && echo qcbor: && size exe_qc && echo libcbor: && size exe_libcbor"]
+CMD ["bash", "-c", "echo '=== CPU performance + memory ===' && ./bench && echo && echo '=== correctness corpus ===' && ./correctness && echo && echo '=== code size (single decode entry point, dead-code-eliminated) ===' && echo constexpr-cbor_heap: && size exe_cc && echo constexpr-cbor_noalloc: && size exe_noalloc && echo tinycbor: && size exe_tc && echo qcbor: && size exe_qc && echo libcbor: && size exe_libcbor"]

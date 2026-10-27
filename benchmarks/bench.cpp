@@ -1,4 +1,4 @@
-// Benchmarks constexpr-cbor (heap CborValue, and the no-malloc Arena)
+// Benchmarks constexpr-cbor (heap CborValue, and the no-malloc NoAlloc)
 // against tinycbor, QCBOR, and libcbor on the *same* encoded bytes
 // (benchmarks/data, embedded via payloads.h). Every library's decode
 // function does the same amount of work: fully walk the decoded structure
@@ -26,7 +26,7 @@
 #include <vector>
 
 #include "constexpr_cbor.hpp"
-#include "constexpr_cbor_arena.hpp"
+#include "constexpr_cbor_noalloc.hpp"
 #include "libcbor_adapter.hpp"
 #include "payloads.h"
 
@@ -102,12 +102,12 @@ HeapResult decode_heap(std::span<const std::uint8_t> bytes) {
 }
 
 // ---------------------------------------------------------------------
-// constexpr-cbor, no-malloc Arena
+// constexpr-cbor, no-malloc NoAlloc
 // ---------------------------------------------------------------------
 
-void walk_arena_node(const ConstexprCbor::Arena::NodePool& pool, const ConstexprCbor::Arena::Node& node,
+void walk_noalloc_node(const ConstexprCbor::NoAlloc::NodePool& pool, const ConstexprCbor::NoAlloc::Node& node,
                       Checksum& sum) {
-  using namespace ConstexprCbor::Arena;
+  using namespace ConstexprCbor::NoAlloc;
   sum.items++;
   std::visit(
       [&](const auto& x) {
@@ -121,14 +121,14 @@ void walk_arena_node(const ConstexprCbor::Arena::NodePool& pool, const Constexpr
         } else if constexpr (std::is_same_v<T, StringRef>) {
           sum.strbytes += pool.bytes_of(x).size();
         } else if constexpr (std::is_same_v<T, ArrayRef>) {
-          for (std::size_t i = 0; i < x.count; ++i) walk_arena_node(pool, pool.child(x, i), sum);
+          for (std::size_t i = 0; i < x.count; ++i) walk_noalloc_node(pool, pool.child(x, i), sum);
         } else if constexpr (std::is_same_v<T, MapRef>) {
           for (std::size_t i = 0; i < x.count; ++i) {
-            walk_arena_node(pool, pool.map_key(x, i), sum);
-            walk_arena_node(pool, pool.map_value(x, i), sum);
+            walk_noalloc_node(pool, pool.map_key(x, i), sum);
+            walk_noalloc_node(pool, pool.map_value(x, i), sum);
           }
         } else if constexpr (std::is_same_v<T, TagRef>) {
-          walk_arena_node(pool, pool.tag_child(x), sum);
+          walk_noalloc_node(pool, pool.tag_child(x), sum);
         }
       },
       node.data);
@@ -137,17 +137,17 @@ void walk_arena_node(const ConstexprCbor::Arena::NodePool& pool, const Constexpr
 // `pool` is provisioned once by the caller, outside the measured window
 // below, exactly as a real embedded caller would provision a
 // static/stack NodePool up front -- re-decoding into the same pool
-// repeatedly (resetting its three cursors) is what the Arena API is
+// repeatedly (resetting its three cursors) is what the NoAlloc API is
 // actually for, so that's what's timed, not a fresh allocation per call.
-HeapResult decode_arena(ConstexprCbor::Arena::NodePool& pool, std::span<const std::uint8_t> bytes) {
+HeapResult decode_noalloc(ConstexprCbor::NoAlloc::NodePool& pool, std::span<const std::uint8_t> bytes) {
   pool.node_count_ = 0;
   pool.ref_count_ = 0;
   pool.byte_count_ = 0;
   const long long before = alloc_delta_begin();
-  const auto decoded = ConstexprCbor::Arena::decode_value(pool, bytes);
+  const auto decoded = ConstexprCbor::NoAlloc::decode_value(pool, bytes);
   if (!decoded) return {false, {}, 0};
   Checksum sum;
-  walk_arena_node(pool, *decoded->node, sum);
+  walk_noalloc_node(pool, *decoded->node, sum);
   const long long after = alloc_delta_begin();
   return {true, sum, after - before};
 }
@@ -243,7 +243,7 @@ QcborResult decode_qcbor(std::span<const std::uint8_t> bytes) {
     if (err != QCBOR_SUCCESS) return {{false, {}, 0}, static_cast<int>(err)};
     sum.items++;
     // Map/array keys come back as this item's *label*, not as a separate
-    // item the way heap/tinycbor/Arena's walkers see them -- folded in
+    // item the way heap/tinycbor/NoAlloc's walkers see them -- folded in
     // here so the cross-library checksum is actually comparable.
     if (item.uLabelType == QCBOR_TYPE_TEXT_STRING || item.uLabelType == QCBOR_TYPE_BYTE_STRING) {
       sum.items++;
@@ -328,33 +328,33 @@ double time_one_round_ns_per_call(F&& f, int iterations) {
   return std::chrono::duration<double, std::nano>(end - start).count() / iterations;
 }
 
-constexpr std::size_t kArenaMaxNodes = 65536;
-constexpr std::size_t kArenaMaxRefs = 65536;
-constexpr std::size_t kArenaMaxBytes = 262144;
+constexpr std::size_t kNoAllocMaxNodes = 65536;
+constexpr std::size_t kNoAllocMaxRefs = 65536;
+constexpr std::size_t kNoAllocMaxBytes = 262144;
 
 void run_payload(const Payload& p) {
   const std::span<const std::uint8_t> bytes(p.bytes, p.len);
-  static ConstexprCbor::Arena::ArenaStorage<kArenaMaxNodes, kArenaMaxRefs, kArenaMaxBytes> storage;
+  static ConstexprCbor::NoAlloc::NoAllocStorage<kNoAllocMaxNodes, kNoAllocMaxRefs, kNoAllocMaxBytes> storage;
   static auto pool = storage.make_pool();
 
   const auto heap_r = decode_heap(bytes);
-  const auto arena_r = decode_arena(pool, bytes);
+  const auto noalloc_r = decode_noalloc(pool, bytes);
   const auto tiny_r = decode_tinycbor(bytes);
   const auto qcbor_full = decode_qcbor(bytes);
   const auto& qcbor_r = qcbor_full.r;
   const auto libcbor_r = decode_libcbor_checksum(bytes);
 
   std::printf("\n== %s (%zu bytes) ==\n", p.name, p.len);
-  std::printf("  decode ok:  heap=%d arena=%d tinycbor=%d qcbor=%d (qcbor error=%d) libcbor=%d\n", heap_r.ok,
-              arena_r.ok, tiny_r.ok, qcbor_r.ok, qcbor_full.error, libcbor_r.ok);
-  std::printf("  checksum match: heap==arena=%d heap==tinycbor=%d heap==qcbor=%d heap==libcbor=%d\n",
-              heap_r.sum == arena_r.sum, heap_r.sum == tiny_r.sum, heap_r.sum == qcbor_r.sum,
+  std::printf("  decode ok:  heap=%d noalloc=%d tinycbor=%d qcbor=%d (qcbor error=%d) libcbor=%d\n", heap_r.ok,
+              noalloc_r.ok, tiny_r.ok, qcbor_r.ok, qcbor_full.error, libcbor_r.ok);
+  std::printf("  checksum match: heap==noalloc=%d heap==tinycbor=%d heap==qcbor=%d heap==libcbor=%d\n",
+              heap_r.sum == noalloc_r.sum, heap_r.sum == tiny_r.sum, heap_r.sum == qcbor_r.sum,
               heap_r.sum == libcbor_r.sum);
   std::printf("  items=%llu isum=%lld fsum=%.3f strbytes=%llu\n",
               static_cast<unsigned long long>(heap_r.sum.items), static_cast<long long>(heap_r.sum.isum),
               heap_r.sum.fsum, static_cast<unsigned long long>(heap_r.sum.strbytes));
   std::printf("  heap bytes allocated/decode:    %lld\n", heap_r.bytes_allocated);
-  std::printf("  arena bytes allocated/decode:   %lld\n", arena_r.bytes_allocated);
+  std::printf("  noalloc bytes allocated/decode:   %lld\n", noalloc_r.bytes_allocated);
   std::printf("  tinycbor bytes allocated/decode: %lld\n", tiny_r.bytes_allocated);
   std::printf("  qcbor bytes allocated/decode:    %lld\n", qcbor_r.bytes_allocated);
   std::printf("  libcbor bytes allocated/decode:  %lld\n", libcbor_r.bytes_allocated);
@@ -366,21 +366,21 @@ void run_payload(const Payload& p) {
   const int iters = std::max(200, p.iterations / kRounds);
 
   TimingStats heap_t{std::numeric_limits<double>::infinity(), 0.0};
-  TimingStats arena_t = heap_t, tiny_t = heap_t, qcbor_t = heap_t, libcbor_t = heap_t;
+  TimingStats noalloc_t = heap_t, tiny_t = heap_t, qcbor_t = heap_t, libcbor_t = heap_t;
 
   // A few untimed warmup calls per library first (page faults, branch
   // predictor, icache) -- done once, outside any of the timed rounds,
   // rather than re-warming inside every round.
   for (int i = 0; i < 5; ++i) {
     (void)decode_heap(bytes);
-    (void)decode_arena(pool, bytes);
+    (void)decode_noalloc(pool, bytes);
     (void)decode_tinycbor(bytes);
     (void)decode_qcbor(bytes);
     (void)decode_libcbor_checksum(bytes);
   }
 
   for (int round = 0; round < kRounds; ++round) {
-    // Interleaved within each round (heap, then arena, then tinycbor,
+    // Interleaved within each round (heap, then noalloc, then tinycbor,
     // ...) rather than running all kRounds for one library before moving
     // to the next: that way a disturbance during round N affects every
     // library's round-N measurement roughly equally, instead of being
@@ -389,9 +389,9 @@ void run_payload(const Payload& p) {
     const double h = time_one_round_ns_per_call([&] { (void)decode_heap(bytes); }, iters);
     heap_t.min_ns = std::min(heap_t.min_ns, h);
     heap_t.max_ns = std::max(heap_t.max_ns, h);
-    const double a = time_one_round_ns_per_call([&] { (void)decode_arena(pool, bytes); }, iters);
-    arena_t.min_ns = std::min(arena_t.min_ns, a);
-    arena_t.max_ns = std::max(arena_t.max_ns, a);
+    const double a = time_one_round_ns_per_call([&] { (void)decode_noalloc(pool, bytes); }, iters);
+    noalloc_t.min_ns = std::min(noalloc_t.min_ns, a);
+    noalloc_t.max_ns = std::max(noalloc_t.max_ns, a);
     const double t = time_one_round_ns_per_call([&] { (void)decode_tinycbor(bytes); }, iters);
     tiny_t.min_ns = std::min(tiny_t.min_ns, t);
     tiny_t.max_ns = std::max(tiny_t.max_ns, t);
@@ -407,14 +407,14 @@ void run_payload(const Payload& p) {
   // max alongside it so a wide min-max spread -- a sign this particular
   // run was noisy -- is visible instead of hidden behind one falsely
   // precise-looking number.
-  std::printf("  ns/decode (min, over %d rounds of %d calls): heap=%.0f arena=%.0f tinycbor=%.0f qcbor=%.0f "
+  std::printf("  ns/decode (min, over %d rounds of %d calls): heap=%.0f noalloc=%.0f tinycbor=%.0f qcbor=%.0f "
               "libcbor=%.0f\n",
-              kRounds, iters, heap_t.min_ns, arena_t.min_ns, tiny_t.min_ns, qcbor_t.min_ns, libcbor_t.min_ns);
+              kRounds, iters, heap_t.min_ns, noalloc_t.min_ns, tiny_t.min_ns, qcbor_t.min_ns, libcbor_t.min_ns);
   std::printf("  ns/decode (max, same rounds -- spread vs. min is this run's noise):"
-              " heap=%.0f arena=%.0f tinycbor=%.0f qcbor=%.0f libcbor=%.0f\n",
-              heap_t.max_ns, arena_t.max_ns, tiny_t.max_ns, qcbor_t.max_ns, libcbor_t.max_ns);
-  std::printf("  MB/s (from min): heap=%.1f arena=%.1f tinycbor=%.1f qcbor=%.1f libcbor=%.1f\n",
-              p.len / (heap_t.min_ns * 1e-3), p.len / (arena_t.min_ns * 1e-3), p.len / (tiny_t.min_ns * 1e-3),
+              " heap=%.0f noalloc=%.0f tinycbor=%.0f qcbor=%.0f libcbor=%.0f\n",
+              heap_t.max_ns, noalloc_t.max_ns, tiny_t.max_ns, qcbor_t.max_ns, libcbor_t.max_ns);
+  std::printf("  MB/s (from min): heap=%.1f noalloc=%.1f tinycbor=%.1f qcbor=%.1f libcbor=%.1f\n",
+              p.len / (heap_t.min_ns * 1e-3), p.len / (noalloc_t.min_ns * 1e-3), p.len / (tiny_t.min_ns * 1e-3),
               p.len / (qcbor_t.min_ns * 1e-3), p.len / (libcbor_t.min_ns * 1e-3));
 }
 

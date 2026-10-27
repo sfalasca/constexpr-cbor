@@ -1,13 +1,13 @@
-// See size_cc.cpp's comment -- same fairness fix, Arena mode.
-#include "constexpr_cbor_arena.hpp"
+// See size_cc.cpp's comment -- same fairness fix, NoAlloc mode.
+#include "constexpr_cbor_noalloc.hpp"
 
 namespace {
 volatile std::uint64_t sink = 0;
-ConstexprCbor::Arena::ArenaStorage<64, 64, 512> storage;
-ConstexprCbor::Arena::NodePool pool = storage.make_pool();
+ConstexprCbor::NoAlloc::NoAllocStorage<64, 64, 512> storage;
+ConstexprCbor::NoAlloc::NodePool pool = storage.make_pool();
 
-void walk(const ConstexprCbor::Arena::Node& node) {
-  using namespace ConstexprCbor::Arena;
+void walk(const ConstexprCbor::NoAlloc::Node& node) {
+  using namespace ConstexprCbor::NoAlloc;
   sink = sink + 1;
   std::visit(
       [](const auto& x) {
@@ -33,7 +33,7 @@ extern "C" bool decode_entry(const unsigned char* p, unsigned long n) {
   pool.node_count_ = 0;
   pool.ref_count_ = 0;
   pool.byte_count_ = 0;
-  const auto decoded = ConstexprCbor::Arena::decode_value(pool, std::span<const std::uint8_t>(p, n));
+  const auto decoded = ConstexprCbor::NoAlloc::decode_value(pool, std::span<const std::uint8_t>(p, n));
   if (!decoded) return false;
   walk(*decoded->node);
   return true;

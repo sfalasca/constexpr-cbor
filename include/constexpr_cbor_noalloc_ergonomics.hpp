@@ -5,43 +5,43 @@
 #include <string_view>
 
 #include "constexpr_cbor.hpp"
-#include "constexpr_cbor_arena.hpp"
+#include "constexpr_cbor_noalloc.hpp"
 
-// Opt-in ergonomic sugar for the no-malloc Arena decoder, mirroring
+// Opt-in ergonomic sugar for the no-malloc NoAlloc decoder, mirroring
 // CborValue's own is_*()/operator[]/.get<T>()/iteration surface
-// (constexpr_cbor.hpp) but read-only: Arena::Node's accessor methods still
+// (constexpr_cbor.hpp) but read-only: NoAlloc::Node's accessor methods still
 // need the pool passed explicitly for structural operations (contains(),
-// the string_view key overloads, and operator[](const ArenaView&), all of
-// which go through node_equal), so ArenaView bundles a (pool, node) pair
+// the string_view key overloads, and operator[](const NoAllocView&), all of
+// which go through node_equal), so NoAllocView bundles a (pool, node) pair
 // the same way a CborValue reference bundles its own data directly,
 // letting `view["a"][2]["b"]` chain without the caller re-threading `pool`
-// at every step. ArenaBuilder is the one mutating piece: it writes new
+// at every step. NoAllocBuilder is the one mutating piece: it writes new
 // nodes into an *existing* caller-owned NodePool's remaining capacity,
 // with every write returning std::optional (pool exhaustion is an
 // ordinary, expected failure here, unlike the heap builder where
 // std::vector growth can't fail).
 //
 // Deliberately out of scope: a mutable builder-style operator[] on
-// ArenaView itself (it would need the exact same optional-returning
+// NoAllocView itself (it would need the exact same optional-returning
 // grow/promote machinery as the heap builder, but duplicated under a
 // completely different failure contract -- not a small addition once pool
 // exhaustion is taken seriously), and brace-initializer construction (no
-// array/map literal heuristic is needed here since ArenaBuilder's
+// array/map literal heuristic is needed here since NoAllocBuilder's
 // make_array/make_map calls are explicit and unambiguous already).
-namespace ConstexprCbor::Arena {
+namespace ConstexprCbor::NoAlloc {
 
 // A single, non-template sentinel node -- the pointer-world replacement
 // for the old per-<MaxNodes,MaxBytes> sentinel pool variable template.
-// ArenaView::sentinel() needs no real pool at all: none of ArenaView's
+// NoAllocView::sentinel() needs no real pool at all: none of NoAllocView's
 // read-only predicates/accessors ever dereference `pool` for an
 // is_undefined() node, so the pool member can simply be nullptr.
 inline constexpr Node undefined_sentinel_node{.data = std::monostate{}};
 
-struct ArenaView {
+struct NoAllocView {
   const NodePool* pool;  // may be nullptr for a sentinel view -- see above
   const Node* node;
 
-  static constexpr ArenaView sentinel() { return ArenaView{nullptr, &undefined_sentinel_node}; }
+  static constexpr NoAllocView sentinel() { return NoAllocView{nullptr, &undefined_sentinel_node}; }
 
   constexpr bool is_undefined() const { return std::holds_alternative<std::monostate>(node->data); }
   constexpr bool is_null() const { return std::holds_alternative<std::nullptr_t>(node->data); }
@@ -74,7 +74,7 @@ struct ArenaView {
   }
   constexpr bool empty() const { return size() == 0; }
 
-  constexpr bool contains(const ArenaView& key) const {
+  constexpr bool contains(const NoAllocView& key) const {
     const auto* m = std::get_if<MapRef>(&node->data);
     if (!m) return false;
     for (std::size_t i = 0; i < m->count; ++i) {
@@ -83,9 +83,9 @@ struct ArenaView {
     return false;
   }
 
-  constexpr ArenaView operator[](std::size_t i) const {
+  constexpr NoAllocView operator[](std::size_t i) const {
     if (const auto* a = std::get_if<ArrayRef>(&node->data); a && i < a->count) {
-      return ArenaView{pool, a->first_child[i]};
+      return NoAllocView{pool, a->first_child[i]};
     }
     return sentinel();
   }
@@ -97,18 +97,18 @@ struct ArenaView {
   // text key (which doesn't already live in the pool), use the
   // std::string_view overload below instead, which compares string
   // *content* directly and needs no shared pool.
-  constexpr ArenaView operator[](const ArenaView& key) const {
+  constexpr NoAllocView operator[](const NoAllocView& key) const {
     if (const auto* m = std::get_if<MapRef>(&node->data)) {
       for (std::size_t i = 0; i < m->count; ++i) {
         if (node_equal(*pool, m->first_pair[2 * i], key.node)) {
-          return ArenaView{pool, m->first_pair[2 * i + 1]};
+          return NoAllocView{pool, m->first_pair[2 * i + 1]};
         }
       }
     }
     return sentinel();
   }
 
-  constexpr ArenaView operator[](std::string_view key) const {
+  constexpr NoAllocView operator[](std::string_view key) const {
     if (const auto* m = std::get_if<MapRef>(&node->data)) {
       for (std::size_t i = 0; i < m->count; ++i) {
         const auto* s = std::get_if<StringRef>(&m->first_pair[2 * i]->data);
@@ -117,7 +117,7 @@ struct ArenaView {
           if (content.size() == key.size() &&
               std::equal(content.begin(), content.end(), key.begin(),
                          [](std::uint8_t a, char b) { return a == static_cast<std::uint8_t>(b); })) {
-            return ArenaView{pool, m->first_pair[2 * i + 1]};
+            return NoAllocView{pool, m->first_pair[2 * i + 1]};
           }
         }
       }
@@ -183,8 +183,8 @@ struct ArenaView {
     } else if constexpr (std::same_as<T, std::nullptr_t>) {
       return is_null() ? std::optional<T>(nullptr) : std::nullopt;
     } else {
-      static_assert(sizeof(T) == 0, "ArenaView::get<T>() has no built-in support for this T (no ADL hook support "
-                                     "for Arena -- convert via the heap CborValue API instead if needed)");
+      static_assert(sizeof(T) == 0, "NoAllocView::get<T>() has no built-in support for this T (no ADL hook support "
+                                     "for NoAlloc -- convert via the heap CborValue API instead if needed)");
     }
   }
 
@@ -193,12 +193,12 @@ struct ArenaView {
   //
   // const_iterator/ItemsProxy are only forward-declared here, not defined
   // inline: unlike CborValue (whose own iterator nests inside a template),
-  // ArenaView is a concrete, non-template type now, and a nested class
-  // whose own fields hold ArenaView BY VALUE (ItemsProxy::Item below)
-  // needs ArenaView to already be a complete type -- which it isn't yet,
+  // NoAllocView is a concrete, non-template type now, and a nested class
+  // whose own fields hold NoAllocView BY VALUE (ItemsProxy::Item below)
+  // needs NoAllocView to already be a complete type -- which it isn't yet,
   // this early in its own body. Forward-declare, then give each its full
-  // out-of-line definition (qualified as ArenaView::const_iterator etc.)
-  // right after this struct closes, where ArenaView is complete.
+  // out-of-line definition (qualified as NoAllocView::const_iterator etc.)
+  // right after this struct closes, where NoAllocView is complete.
   struct const_iterator;
   struct ItemsProxy;
 
@@ -207,15 +207,15 @@ struct ArenaView {
   constexpr ItemsProxy items() const;
 };
 
-struct ArenaView::const_iterator {
-  const ArenaView* owner;
+struct NoAllocView::const_iterator {
+  const NoAllocView* owner;
   std::size_t index;
-  constexpr ArenaView operator*() const {
+  constexpr NoAllocView operator*() const {
     if (const auto* a = std::get_if<ArrayRef>(&owner->node->data)) {
-      return ArenaView{owner->pool, a->first_child[index]};
+      return NoAllocView{owner->pool, a->first_child[index]};
     }
     const auto& m = std::get<MapRef>(owner->node->data);
-    return ArenaView{owner->pool, m.first_pair[2 * index + 1]};
+    return NoAllocView{owner->pool, m.first_pair[2 * index + 1]};
   }
   constexpr const_iterator& operator++() {
     ++index;
@@ -224,19 +224,19 @@ struct ArenaView::const_iterator {
   constexpr bool operator==(const const_iterator& other) const { return index == other.index; }
 };
 
-struct ArenaView::ItemsProxy {
-  const ArenaView* owner;
+struct NoAllocView::ItemsProxy {
+  const NoAllocView* owner;
   struct Item {
-    ArenaView key;
-    ArenaView value;
+    NoAllocView key;
+    NoAllocView value;
   };
   struct iterator {
-    const ArenaView* owner;
+    const NoAllocView* owner;
     std::size_t index;
     constexpr Item operator*() const {
       const auto& m = std::get<MapRef>(owner->node->data);
-      return Item{ArenaView{owner->pool, m.first_pair[2 * index]},
-                  ArenaView{owner->pool, m.first_pair[2 * index + 1]}};
+      return Item{NoAllocView{owner->pool, m.first_pair[2 * index]},
+                  NoAllocView{owner->pool, m.first_pair[2 * index + 1]}};
     }
     constexpr iterator& operator++() {
       ++index;
@@ -248,18 +248,18 @@ struct ArenaView::ItemsProxy {
   constexpr iterator end() const { return iterator{owner, owner->is_map() ? owner->size() : 0}; }
 };
 
-constexpr ArenaView::const_iterator ArenaView::begin() const { return const_iterator{this, 0}; }
-constexpr ArenaView::const_iterator ArenaView::end() const { return const_iterator{this, size()}; }
-constexpr ArenaView::ItemsProxy ArenaView::items() const { return ItemsProxy{this}; }
+constexpr NoAllocView::const_iterator NoAllocView::begin() const { return const_iterator{this, 0}; }
+constexpr NoAllocView::const_iterator NoAllocView::end() const { return const_iterator{this, size()}; }
+constexpr NoAllocView::ItemsProxy NoAllocView::items() const { return ItemsProxy{this}; }
 
-constexpr ArenaView view(const NodePool& pool, const Node* node) { return ArenaView{&pool, node}; }
+constexpr NoAllocView view(const NodePool& pool, const Node* node) { return NoAllocView{&pool, node}; }
 
 // One-call ergonomic entry point: decode straight into a view.
 template <std::size_t MaxDepth = 32, typename Utf8Policy = NoUtf8Validation, typename KeyPolicy = RejectDuplicateKeys>
-constexpr std::optional<ArenaView> decode_view(NodePool& pool, std::span<const std::uint8_t> bytes) {
+constexpr std::optional<NoAllocView> decode_view(NodePool& pool, std::span<const std::uint8_t> bytes) {
   const auto decoded = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(pool, bytes);
   if (!decoded) return std::nullopt;
-  return ArenaView{&pool, decoded->node};
+  return NoAllocView{&pool, decoded->node};
 }
 
 // Minimal builder: writes new nodes into an existing, caller-owned pool's
@@ -271,19 +271,19 @@ constexpr std::optional<ArenaView> decode_view(NodePool& pool, std::span<const s
 // decode, which is policy-templated against untrusted wire input, the
 // builder just writes already-assembled pairs in order -- a caller needing
 // dedup resolves it in their own pair list first).
-struct ArenaBuilder {
+struct NoAllocBuilder {
   NodePool* pool;
 
-  constexpr std::optional<ArenaView> make_null() { return alloc(Node{.data = nullptr}); }
-  constexpr std::optional<ArenaView> make_bool(bool v) { return alloc(Node{.data = v}); }
-  constexpr std::optional<ArenaView> make_uint(std::uint64_t v) { return alloc(Node{.data = v}); }
-  constexpr std::optional<ArenaView> make_int(std::int64_t v) {
+  constexpr std::optional<NoAllocView> make_null() { return alloc(Node{.data = nullptr}); }
+  constexpr std::optional<NoAllocView> make_bool(bool v) { return alloc(Node{.data = v}); }
+  constexpr std::optional<NoAllocView> make_uint(std::uint64_t v) { return alloc(Node{.data = v}); }
+  constexpr std::optional<NoAllocView> make_int(std::int64_t v) {
     if (v >= 0) return make_uint(static_cast<std::uint64_t>(v));
     return alloc(Node{.data = NegativeInt{.n = static_cast<std::uint64_t>(-1 - v)}});
   }
-  constexpr std::optional<ArenaView> make_float(double v) { return alloc(Node{.data = v}); }
+  constexpr std::optional<NoAllocView> make_float(double v) { return alloc(Node{.data = v}); }
 
-  constexpr std::optional<ArenaView> make_text(std::string_view sv) {
+  constexpr std::optional<NoAllocView> make_text(std::string_view sv) {
     std::vector<std::uint8_t> buf(sv.size());
     for (std::size_t i = 0; i < sv.size(); ++i) {
       buf[i] = static_cast<std::uint8_t>(sv[i]);
@@ -292,28 +292,28 @@ struct ArenaBuilder {
     if (!data) return std::nullopt;
     return alloc(Node{.data = StringRef{.kind = CborValue::StringKind::Text, .data = data, .length = sv.size()}});
   }
-  constexpr std::optional<ArenaView> make_bytes(std::span<const std::uint8_t> bytes) {
+  constexpr std::optional<NoAllocView> make_bytes(std::span<const std::uint8_t> bytes) {
     const auto data = pool->allocate_bytes(bytes);
     if (!data) return std::nullopt;
     return alloc(Node{.data = StringRef{.kind = CborValue::StringKind::Bytes, .data = data, .length = bytes.size()}});
   }
 
-  constexpr std::optional<ArenaView> make_array(std::span<const ArenaView> children) {
+  constexpr std::optional<NoAllocView> make_array(std::span<const NoAllocView> children) {
     Node** first = pool->reserve_refs(children.size());
     if (!first) return std::nullopt;
     for (std::size_t i = 0; i < children.size(); ++i) {
-      ARENA_ASSERT(pool->owns(children[i].node));  // catches a child view from a different pool
+      NOALLOC_ASSERT(pool->owns(children[i].node));  // catches a child view from a different pool
       first[i] = const_cast<Node*>(children[i].node);
     }
     return alloc(Node{.data = ArrayRef{.first_child = first, .count = children.size()}});
   }
 
-  constexpr std::optional<ArenaView> make_map(std::span<const std::pair<ArenaView, ArenaView>> pairs) {
+  constexpr std::optional<NoAllocView> make_map(std::span<const std::pair<NoAllocView, NoAllocView>> pairs) {
     Node** first = pool->reserve_refs(2 * pairs.size());
     if (!first) return std::nullopt;
     for (std::size_t i = 0; i < pairs.size(); ++i) {
-      ARENA_ASSERT(pool->owns(pairs[i].first.node));
-      ARENA_ASSERT(pool->owns(pairs[i].second.node));
+      NOALLOC_ASSERT(pool->owns(pairs[i].first.node));
+      NOALLOC_ASSERT(pool->owns(pairs[i].second.node));
       first[2 * i] = const_cast<Node*>(pairs[i].first.node);
       first[2 * i + 1] = const_cast<Node*>(pairs[i].second.node);
     }
@@ -321,11 +321,11 @@ struct ArenaBuilder {
   }
 
  private:
-  constexpr std::optional<ArenaView> alloc(Node n) {
+  constexpr std::optional<NoAllocView> alloc(Node n) {
     Node* node = pool->allocate_node(n);
     if (!node) return std::nullopt;
-    return ArenaView{pool, node};
+    return NoAllocView{pool, node};
   }
 };
 
-}  // namespace ConstexprCbor::Arena
+}  // namespace ConstexprCbor::NoAlloc

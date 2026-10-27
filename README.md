@@ -144,7 +144,7 @@ UTF-8 policy above:
 an incomplete element type, which is exactly what makes a recursive value type
 possible without a heap pointer indirection of some kind — but it does mean a
 heap. For environments without one at all, `ConstexprCbor::Arena` (in its own
-header, `include/constexpr_cbor_arena.hpp`) is the no-malloc counterpart: every
+header, `include/constexpr_cbor_noalloc.hpp`) is the no-malloc counterpart: every
 decoded value is a `Node` living in storage the *caller* owns and sizes —
 `ArenaStorage<MaxNodes, MaxRefs, MaxBytes>` bundles a `Node[]`, a `Node*[]`
 reference-slot array (see below), and a flat byte array for string/bignum
@@ -156,13 +156,13 @@ below for exactly what that means and how `NodePool` defensively checks for it.
 
 The two headers are independently usable: a project that only wants the
 heap-based API includes just `constexpr_cbor.hpp`, and a project that only
-wants the no-malloc API includes just `constexpr_cbor_arena.hpp` (which pulls
+wants the no-malloc API includes just `constexpr_cbor_noalloc.hpp` (which pulls
 in `constexpr_cbor.hpp` itself, for the primitives both share — `decode_length`,
 the UTF-8 policies, `decode_byte_string`/`decode_text_string`, `decode_simple` —
 none of which allocate). Since every symbol in both headers is a template,
 including one and never touching the other costs nothing: unused templates
 generate no code. A project that wants both just includes both (or includes
-only `constexpr_cbor_arena.hpp`, since that already gets both) — doing so is
+only `constexpr_cbor_noalloc.hpp`, since that already gets both) — doing so is
 exactly how `RejectDuplicateKeys`/`KeepFirstDuplicateKey`/`KeepLastDuplicateKey`
 end up usable with *both* `decode_value` and `Arena::decode_value`: each is
 the same type in both headers (see "Pluggable duplicate-map-key policies" above
@@ -170,7 +170,7 @@ for the Arena-shaped overload each one also provides), not a parallel
 Arena-only copy of each.
 
 ```cpp
-#include "constexpr_cbor_arena.hpp"
+#include "constexpr_cbor_noalloc.hpp"
 
 using namespace ConstexprCbor;
 
@@ -388,12 +388,12 @@ instantiation failure, not a runtime/consteval-execution-time one).
 
 **Arena (`ConstexprCbor::Arena::ArenaView`)**: the same read-only surface
 (`is_*()`/`operator[]`/`.get<T>()`/iteration/`.items()`), via
-`#include "constexpr_cbor_arena_ergonomics.hpp"` — a third, separately
+`#include "constexpr_cbor_noalloc_ergonomics.hpp"` — a third, separately
 includable header (depends on both existing ones), so a minimal embedded
 consumer who only wants raw `Arena::decode_value` never pays for it:
 
 ```cpp
-#include "constexpr_cbor_arena_ergonomics.hpp"
+#include "constexpr_cbor_noalloc_ergonomics.hpp"
 using namespace ConstexprCbor::Arena;
 
 ArenaStorage<32, 32, 32> storage;

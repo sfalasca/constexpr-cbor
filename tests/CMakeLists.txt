@@ -32,29 +32,29 @@ set(positive_test_sources
     test_indefinite_length.cpp
     test_nesting_depth.cpp
     test_malformed_input.cpp
-    test_arena.cpp
-    arena_no_alloc_tests.cpp
+    test_noalloc.cpp
+    noalloc_runtime_tests.cpp
     test_ergonomics_predicates.cpp
     test_ergonomics_access.cpp
     test_ergonomics_iteration.cpp
     test_ergonomics_builder.cpp
     test_ergonomics_get.cpp
     test_ergonomics_adl.cpp
-    test_arena_view.cpp
-    test_arena_builder.cpp
+    test_noalloc_view.cpp
+    test_noalloc_builder.cpp
 )
 
-# arena_no_alloc_tests.cpp is the one source that doesn't use
-# compile_time_ut: it specifically proves Arena::decode_value/encode_value
+# noalloc_runtime_tests.cpp is the one source that doesn't use
+# compile_time_ut: it specifically proves NoAlloc::decode_value/encode_value
 # work at genuine runtime (plain, non-constexpr functions, run by ctest
 # like any other test binary), which is a different concern from
-# compile-time assertions. test_arena.cpp itself IS fully compile_time_ut
-# based: Arena::decode_value takes its NodePool by non-const reference, so
+# compile-time assertions. test_noalloc.cpp itself IS fully compile_time_ut
+# based: NoAlloc::decode_value takes its NodePool by non-const reference, so
 # the pool can never itself be a constexpr input the way sibling files'
 # plain byte vectors are, but a small constexpr helper with its own pool
 # declared and consumed entirely inside its own body is a self-contained
 # expression, usable directly as an expect_eq<>()/expect_true<>() argument.
-set(no_ctut_sources arena_no_alloc_tests.cpp)
+set(no_ctut_sources noalloc_runtime_tests.cpp)
 
 foreach(src ${positive_test_sources})
     get_filename_component(name ${src} NAME_WE)
@@ -127,8 +127,8 @@ add_compile_failure_test_with_values(wrong_shape_duplicate_key_policy
     expected_failures/wrong_shape_duplicate_key_policy.cpp LABELS policy
     EXPECT "KeyPolicy must provide static bool on_duplicate")
 
-add_compile_failure_test_with_values(wrong_shape_duplicate_key_policy_arena
-    expected_failures/wrong_shape_duplicate_key_policy_arena.cpp LABELS policy
+add_compile_failure_test_with_values(wrong_shape_duplicate_key_policy_noalloc
+    expected_failures/wrong_shape_duplicate_key_policy_noalloc.cpp LABELS policy
     EXPECT "KeyPolicy must provide static bool on_duplicate")
 
 add_compile_failure_test_with_values(ergonomics_get_unregistered_type

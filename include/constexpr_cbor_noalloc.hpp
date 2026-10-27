@@ -15,7 +15,7 @@
 // path (every Node* a well-formed decode ever sees genuinely came from
 // this pool's own nodes_ array); it exists for the genuine-misuse case
 // NodePool::owns() documents.
-#define ARENA_ASSERT(cond) assert(cond)
+#define NOALLOC_ASSERT(cond) assert(cond)
 
 // ---------------------------------------------------------------------------
 // No-malloc counterpart of constexpr_cbor.hpp, for environments where a heap
@@ -24,8 +24,8 @@
 // (for the recursive Array/Map/Tag alternatives); std::array<T,N> has no
 // such allowance, so a self-referential type cannot be stored inline in a
 // fixed-size array no matter how it's declared -- some indirection is
-// unavoidable. Here that indirection is a pointer into a Node arena the
-// caller owns, rather than a heap pointer: every decoded value (including
+// unavoidable. Here that indirection is a pointer into caller-owned Node
+// storage, rather than a heap pointer: every decoded value (including
 // every array/map element and every tag's nested value) is a Node living
 // in caller-supplied storage, and a node never contains another node by
 // value, only by pointer.
@@ -57,15 +57,15 @@
 // the UTF-8 policies, decode_byte_string/decode_text_string, decode_simple)
 // or its duplicate-key policy types: RejectDuplicateKeys/KeepFirstDuplicateKey/
 // KeepLastDuplicateKey are the exact same types usable with both
-// ConstexprCbor::decode_value and ConstexprCbor::Arena::decode_value (see
-// their Arena-shaped on_duplicate overload in constexpr_cbor.hpp), not a
-// parallel Arena-only copy of each -- "it's still a policy" means one
+// ConstexprCbor::decode_value and ConstexprCbor::NoAlloc::decode_value (see
+// their NoAlloc-shaped on_duplicate overload in constexpr_cbor.hpp), not a
+// parallel NoAlloc-only copy of each -- "it's still a policy" means one
 // coherent type per policy. A project that only wants the heap-based API
 // includes just constexpr_cbor.hpp and never pays for any of this (every
 // symbol below is a template, and templates cost nothing unless
 // instantiated); a project that only wants the no-malloc API includes just
 // this file, which pulls in constexpr_cbor.hpp transitively.
-namespace ConstexprCbor::Arena {
+namespace ConstexprCbor::NoAlloc {
 
 struct StringRef {
   CborValue::StringKind kind;
@@ -187,7 +187,7 @@ struct NodePool {
   // one derived from bad pointer arithmetic, a null/garbage value. It does
   // NOT, and cannot, catch the pool's own storage having moved out from
   // under it: nodes_/node_capacity_ are themselves just members of this
-  // object, captured once, and if the whole arena relocates without this
+  // object, captured once, and if the whole buffer relocates without this
   // NodePool's members being updated to match, every pointer involved --
   // including nodes_ itself -- is equally stale, and the comparison below
   // tells you nothing about that (it would still report ptr as "in range"
@@ -199,19 +199,19 @@ struct NodePool {
   constexpr bool owns(const Node* ptr) const { return ptr != nullptr && ptr >= nodes_ && ptr < nodes_ + node_capacity_; }
 
   constexpr const Node& child(const ArrayRef& ref, std::size_t i) const {
-    ARENA_ASSERT(owns(ref.first_child[i]));
+    NOALLOC_ASSERT(owns(ref.first_child[i]));
     return *ref.first_child[i];
   }
   constexpr const Node& map_key(const MapRef& ref, std::size_t i) const {
-    ARENA_ASSERT(owns(ref.first_pair[2 * i]));
+    NOALLOC_ASSERT(owns(ref.first_pair[2 * i]));
     return *ref.first_pair[2 * i];
   }
   constexpr const Node& map_value(const MapRef& ref, std::size_t i) const {
-    ARENA_ASSERT(owns(ref.first_pair[2 * i + 1]));
+    NOALLOC_ASSERT(owns(ref.first_pair[2 * i + 1]));
     return *ref.first_pair[2 * i + 1];
   }
   constexpr const Node& tag_child(const TagRef& ref) const {
-    ARENA_ASSERT(owns(ref.child));
+    NOALLOC_ASSERT(owns(ref.child));
     return *ref.child;
   }
 };
@@ -225,7 +225,7 @@ struct NodePool {
 // MaxRefs == MaxNodes is a safe, conservative default, but a caller
 // decoding shallowly-nested, mostly-scalar data can size it much smaller.
 template <std::size_t MaxNodes, std::size_t MaxRefs, std::size_t MaxBytes>
-struct ArenaStorage {
+struct NoAllocStorage {
   std::array<Node, MaxNodes> nodes{};
   std::array<Node*, MaxRefs> refs{};
   std::array<std::uint8_t, MaxBytes> bytes{};
@@ -377,7 +377,7 @@ constexpr std::optional<std::uint64_t> count_indefinite_map_pairs(std::span<cons
 // A CBOR length/count field is a uint64_t (the wire format allows up to
 // 2^64-1 items), but the reference-slot array indexes with std::size_t,
 // which can be narrower (32 bits on common embedded targets).
-// Arena::decode_value reserves a reference slot for every item *before*
+// NoAlloc::decode_value reserves a reference slot for every item *before*
 // decoding any of them (see the array/map cases below), so a silently-
 // truncating cast here would be exactly the libcbor PR #387 shape of bug:
 // a huge count wraps to a small one, reserve_refs "succeeds" against that
@@ -404,7 +404,7 @@ constexpr std::optional<std::size_t> checked_node_count(std::uint64_t count, std
 }  // namespace detail
 
 // Structural equality between two already-decoded nodes, by pointer --
-// needed to detect a duplicate map key, since an arena map has no flat,
+// needed to detect a duplicate map key, since a no-alloc map has no flat,
 // directly-comparable entries container the way the heap-based decoder's
 // std::vector<pair<CborValue,CborValue>> does. Mirrors CborValue's own
 // generated operator== in both scope (every alternative, including
@@ -412,8 +412,8 @@ constexpr std::optional<std::size_t> checked_node_count(std::uint64_t count, std
 // semantics (order-sensitive for arrays/maps, no canonical-equivalence
 // resolution -- bytes are bytes, same stance as the rest of this library).
 constexpr bool node_equal(const NodePool& pool, const Node* a_ptr, const Node* b_ptr) {
-  ARENA_ASSERT(pool.owns(a_ptr));
-  ARENA_ASSERT(pool.owns(b_ptr));
+  NOALLOC_ASSERT(pool.owns(a_ptr));
+  NOALLOC_ASSERT(pool.owns(b_ptr));
   const Node& a = *a_ptr;
   const Node& b = *b_ptr;
   return std::visit(
@@ -458,7 +458,7 @@ constexpr bool node_equal(const NodePool& pool, const Node* a_ptr, const Node* b
       a.data);
 }
 
-// Arena-shaped counterpart of ::ConstexprCbor::is_duplicate_key_policy_v:
+// NoAlloc-shaped counterpart of ::ConstexprCbor::is_duplicate_key_policy_v:
 // checks the on_duplicate(NodePool&, Node**, size_t, Node*, Node*) member
 // each policy in the enclosing namespace also provides. Once NodePool
 // carries no NTTPs, this overload no longer needs to be a member
@@ -470,7 +470,7 @@ constexpr bool node_equal(const NodePool& pool, const Node* a_ptr, const Node* b
 // -- see that trait's own comment for why a plain std::is_invocable_r_v
 // on a bare decltype(&P::on_duplicate) won't compile, and why the void_t
 // partial specialization (not a direct bool_constant) is required: for a
-// P that provides no Arena-shaped overload at all, the static_cast itself
+// P that provides no NoAlloc-shaped overload at all, the static_cast itself
 // is a hard "no matching function" error, and a class template's
 // base-class list isn't a SFINAE context, so void_t's own substitution-
 // failure-is-not-an-error protection is what lets this trait still
@@ -491,7 +491,7 @@ struct DecodedNode {
   std::size_t bytes_consumed;
 };
 
-// The arena counterpart of ConstexprCbor::decode_value: same contract
+// The no-alloc counterpart of ConstexprCbor::decode_value: same contract
 // (pure function over an immutable span, std::nullopt on any refusal),
 // but every allocation goes into the caller-supplied `pool` instead of the
 // heap -- running out of pool capacity is just another refusal,
@@ -750,7 +750,7 @@ constexpr bool append_bytes_into(std::span<std::uint8_t> out, std::size_t& pos, 
   return true;
 }
 
-// Mirrors ConstexprCbor::encode_float, but reuses the arena's own
+// Mirrors ConstexprCbor::encode_float, but reuses this file's own
 // detail-free primitives instead of duplicating the half/single-float
 // derivation -- half/single candidate search doesn't allocate, so it is
 // shared as-is via the free functions in the enclosing ::ConstexprCbor
@@ -779,13 +779,13 @@ constexpr bool append_float_into(std::span<std::uint8_t> out, std::size_t& pos, 
 
 }  // namespace detail
 
-// The arena counterpart of ConstexprCbor::encode_value: writes into a
+// The no-alloc counterpart of ConstexprCbor::encode_value: writes into a
 // caller-supplied fixed buffer and returns how many bytes it used, or
 // nullopt if the value doesn't fit -- never allocates, same discipline as
 // decode_value above.
 constexpr std::optional<std::size_t> encode_value(const NodePool& pool, const Node* node, std::span<std::uint8_t> out,
                                                     std::size_t pos = 0) {
-  ARENA_ASSERT(pool.owns(node));
+  NOALLOC_ASSERT(pool.owns(node));
   return std::visit(
       [&](const auto& v) -> std::optional<std::size_t> {
         using T = std::decay_t<decltype(v)>;
@@ -862,20 +862,20 @@ constexpr std::optional<std::size_t> encode_value(const NodePool& pool, const No
       node->data);
 }
 
-}  // namespace ConstexprCbor::Arena
+}  // namespace ConstexprCbor::NoAlloc
 
 namespace ConstexprCbor {
 
 // Out-of-line definition, placed here (rather than in constexpr_cbor.hpp)
-// because Arena::Node needs to be complete (see the forward declaration
+// because NoAlloc::Node needs to be complete (see the forward declaration
 // and the in-class declaration in constexpr_cbor.hpp, next to
-// RejectDuplicateKeys and KeepFirstDuplicateKey's own Arena overloads). A
+// RejectDuplicateKeys and KeepFirstDuplicateKey's own NoAlloc overloads). A
 // project that includes only constexpr_cbor.hpp never instantiates this
 // template, so it never needs this definition at all; a project that
 // includes this file gets it.
-constexpr bool KeepLastDuplicateKey::on_duplicate(Arena::NodePool&, Arena::Node** first_pair,
-                                                   std::size_t existing_pair_index, Arena::Node* /*new_key*/,
-                                                   Arena::Node* new_value) {
+constexpr bool KeepLastDuplicateKey::on_duplicate(NoAlloc::NodePool&, NoAlloc::Node** first_pair,
+                                                   std::size_t existing_pair_index, NoAlloc::Node* /*new_key*/,
+                                                   NoAlloc::Node* new_value) {
   // Overwrite the existing pair's value slot in place -- the pair stays
   // at its original position, only the reference it points to changes.
   first_pair[2 * existing_pair_index + 1] = new_value;

@@ -12,7 +12,7 @@ using namespace CompileTimeUnitTesting;
 // consteval path this file exercises.
 //
 // Each check below is a self-contained helper (build + query inside one
-// function body), matching test_arena.cpp's established convention: a
+// function body), matching test_noalloc.cpp's established convention: a
 // named variable from an *earlier statement* can't be referenced forming
 // a later expect_eq<>()/expect_true<>() NTTP, but one whose lifetime began
 // within that same evaluation (i.e. entirely inside its own helper) can.

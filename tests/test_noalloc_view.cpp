@@ -1,22 +1,22 @@
 #include "compile_time_ut.hpp"
-#include "constexpr_cbor_arena_ergonomics.hpp"
+#include "constexpr_cbor_noalloc_ergonomics.hpp"
 
 using namespace ConstexprCbor;
-using namespace ConstexprCbor::Arena;
+using namespace ConstexprCbor::NoAlloc;
 using namespace CompileTimeUnitTesting;
 
-// Decode the same bytes via both the heap decoder and Arena::decode_view,
+// Decode the same bytes via both the heap decoder and NoAlloc::decode_view,
 // prove every predicate/operator[]/.get<T>()/iteration result agrees
-// between the resulting CborValue and the resulting ArenaView.
+// between the resulting CborValue and the resulting NoAllocView.
 constexpr std::uint8_t kBytes[] = {
     0xa2,                                // map(2)
     0x61, 0x61, 0x01,                    //   "a": 1
     0x61, 0x62, 0x82, 0x02, 0x03,        //   "b": [2, 3]
 };
 
-constexpr bool heap_and_arena_agree_on_shape() {
+constexpr bool heap_and_noalloc_agree_on_shape() {
   const auto heap = decode_value(kBytes);
-  ArenaStorage<32, 32, 48> storage;
+  NoAllocStorage<32, 32, 48> storage;
   auto pool = storage.make_pool();
   const auto view = decode_view(pool, kBytes);
   if (!heap || !view) return false;
@@ -34,7 +34,7 @@ constexpr bool heap_and_arena_agree_on_shape() {
 }
 
 constexpr std::uint64_t sum_array_view_iteration() {
-  ArenaStorage<32, 32, 48> storage;
+  NoAllocStorage<32, 32, 48> storage;
   auto pool = storage.make_pool();
   const auto view = decode_view(pool, kBytes);
   if (!view) return 0;
@@ -47,7 +47,7 @@ constexpr std::uint64_t sum_array_view_iteration() {
 }
 
 constexpr bool items_proxy_matches_heap() {
-  ArenaStorage<32, 32, 48> storage;
+  NoAllocStorage<32, 32, 48> storage;
   auto pool = storage.make_pool();
   const auto view = decode_view(pool, kBytes);
   if (!view) return false;
@@ -60,7 +60,7 @@ constexpr bool items_proxy_matches_heap() {
 }
 
 constexpr bool miss_returns_undefined_sentinel() {
-  ArenaStorage<32, 32, 48> storage;
+  NoAllocStorage<32, 32, 48> storage;
   auto pool = storage.make_pool();
   const auto view = decode_view(pool, kBytes);
   if (!view) return false;
@@ -72,21 +72,21 @@ constexpr bool tags_and_bignums_agree() {
   // is_tag() and the same nested scalar.
   constexpr std::uint8_t tagged[] = {0xc1, 0x1a, 0x51, 0x4b, 0x67, 0xb0};
   const auto heap = decode_value(tagged);
-  ArenaStorage<32, 32, 48> storage;
+  NoAllocStorage<32, 32, 48> storage;
   auto pool = storage.make_pool();
   const auto view = decode_view(pool, tagged);
   if (!heap || !view) return false;
   return heap->first.is_tag() == view->is_tag();
 }
 
-consteval bool test_arena_view_parity() {
-  expect_true<heap_and_arena_agree_on_shape()>();
+consteval bool test_noalloc_view_parity() {
+  expect_true<heap_and_noalloc_agree_on_shape()>();
   expect_eq<sum_array_view_iteration(), std::uint64_t{5}>();
   expect_true<items_proxy_matches_heap()>();
   expect_true<miss_returns_undefined_sentinel()>();
   expect_true<tags_and_bignums_agree()>();
   return true;
 }
-static_assert(test_arena_view_parity());
+static_assert(test_noalloc_view_parity());
 
-int main() { return test_arena_view_parity() ? 0 : 1; }
+int main() { return test_noalloc_view_parity() ? 0 : 1; }

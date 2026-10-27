@@ -389,7 +389,7 @@ constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_
 // fall back to this (ADL user-type hook dispatch, see the definition below
 // this class) for any T that isn't one of the built-in CBOR alternatives.
 // Declaring it here (not yet defining it) is enough, the same forward-
-// declare-then-define-later pattern already used for Arena::NodePool below.
+// declare-then-define-later pattern already used for NoAlloc::NodePool below.
 template <typename T, typename = void>
 struct CborSerializer;
 
@@ -864,23 +864,23 @@ struct CborSerializer {
   }
 };
 
-// Forward declarations only: ConstexprCbor::Arena::NodePool/Node are
+// Forward declarations only: ConstexprCbor::NoAlloc::NodePool/Node are
 // defined later in this header (after this ConstexprCbor namespace
 // closes), but the duplicate-key policies just below need to declare an
-// Arena-shaped on_duplicate overload alongside their std::vector-shaped
+// NoAlloc-shaped on_duplicate overload alongside their std::vector-shaped
 // one, so that the exact same policy TYPE works for both decode_value
-// (this namespace) and Arena::decode_value -- "it's still a policy" means
-// one coherent type per policy, not a parallel Arena-only copy of each.
+// (this namespace) and NoAlloc::decode_value -- "it's still a policy" means
+// one coherent type per policy, not a parallel NoAlloc-only copy of each.
 // Declaring (not yet defining) these here is enough: the member functions
 // below are only instantiated once actually called, by which point
-// Arena's own definitions have long since appeared in the same
+// NoAlloc's own definitions have long since appeared in the same
 // translation unit. Neither type carries NTTPs: NodePool is a small,
 // non-owning, trivially-copyable view over caller-supplied storage, not a
 // container sized by template parameters.
-namespace Arena {
+namespace NoAlloc {
 struct NodePool;
 struct Node;
-}  // namespace Arena
+}  // namespace NoAlloc
 
 // ---------------------------------------------------------------------------
 // Duplicate map keys: RFC 8949 Section 5.3.1 leaves this implementation-
@@ -889,13 +889,13 @@ struct Node;
 // "bug," just an acknowledged open design question). Modeled the same way
 // as the UTF-8 policy: a type, checked against a real interface contract.
 // A concrete target function-pointer type, not a bare `decltype(&P::on_duplicate)`,
-// is required here: once the Arena-shaped on_duplicate overload below
+// is required here: once the NoAlloc-shaped on_duplicate overload below
 // exists too (a member function *template*), an unqualified address-of
 // has no target type to resolve the overload against and is ill-formed
 // ("decltype cannot resolve address of overloaded function") even for a
 // concrete, non-template P. The static_cast pins exactly this
-// std::vector-shaped overload, leaving the Arena-shaped template one to
-// its own trait in constexpr_cbor_arena.hpp.
+// std::vector-shaped overload, leaving the NoAlloc-shaped template one to
+// its own trait in constexpr_cbor_noalloc.hpp.
 // Partial specialization + void_t, not a plain std::is_invocable_r_v on a
 // bare decltype(&P::on_duplicate): the static_cast that pins the overload
 // is itself ill-formed for a P with the wrong shape entirely (casting
@@ -923,9 +923,9 @@ inline constexpr bool is_duplicate_key_policy_v = is_duplicate_key_policy<P>::va
 // on_duplicate is called when `key` has already been seen in `entries`; it
 // mutates `entries` as needed and returns false to abort the whole map's
 // decode (reject), true to continue. Each policy below also provides an
-// Arena-shaped overload (same decision, same return-value contract, just
+// NoAlloc-shaped overload (same decision, same return-value contract, just
 // expressed over pointers into the pool instead of a std::vector<pair<...>> --
-// Arena::decode_value has no flat, directly-comparable entries container
+// NoAlloc::decode_value has no flat, directly-comparable entries container
 // to search or mutate, only a pool and references into it): `first_pair`
 // is the base of the pair's contiguous Node* reference-slot block,
 // `existing_pair_index` is which already-written pair (0-based) the new
@@ -935,9 +935,9 @@ struct RejectDuplicateKeys {
   static constexpr bool on_duplicate(std::vector<std::pair<CborValue, CborValue>>&, CborValue, CborValue) {
     return false;
   }
-  static constexpr bool on_duplicate(Arena::NodePool&, Arena::Node** /*first_pair*/,
-                                      std::size_t /*existing_pair_index*/, Arena::Node* /*new_key*/,
-                                      Arena::Node* /*new_value*/) {
+  static constexpr bool on_duplicate(NoAlloc::NodePool&, NoAlloc::Node** /*first_pair*/,
+                                      std::size_t /*existing_pair_index*/, NoAlloc::Node* /*new_key*/,
+                                      NoAlloc::Node* /*new_value*/) {
     return false;
   }
 };
@@ -945,9 +945,9 @@ struct KeepFirstDuplicateKey {
   static constexpr bool on_duplicate(std::vector<std::pair<CborValue, CborValue>>&, CborValue, CborValue) {
     return true;  // first occurrence already in entries; drop this one
   }
-  static constexpr bool on_duplicate(Arena::NodePool&, Arena::Node** /*first_pair*/,
-                                      std::size_t /*existing_pair_index*/, Arena::Node* /*new_key*/,
-                                      Arena::Node* /*new_value*/) {
+  static constexpr bool on_duplicate(NoAlloc::NodePool&, NoAlloc::Node** /*first_pair*/,
+                                      std::size_t /*existing_pair_index*/, NoAlloc::Node* /*new_key*/,
+                                      NoAlloc::Node* /*new_value*/) {
     return true;  // first occurrence's pair is left exactly where it is; drop this one
   }
 };
@@ -962,15 +962,15 @@ struct KeepLastDuplicateKey {
     }
     return true;
   }
-  // Defined out-of-line, after Arena::Node is complete: GCC's
+  // Defined out-of-line, after NoAlloc::Node is complete: GCC's
   // -Wtemplate-body checks aggregate-initializer syntax eagerly against a
   // member function's body even though it's only truly instantiated once
-  // called (by which point Arena's own types have long since been fully
+  // called (by which point NoAlloc's own types have long since been fully
   // defined later in this header) -- an inline body here would hit that
   // check while Node is still just a forward declaration.
-  static constexpr bool on_duplicate(Arena::NodePool& pool, Arena::Node** first_pair,
-                                      std::size_t existing_pair_index, Arena::Node* new_key,
-                                      Arena::Node* new_value);
+  static constexpr bool on_duplicate(NoAlloc::NodePool& pool, NoAlloc::Node** first_pair,
+                                      std::size_t existing_pair_index, NoAlloc::Node* new_key,
+                                      NoAlloc::Node* new_value);
 };
 
 namespace detail {
