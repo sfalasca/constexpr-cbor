@@ -3,6 +3,12 @@
 
 using namespace ConstexprCbor;
 
+// std::isnan isn't guaranteed constexpr before C++23 and several libc++
+// releases don't mark it constexpr even then (see the matching comment in
+// constexpr_cbor.hpp) -- this test runs under static_assert, so it needs
+// the same portable, comparison-operator-only NaN check the library uses.
+constexpr bool is_nan(double v) { return v != v; }
+
 // RFC 8949 Appendix A: false -> 0xf4, true -> 0xf5, null -> 0xf6, undefined -> 0xf7.
 consteval bool test_decode_simple_matches_boolean_null_undefined_vectors() {
   using namespace CompileTimeUnitTesting;
@@ -47,7 +53,7 @@ consteval bool test_decode_simple_matches_official_half_float_vectors() {
   expect_eq<decode_simple(vec_neg_4)->as_double, -4.0>();
   expect_eq<decode_simple(vec_infinity)->as_double, std::numeric_limits<double>::infinity()>();
   expect_eq<decode_simple(vec_neg_infinity)->as_double, -std::numeric_limits<double>::infinity()>();
-  expect_eq<std::isnan(decode_simple(vec_nan)->as_double), true>();
+  expect_eq<is_nan(decode_simple(vec_nan)->as_double), true>();
   return true;
 }
 static_assert(test_decode_simple_matches_official_half_float_vectors());
@@ -67,7 +73,7 @@ consteval bool test_decode_simple_matches_official_single_float_vectors() {
   expect_eq<decode_simple(vec_largest_finite)->as_double, 3.4028234663852886e+38>();
   expect_eq<decode_simple(vec_infinity)->as_double, std::numeric_limits<double>::infinity()>();
   expect_eq<decode_simple(vec_neg_infinity)->as_double, -std::numeric_limits<double>::infinity()>();
-  expect_eq<std::isnan(decode_simple(vec_nan)->as_double), true>();
+  expect_eq<is_nan(decode_simple(vec_nan)->as_double), true>();
   return true;
 }
 static_assert(test_decode_simple_matches_official_single_float_vectors());
@@ -89,7 +95,7 @@ consteval bool test_decode_simple_matches_official_double_float_vectors() {
   expect_eq<decode_simple(vec_neg_4_1)->as_double, -4.1>();
   expect_eq<decode_simple(vec_infinity)->as_double, std::numeric_limits<double>::infinity()>();
   expect_eq<decode_simple(vec_neg_infinity)->as_double, -std::numeric_limits<double>::infinity()>();
-  expect_eq<std::isnan(decode_simple(vec_nan)->as_double), true>();
+  expect_eq<is_nan(decode_simple(vec_nan)->as_double), true>();
   return true;
 }
 static_assert(test_decode_simple_matches_official_double_float_vectors());

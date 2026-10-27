@@ -675,8 +675,8 @@ constexpr bool append_float_into(std::span<std::uint8_t> out, std::size_t& pos, 
     return true;
   }
   if (out.size() < pos + 9) return false;
-  const std::uint64_t d =
-      std::isnan(value) ? 0x7ff8000000000000ull : std::bit_cast<std::uint64_t>(value);
+  const std::uint64_t d = ConstexprCbor::detail::is_nan(value) ? 0x7ff8000000000000ull
+                                                                : std::bit_cast<std::uint64_t>(value);
   out[pos++] = 0xfb;
   for (int shift = 56; shift >= 0; shift -= 8) out[pos++] = static_cast<std::uint8_t>(d >> shift);
   return true;

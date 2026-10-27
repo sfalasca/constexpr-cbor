@@ -108,8 +108,26 @@ class ExpectedImpl {
   std::variant<T, E> storage_;
 
  public:
-  constexpr ExpectedImpl(T v) : storage_(std::in_place_index<0>, std::move(v)) {}  // NOLINT(google-explicit-constructor)
-  constexpr ExpectedImpl(Unexpected<E> u)                                          // NOLINT(google-explicit-constructor)
+  // A forwarding-reference constructor, not `ExpectedImpl(T v)` taking T
+  // by value and std::move-ing it into storage_ -- empirically, the
+  // by-value-then-move shape triggers a real constexpr evaluation bug in
+  // at least one toolchain this library targets (arm-none-eabi-g++
+  // 13.2.1's newlib libstdc++, confirmed via a minimal repro): moving an
+  // already-materialized std::string built via a non-trivial constructor
+  // (e.g. the iterator-range ctor decode_text_string's result goes
+  // through) into a std::variant's union storage loses track of which
+  // union member (_M_local_buf vs. _M_allocated_capacity) is active.
+  // Forwarding the original argument straight into std::in_place_index's
+  // construction (no intermediate named T object ever exists) avoids it
+  // -- confirmed fixed by the same minimal repro. Excludes Unexpected<E>
+  // (its own constructor below handles that) and ExpectedImpl itself (the
+  // classic "forwarding reference shadows copy/move constructor" trap,
+  // same guard CborValue's own converting constructor uses).
+  template <typename U = T>
+    requires(!std::same_as<std::remove_cvref_t<U>, Unexpected<E>> &&
+             !std::same_as<std::remove_cvref_t<U>, ExpectedImpl> && std::constructible_from<T, U&&>)
+  constexpr ExpectedImpl(U&& v) : storage_(std::in_place_index<0>, std::forward<U>(v)) {}  // NOLINT(google-explicit-constructor)
+  constexpr ExpectedImpl(Unexpected<E> u)                                                  // NOLINT(google-explicit-constructor)
       : storage_(std::in_place_index<1>, std::move(u.error)) {}
 
   constexpr bool has_value() const { return storage_.index() == 0; }
@@ -578,13 +596,19 @@ constexpr Expected<std::size_t, Error> skip_item(std::span<const std::uint8_t> b
           if (bytes.size() < consumed + chunk_len->bytes_consumed + chunk_len->value) {
             return unexpected(Error{ErrorReason::TruncatedPayload, consumed});
           }
-          consumed += chunk_len->bytes_consumed + chunk_len->value;
+          // The check above already proved consumed+bytes_consumed+value fits
+          // within bytes.size() (a std::size_t), so narrowing the uint64_t
+          // header-claimed `value` back down to std::size_t here is lossless
+          // -- same already-bounds-checked situation detail::narrow exists
+          // for, used identically by decode_byte_string/decode_text_string.
+          consumed += chunk_len->bytes_consumed + detail::narrow<std::size_t>(chunk_len->value);
         }
       }
       const auto len = decode_length(bytes);
       if (!len) return unexpected(len.error());
       if (bytes.size() < len->bytes_consumed + len->value) return unexpected(Error{ErrorReason::TruncatedPayload});
-      return len->bytes_consumed + len->value;
+      // Same reasoning as above: the check just above proves this fits.
+      return len->bytes_consumed + detail::narrow<std::size_t>(len->value);
     }
     case 4: {
       if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
@@ -1649,9 +1673,23 @@ constexpr std::vector<std::uint8_t> encode_text_string(std::span<const std::uint
 
 namespace detail {
 
+// std::isnan/std::isinf aren't guaranteed constexpr before C++23 (P0533)
+// and several libc++ releases (Clang 19-21's included, and emscripten's
+// libc++) don't mark them constexpr even then as of this writing --
+// confirmed empirically, not assumed, since this codebase's default
+// C++20 floor must stay evaluable under them. `value != value` and a
+// direct comparison against `infinity()` rely only on floating-point
+// comparison operators, which are constexpr in every standard this
+// library supports, so they're used instead everywhere a NaN/Inf check
+// has to happen in a constexpr-evaluated path.
+constexpr bool is_nan(double value) { return value != value; }
+constexpr bool is_inf(double value) {
+  return value == std::numeric_limits<double>::infinity() || value == -std::numeric_limits<double>::infinity();
+}
+
 constexpr bool bit_identical_double(double a, double b) {
-  if (std::isnan(a) || std::isnan(b)) {
-    return std::isnan(a) && std::isnan(b);
+  if (is_nan(a) || is_nan(b)) {
+    return is_nan(a) && is_nan(b);
   }
   return std::bit_cast<std::uint64_t>(a) == std::bit_cast<std::uint64_t>(b);
 }
@@ -1663,7 +1701,7 @@ constexpr bool bit_identical_double(double a, double b) {
 // rather than trusting the forward derivation blindly.
 constexpr std::optional<std::uint16_t> try_encode_half_float(double value) {
   std::uint16_t candidate;
-  if (std::isnan(value)) {
+  if (is_nan(value)) {
     candidate = 0x7e00;  // canonical NaN
   } else {
     const std::uint64_t bits64 = std::bit_cast<std::uint64_t>(value);
@@ -1676,7 +1714,7 @@ constexpr std::optional<std::uint16_t> try_encode_half_float(double value) {
     const std::uint64_t sign = bits64 >> 63;
     if (value == 0.0) {
       candidate = static_cast<std::uint16_t>(sign << 15);
-    } else if (std::isinf(value)) {
+    } else if (is_inf(value)) {
       candidate = static_cast<std::uint16_t>((sign << 15) | (0x1fu << 10));
     } else {
       const std::int64_t exponent = static_cast<std::int64_t>((bits64 >> 52) & 0x7ff) - 1023;
@@ -1707,7 +1745,7 @@ constexpr std::optional<std::uint16_t> try_encode_half_float(double value) {
 }
 
 constexpr std::optional<std::uint32_t> try_encode_single_float(double value) {
-  if (std::isnan(value)) {
+  if (is_nan(value)) {
     return std::uint32_t{0x7fc00000};  // canonical single NaN
   }
   const float as_float = static_cast<float>(value);
@@ -1728,7 +1766,7 @@ constexpr std::vector<std::uint8_t> encode_float(double value) {
     for (int shift = 24; shift >= 0; shift -= 8) out.push_back(static_cast<std::uint8_t>(*s >> shift));
     return out;
   }
-  const std::uint64_t d = std::isnan(value) ? 0x7ff8000000000000ull : std::bit_cast<std::uint64_t>(value);
+  const std::uint64_t d = detail::is_nan(value) ? 0x7ff8000000000000ull : std::bit_cast<std::uint64_t>(value);
   std::vector<std::uint8_t> out{0xfb};
   for (int shift = 56; shift >= 0; shift -= 8) out.push_back(static_cast<std::uint8_t>(d >> shift));
   return out;
