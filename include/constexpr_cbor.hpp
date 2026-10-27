@@ -6,6 +6,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <numeric>
@@ -17,12 +18,154 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include <version>
+
+#if defined(__has_include)
+#if __has_include(<expected>)
+#include <expected>
+#endif
+#endif
 
 // constexpr-cbor: a from-scratch, consteval-evaluable C++20 decoder/encoder for
 // RFC 8949 (CBOR). Every decoder here is a pure function over an immutable
-// std::span, returning a fresh std::optional -- there is no persistent mutable
-// decoder-state object to corrupt on a failed sub-decode.
+// std::span, returning a fresh ConstexprCbor::Expected -- there is no
+// persistent mutable decoder-state object to corrupt on a failed sub-decode.
 namespace ConstexprCbor {
+
+// ---------------------------------------------------------------------------
+// Every refusal in this library (malformed/truncated input, a capacity
+// limit, a type mismatch) carries one of these, plus (where meaningful) a
+// byte offset -- "truncated at byte 412" instead of just "no." offset is
+// absolute within whichever buffer is relevant (the input span while
+// decoding, the output span while encoding), and is 0/not meaningful for
+// TypeMismatch and UnsupportedUserType, which aren't buffer-position
+// failures at all -- they're "you asked for the wrong thing," not "the
+// wire format broke down at some point."
+enum class ErrorReason {
+  TruncatedInput,        // ran out of bytes before a complete header/field
+  MalformedHeader,       // reserved additional-info (28-30), wrong major type for
+                          // context, or a break marker where one isn't permitted
+  TruncatedPayload,      // a declared length/argument exceeds what's actually left
+  MaxDepthExceeded,
+  InvalidUtf8,
+  DuplicateKey,          // rejected by the active KeyPolicy
+  IntegerOutOfRange,     // NegativeInt::to_int64 / get<int64_t> narrowing failure
+  TypeMismatch,          // get<T>() / NoAllocView::get<T>() wrong active alternative
+  UnsupportedUserType,   // CborSerializer<T>::from_cbor returned false
+  NodeCapacityExhausted,  // NoAlloc only
+  RefCapacityExhausted,   // NoAlloc only
+  ByteCapacityExhausted,  // NoAlloc only (decode-side storage, or NoAllocBuilder's
+                          // make_text/make_bytes)
+  CountOverflow,          // NoAlloc only -- checked_node_count's uint64_t->size_t / *2 guard
+  OutputBufferTooSmall,   // encode_value (NoAlloc only -- heap's std::vector can't fail this way)
+};
+
+struct Error {
+  ErrorReason reason;
+  std::size_t offset = 0;
+  friend constexpr bool operator==(const Error&, const Error&) = default;
+};
+
+namespace detail {
+
+// `ConstexprCbor::Expected<T, E>` is this library's one return-type
+// spelling for "a value, or why there isn't one" -- std::expected itself
+// when the including compiler actually has it (feature-detected via the
+// standard __cpp_lib_expected macro, not guessed from a compiler version
+// number), or a small fallback otherwise. This split exists because
+// std::expected is gated to C++23 in libstdc++ (confirmed empirically:
+// `g++ -std=c++20` rejects it outright, a language-mode restriction, not
+// merely "needs a newer compiler") -- making it the literal public return
+// type everywhere would silently raise this library's documented "C++20
+// minimum" to C++23 for every consumer. One alias name, one call-site
+// spelling, regardless of which backend is actually active.
+#if defined(__cpp_lib_expected)
+
+template <typename T, typename E>
+using ExpectedImpl = std::expected<T, E>;
+using std::unexpected;
+
+#else
+
+template <typename E>
+struct Unexpected {
+  E error;
+};
+template <typename E>
+constexpr Unexpected<E> unexpected(E e) {
+  return Unexpected<E>{e};
+}
+
+// Covers exactly the operations this codebase and its tests use
+// (has_value()/operator bool, operator*/operator->() const, value_or(),
+// error(), value()) -- not a claim of full std::expected API parity (no
+// and_then/transform/or_else; nothing here calls them). Built on
+// std::variant, the same constexpr-proven building block every other
+// recursive type in this header already relies on.
+template <typename T, typename E>
+class ExpectedImpl {
+  std::variant<T, E> storage_;
+
+ public:
+  constexpr ExpectedImpl(T v) : storage_(std::in_place_index<0>, std::move(v)) {}  // NOLINT(google-explicit-constructor)
+  constexpr ExpectedImpl(Unexpected<E> u)                                          // NOLINT(google-explicit-constructor)
+      : storage_(std::in_place_index<1>, std::move(u.error)) {}
+
+  constexpr bool has_value() const { return storage_.index() == 0; }
+  constexpr explicit operator bool() const { return has_value(); }
+  constexpr const T& operator*() const { return std::get<0>(storage_); }
+  constexpr const T* operator->() const { return &std::get<0>(storage_); }
+  constexpr const E& error() const { return std::get<1>(storage_); }
+  // Both std::optional and real std::expected support comparing directly
+  // against a value convertible to T (not just against another
+  // optional/expected); several call sites in this codebase's own test
+  // suite rely on that. Declared as a hidden friend so C++20's rewritten
+  // candidates synthesize the reversed (U == ExpectedImpl) and the != forms
+  // automatically.
+  template <typename U>
+  friend constexpr bool operator==(const ExpectedImpl& lhs, const U& rhs) {
+    if (!lhs.has_value()) return false;
+    // std::cmp_equal for the integral case: an ordinary `==` between, say,
+    // a stored std::size_t and an int literal a test compares it against
+    // is exactly the kind of mixed-signedness comparison -Wsign-compare
+    // exists to catch -- real std::optional/std::expected never trips it
+    // because their comparison operators live inside a system header,
+    // exempted from this project's own warnings; this one doesn't get
+    // that exemption, so it earns the same safe-comparison treatment
+    // ConstexprCbor::detail::narrow<>() gives width narrowing elsewhere.
+    if constexpr (std::integral<T> && std::integral<U>) {
+      return std::cmp_equal(std::get<0>(lhs.storage_), rhs);
+    } else {
+      return std::get<0>(lhs.storage_) == rhs;
+    }
+  }
+  template <typename U>
+  constexpr T value_or(U&& fallback) const {
+    return has_value() ? std::get<0>(storage_) : static_cast<T>(std::forward<U>(fallback));
+  }
+  // Mirrors std::expected<T,E>::value()'s "throw on empty access" contract
+  // when exceptions are available; aborts instead under -fno-exceptions,
+  // the same fallback this library's own ARENA/NOALLOC_ASSERT-style checks
+  // already use elsewhere -- never silently returns a garbage T.
+  constexpr const T& value() const {
+    if (!has_value()) {
+#if defined(__cpp_exceptions)
+      throw std::bad_variant_access();
+#else
+      std::abort();
+#endif
+    }
+    return std::get<0>(storage_);
+  }
+};
+
+#endif  // defined(__cpp_lib_expected)
+
+}  // namespace detail
+
+template <typename T, typename E>
+using Expected = detail::ExpectedImpl<T, E>;
+using detail::unexpected;
 
 // ---------------------------------------------------------------------------
 // Negative integers: CBOR encodes major type 1 as -1 - n, n in [0, 2^64-1].
@@ -32,9 +175,9 @@ namespace ConstexprCbor {
 struct NegativeInt {
   std::uint64_t n;  // value == -1 - n
   friend constexpr bool operator==(const NegativeInt&, const NegativeInt&) = default;
-  constexpr std::optional<std::int64_t> to_int64() const {
+  constexpr Expected<std::int64_t, Error> to_int64() const {
     if (n > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-      return std::nullopt;
+      return unexpected(Error{ErrorReason::IntegerOutOfRange});
     }
     return static_cast<std::int64_t>(-1) - static_cast<std::int64_t>(n);
   }
@@ -72,21 +215,21 @@ struct DecodedUint {
   std::size_t bytes_consumed;
 };
 
-constexpr std::optional<DecodedUint> decode_length(std::span<const std::uint8_t> bytes) {
+constexpr Expected<DecodedUint, Error> decode_length(std::span<const std::uint8_t> bytes) {
   if (bytes.empty()) {
-    return std::nullopt;
+    return unexpected(Error{ErrorReason::TruncatedInput});
   }
   const std::uint8_t additional_info = bytes[0] & 0x1f;
   if (additional_info <= 23) {
     return DecodedUint{.value = additional_info, .bytes_consumed = 1};
   }
   if (additional_info > 27) {
-    return std::nullopt;  // 28-30 reserved, 31 indefinite: handled by the caller, not here
+    return unexpected(Error{ErrorReason::MalformedHeader});  // 28-30 reserved, 31 indefinite: handled by the caller
   }
   constexpr std::size_t length_bytes_for[] = {1, 2, 4, 8};
   const std::size_t length_bytes = length_bytes_for[additional_info - 24];
   if (bytes.size() < 1 + length_bytes) {
-    return std::nullopt;
+    return unexpected(Error{ErrorReason::TruncatedInput});
   }
   const auto value_bytes = bytes.subspan(1, length_bytes);
   const std::uint64_t value = std::accumulate(value_bytes.begin(), value_bytes.end(), std::uint64_t{0},
@@ -102,9 +245,9 @@ constexpr bool is_indefinite_or_break(std::span<const std::uint8_t> bytes) {
 
 // ---------------------------------------------------------------------------
 // Major type 0: unsigned integer.
-constexpr std::optional<DecodedUint> decode_uint(std::span<const std::uint8_t> bytes) {
+constexpr Expected<DecodedUint, Error> decode_uint(std::span<const std::uint8_t> bytes) {
   if (bytes.empty() || (bytes[0] >> 5) != 0) {
-    return std::nullopt;
+    return unexpected(Error{ErrorReason::MalformedHeader});
   }
   return decode_length(bytes);
 }
@@ -116,13 +259,13 @@ struct DecodedNegint {
   std::size_t bytes_consumed;
 };
 
-constexpr std::optional<DecodedNegint> decode_negint(std::span<const std::uint8_t> bytes) {
+constexpr Expected<DecodedNegint, Error> decode_negint(std::span<const std::uint8_t> bytes) {
   if (bytes.empty() || (bytes[0] >> 5) != 1) {
-    return std::nullopt;
+    return unexpected(Error{ErrorReason::MalformedHeader});
   }
   const auto len = decode_length(bytes);
   if (!len) {
-    return std::nullopt;
+    return unexpected(len.error());
   }
   return DecodedNegint{.value = NegativeInt{.n = len->value}, .bytes_consumed = len->bytes_consumed};
 }
@@ -262,41 +405,41 @@ struct DecodedBytes {
   std::size_t bytes_consumed;
 };
 
-constexpr std::optional<DecodedBytes> decode_byte_string(std::span<const std::uint8_t> bytes) {
+constexpr Expected<DecodedBytes, Error> decode_byte_string(std::span<const std::uint8_t> bytes) {
   if (bytes.empty() || (bytes[0] >> 5) != 2) {
-    return std::nullopt;
+    return unexpected(Error{ErrorReason::MalformedHeader});
   }
   const auto length_result = decode_length(bytes);
   if (!length_result) {
-    return std::nullopt;
+    return unexpected(length_result.error());
   }
   const std::size_t header_size = length_result->bytes_consumed;
   const std::size_t length = detail::narrow<std::size_t>(length_result->value);
   if (bytes.size() < header_size + length) {
-    return std::nullopt;
+    return unexpected(Error{ErrorReason::TruncatedPayload});
   }
   return DecodedBytes{.bytes = bytes.subspan(header_size, length), .bytes_consumed = header_size + length};
 }
 
 template <typename Utf8Policy = NoUtf8Validation>
-constexpr std::optional<DecodedBytes> decode_text_string(std::span<const std::uint8_t> bytes) {
+constexpr Expected<DecodedBytes, Error> decode_text_string(std::span<const std::uint8_t> bytes) {
   static_assert(is_utf8_validation_policy_v<Utf8Policy>,
                 "Utf8Policy must provide static bool is_valid(std::span<const std::uint8_t>)");
   if (bytes.empty() || (bytes[0] >> 5) != 3) {
-    return std::nullopt;
+    return unexpected(Error{ErrorReason::MalformedHeader});
   }
   const auto length_result = decode_length(bytes);
   if (!length_result) {
-    return std::nullopt;
+    return unexpected(length_result.error());
   }
   const std::size_t header_size = length_result->bytes_consumed;
   const std::size_t length = detail::narrow<std::size_t>(length_result->value);
   if (bytes.size() < header_size + length) {
-    return std::nullopt;
+    return unexpected(Error{ErrorReason::TruncatedPayload});
   }
   const auto payload = bytes.subspan(header_size, length);
   if (!Utf8Policy::is_valid(payload)) {
-    return std::nullopt;
+    return unexpected(Error{ErrorReason::InvalidUtf8});
   }
   return DecodedBytes{.bytes = payload, .bytes_consumed = header_size + length};
 }
@@ -337,9 +480,9 @@ constexpr double decode_half_float(std::uint16_t bits) {
   return std::bit_cast<double>(bits64);
 }
 
-constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_t> bytes) {
+constexpr Expected<DecodedSimple, Error> decode_simple(std::span<const std::uint8_t> bytes) {
   if (bytes.empty() || (bytes[0] >> 5) != 7) {
-    return std::nullopt;
+    return unexpected(Error{ErrorReason::MalformedHeader});
   }
   const std::uint8_t additional_info = bytes[0] & 0x1f;
   if (additional_info <= 19) {
@@ -355,18 +498,18 @@ constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_
     case 23:
       return DecodedSimple{.kind = DecodedSimple::Kind::Undefined, .bytes_consumed = 1};
     case 24: {
-      if (bytes.size() < 2) return std::nullopt;
+      if (bytes.size() < 2) return unexpected(Error{ErrorReason::TruncatedInput});
       return DecodedSimple{.kind = DecodedSimple::Kind::Simple, .simple_value = bytes[1], .bytes_consumed = 2};
     }
     case 25: {
-      if (bytes.size() < 3) return std::nullopt;
+      if (bytes.size() < 3) return unexpected(Error{ErrorReason::TruncatedInput});
       const auto value_bytes = bytes.subspan(1, 2);
       const std::uint16_t bits = std::accumulate(value_bytes.begin(), value_bytes.end(), std::uint16_t{0},
           [](std::uint16_t a, std::uint8_t b) { return static_cast<std::uint16_t>((a << 8) | b); });
       return DecodedSimple{.kind = DecodedSimple::Kind::Float, .as_double = decode_half_float(bits), .bytes_consumed = 3};
     }
     case 26: {
-      if (bytes.size() < 5) return std::nullopt;
+      if (bytes.size() < 5) return unexpected(Error{ErrorReason::TruncatedInput});
       const auto value_bytes = bytes.subspan(1, 4);
       const auto bits = std::accumulate(value_bytes.begin(), value_bytes.end(), std::uint32_t{0},
                                          [](std::uint32_t a, std::uint8_t b) { return (a << 8) | b; });
@@ -375,14 +518,15 @@ constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_
                             .bytes_consumed = 5};
     }
     case 27: {
-      if (bytes.size() < 9) return std::nullopt;
+      if (bytes.size() < 9) return unexpected(Error{ErrorReason::TruncatedInput});
       const auto value_bytes = bytes.subspan(1, 8);
       const auto bits = std::accumulate(value_bytes.begin(), value_bytes.end(), std::uint64_t{0},
                                          [](std::uint64_t a, std::uint8_t b) { return (a << 8) | b; });
       return DecodedSimple{.kind = DecodedSimple::Kind::Float, .as_double = std::bit_cast<double>(bits), .bytes_consumed = 9};
     }
     default:
-      return std::nullopt;  // reserved (28-30), break (31): not well-formed outside an indefinite-length context
+      // reserved (28-30), break (31): not well-formed outside an indefinite-length context
+      return unexpected(Error{ErrorReason::MalformedHeader});
   }
 }
 
@@ -396,98 +540,116 @@ constexpr std::optional<DecodedSimple> decode_simple(std::span<const std::uint8_
 // Deliberately duplicates some of decode_value's own structure rather than
 // sharing it: unifying "count bytes only" with "materialize a value" into
 // one templated walk would add real complexity for a marginal gain here.
+// Propagates a nested call's Error upward, adding `base` (how far into
+// *this* function's own `bytes` the failed sub-call's span started) to its
+// offset -- the sub-call reported its offset relative to its own span,
+// having no way to know where that span sits within the original
+// top-level buffer. Every recursive decoder in this header already has
+// exactly this `base`/`consumed` value in scope at every propagation
+// site, so this telescopes to a correct, absolute offset by the time an
+// error reaches the public entry point, with no new parameters threaded
+// through any signature.
+constexpr Error rebase_error(Error e, std::size_t base) {
+  e.offset += base;
+  return e;
+}
+
 template <std::size_t MaxDepth = 32>
-constexpr std::optional<std::size_t> skip_item(std::span<const std::uint8_t> bytes, std::size_t depth = 0) {
-  if (bytes.empty()) return std::nullopt;
+constexpr Expected<std::size_t, Error> skip_item(std::span<const std::uint8_t> bytes, std::size_t depth = 0) {
+  if (bytes.empty()) return unexpected(Error{ErrorReason::TruncatedInput});
   const std::uint8_t major_type = bytes[0] >> 5;
   switch (major_type) {
     case 0:
     case 1: {
       const auto len = decode_length(bytes);
-      return len ? std::optional<std::size_t>(len->bytes_consumed) : std::nullopt;
+      if (!len) return unexpected(len.error());
+      return len->bytes_consumed;
     }
     case 2:
     case 3: {
       if (is_indefinite_or_break(bytes)) {
         std::size_t consumed = 1;
         while (true) {
-          if (consumed >= bytes.size()) return std::nullopt;
+          if (consumed >= bytes.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
           if (bytes[consumed] == 0xff) return consumed + 1;
           const auto chunk_len = decode_length(bytes.subspan(consumed));
-          if (!chunk_len) return std::nullopt;
-          if (bytes.size() < consumed + chunk_len->bytes_consumed + chunk_len->value) return std::nullopt;
+          if (!chunk_len) return unexpected(rebase_error(chunk_len.error(), consumed));
+          if (bytes.size() < consumed + chunk_len->bytes_consumed + chunk_len->value) {
+            return unexpected(Error{ErrorReason::TruncatedPayload, consumed});
+          }
           consumed += chunk_len->bytes_consumed + chunk_len->value;
         }
       }
       const auto len = decode_length(bytes);
-      if (!len) return std::nullopt;
-      if (bytes.size() < len->bytes_consumed + len->value) return std::nullopt;
+      if (!len) return unexpected(len.error());
+      if (bytes.size() < len->bytes_consumed + len->value) return unexpected(Error{ErrorReason::TruncatedPayload});
       return len->bytes_consumed + len->value;
     }
     case 4: {
-      if (depth >= MaxDepth) return std::nullopt;
+      if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
       std::size_t consumed = 1;
       if (is_indefinite_or_break(bytes)) {
         while (true) {
-          if (consumed >= bytes.size()) return std::nullopt;
+          if (consumed >= bytes.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
           if (bytes[consumed] == 0xff) return consumed + 1;
           const auto item_len = skip_item<MaxDepth>(bytes.subspan(consumed), depth + 1);
-          if (!item_len) return std::nullopt;
+          if (!item_len) return unexpected(rebase_error(item_len.error(), consumed));
           consumed += *item_len;
         }
       }
       const auto len = decode_length(bytes);
-      if (!len) return std::nullopt;
+      if (!len) return unexpected(len.error());
       consumed = len->bytes_consumed;
       for (std::uint64_t i = 0; i < len->value; ++i) {
-        if (consumed > bytes.size()) return std::nullopt;
+        if (consumed > bytes.size()) return unexpected(Error{ErrorReason::TruncatedPayload, consumed});
         const auto item_len = skip_item<MaxDepth>(bytes.subspan(consumed), depth + 1);
-        if (!item_len) return std::nullopt;
+        if (!item_len) return unexpected(rebase_error(item_len.error(), consumed));
         consumed += *item_len;
       }
       return consumed;
     }
     case 5: {
-      if (depth >= MaxDepth) return std::nullopt;
+      if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
       std::size_t consumed = 1;
       const bool indefinite = is_indefinite_or_break(bytes);
       std::optional<std::uint64_t> pair_count;
       if (!indefinite) {
         const auto len = decode_length(bytes);
-        if (!len) return std::nullopt;
+        if (!len) return unexpected(len.error());
         consumed = len->bytes_consumed;
         pair_count = len->value;
       }
       std::uint64_t pairs_read = 0;
       while (indefinite ? true : pairs_read < *pair_count) {
         if (indefinite) {
-          if (consumed >= bytes.size()) return std::nullopt;
+          if (consumed >= bytes.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
           if (bytes[consumed] == 0xff) return consumed + 1;
         }
         const auto key_len = skip_item<MaxDepth>(bytes.subspan(consumed), depth + 1);
-        if (!key_len) return std::nullopt;
+        if (!key_len) return unexpected(rebase_error(key_len.error(), consumed));
         consumed += *key_len;
         const auto value_len = skip_item<MaxDepth>(bytes.subspan(consumed), depth + 1);
-        if (!value_len) return std::nullopt;
+        if (!value_len) return unexpected(rebase_error(value_len.error(), consumed));
         consumed += *value_len;
         ++pairs_read;
       }
       return consumed;
     }
     case 6: {
-      if (depth >= MaxDepth) return std::nullopt;
+      if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
       const auto len = decode_length(bytes);
-      if (!len) return std::nullopt;
+      if (!len) return unexpected(len.error());
       const auto nested_len = skip_item<MaxDepth>(bytes.subspan(len->bytes_consumed), depth + 1);
-      if (!nested_len) return std::nullopt;
+      if (!nested_len) return unexpected(rebase_error(nested_len.error(), len->bytes_consumed));
       return len->bytes_consumed + *nested_len;
     }
     case 7: {
       const auto s = decode_simple(bytes);
-      return s ? std::optional<std::size_t>(s->bytes_consumed) : std::nullopt;
+      if (!s) return unexpected(s.error());
+      return s->bytes_consumed;
     }
     default:
-      return std::nullopt;
+      return unexpected(Error{ErrorReason::MalformedHeader});
   }
 }
 
@@ -758,43 +920,43 @@ struct CborValue {
   constexpr CborValue& operator[](const CborValue& key);
 
   template <typename T>
-  constexpr std::optional<T> get() const {
+  constexpr Expected<T, Error> get() const {
     if constexpr (std::same_as<T, bool>) {
       const auto* p = std::get_if<bool>(&data);
-      return p ? std::optional<T>(*p) : std::nullopt;
+      return p ? Expected<T, Error>(*p) : unexpected(Error{ErrorReason::TypeMismatch});
     } else if constexpr (std::same_as<T, std::uint64_t>) {
       const auto* p = std::get_if<std::uint64_t>(&data);
-      return p ? std::optional<T>(*p) : std::nullopt;
+      return p ? Expected<T, Error>(*p) : unexpected(Error{ErrorReason::TypeMismatch});
     } else if constexpr (std::same_as<T, std::int64_t>) {
       if (const auto* p = std::get_if<std::uint64_t>(&data)) {
         if (*p <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
           return static_cast<std::int64_t>(*p);
         }
-        return std::nullopt;
+        return unexpected(Error{ErrorReason::IntegerOutOfRange});
       }
       if (const auto* p = std::get_if<NegativeInt>(&data)) {
         return p->to_int64();
       }
-      return std::nullopt;
+      return unexpected(Error{ErrorReason::TypeMismatch});
     } else if constexpr (std::same_as<T, double>) {
       const auto* p = std::get_if<double>(&data);
-      return p ? std::optional<T>(*p) : std::nullopt;
+      return p ? Expected<T, Error>(*p) : unexpected(Error{ErrorReason::TypeMismatch});
     } else if constexpr (std::same_as<T, std::string>) {
       const auto* p = std::get_if<OwnedString>(&data);
       if (p && p->kind == StringKind::Text) return std::string(p->content.begin(), p->content.end());
-      return std::nullopt;
+      return unexpected(Error{ErrorReason::TypeMismatch});
     } else if constexpr (std::same_as<T, std::vector<std::uint8_t>>) {
       const auto* p = std::get_if<OwnedString>(&data);
       if (p && p->kind == StringKind::Bytes) return p->content;
-      return std::nullopt;
+      return unexpected(Error{ErrorReason::TypeMismatch});
     } else if constexpr (std::same_as<T, std::monostate>) {
-      return is_undefined() ? std::optional<T>(std::monostate{}) : std::nullopt;
+      return is_undefined() ? Expected<T, Error>(std::monostate{}) : unexpected(Error{ErrorReason::TypeMismatch});
     } else if constexpr (std::same_as<T, std::nullptr_t>) {
-      return is_null() ? std::optional<T>(nullptr) : std::nullopt;
+      return is_null() ? Expected<T, Error>(nullptr) : unexpected(Error{ErrorReason::TypeMismatch});
     } else {
       T value{};
       if (CborSerializer<T>::from_cbor(*this, value)) return value;
-      return std::nullopt;
+      return unexpected(Error{ErrorReason::UnsupportedUserType});
     }
   }
 
@@ -1166,22 +1328,22 @@ namespace detail {
 // checked (QCBOR, tinycbor, and multiple unrelated CVEs all converged on an
 // explicit cap). Exceeding it is a refusal, not a crash.
 template <std::size_t MaxDepth = 32, typename Utf8Policy = NoUtf8Validation, typename KeyPolicy = RejectDuplicateKeys>
-constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::span<const std::uint8_t> bytes,
-                                                                         std::size_t depth = 0) {
+constexpr Expected<std::pair<CborValue, std::size_t>, Error> decode_value(std::span<const std::uint8_t> bytes,
+                                                                           std::size_t depth = 0) {
   if (bytes.empty()) {
-    return std::nullopt;
+    return unexpected(Error{ErrorReason::TruncatedInput});
   }
   const std::uint8_t major_type = bytes[0] >> 5;
 
   switch (major_type) {
     case 0: {
       const auto u = decode_uint(bytes);
-      if (!u) return std::nullopt;
+      if (!u) return unexpected(u.error());
       return std::pair{CborValue(u->value), u->bytes_consumed};
     }
     case 1: {
       const auto n = decode_negint(bytes);
-      if (!n) return std::nullopt;
+      if (!n) return unexpected(n.error());
       return std::pair{CborValue(n->value), n->bytes_consumed};
     }
     case 2:
@@ -1191,14 +1353,16 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
         std::vector<std::uint8_t> content;
         std::size_t consumed = 1;
         while (true) {
-          if (consumed >= bytes.size()) return std::nullopt;  // truncated: ran out of buffer before a break
+          if (consumed >= bytes.size()) {
+            return unexpected(Error{ErrorReason::TruncatedInput, consumed});  // ran out of buffer before a break
+          }
           if (bytes[consumed] == 0xff) {
             ++consumed;
             break;
           }
           const auto chunk = (major_type == 2) ? decode_byte_string(bytes.subspan(consumed))
                                                 : decode_text_string<Utf8Policy>(bytes.subspan(consumed));
-          if (!chunk) return std::nullopt;  // a chunk must itself be definite-length, same major type
+          if (!chunk) return unexpected(rebase_error(chunk.error(), consumed));  // chunk must itself be definite-length, same major type
           content.insert(content.end(), chunk->bytes.begin(), chunk->bytes.end());
           consumed += chunk->bytes_consumed;
         }
@@ -1206,32 +1370,32 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
       }
       const auto result =
           (major_type == 2) ? decode_byte_string(bytes) : decode_text_string<Utf8Policy>(bytes);
-      if (!result) return std::nullopt;
+      if (!result) return unexpected(result.error());
       return std::pair{
           CborValue(CborValue::OwnedString{.kind = kind, .content = {result->bytes.begin(), result->bytes.end()}}),
           result->bytes_consumed};
     }
     case 4: {
-      if (depth >= MaxDepth) return std::nullopt;
+      if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
       std::vector<CborValue> items;
       std::size_t consumed = 1;
       if (is_indefinite_or_break(bytes)) {
         while (true) {
-          if (consumed >= bytes.size()) return std::nullopt;
+          if (consumed >= bytes.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
           if (bytes[consumed] == 0xff) { ++consumed; break; }
           const auto item = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(bytes.subspan(consumed), depth + 1);
-          if (!item) return std::nullopt;
+          if (!item) return unexpected(rebase_error(item.error(), consumed));
           items.push_back(std::move(item->first));
           consumed += item->second;
         }
       } else {
         const auto len = decode_length(bytes);
-        if (!len) return std::nullopt;
+        if (!len) return unexpected(len.error());
         consumed = len->bytes_consumed;
         for (std::uint64_t i = 0; i < len->value; ++i) {
-          if (consumed > bytes.size()) return std::nullopt;
+          if (consumed > bytes.size()) return unexpected(Error{ErrorReason::TruncatedPayload, consumed});
           const auto item = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(bytes.subspan(consumed), depth + 1);
-          if (!item) return std::nullopt;
+          if (!item) return unexpected(rebase_error(item.error(), consumed));
           items.push_back(std::move(item->first));
           consumed += item->second;
         }
@@ -1239,7 +1403,7 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
       return std::pair{CborValue(std::move(items)), consumed};
     }
     case 5: {
-      if (depth >= MaxDepth) return std::nullopt;
+      if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
       static_assert(is_duplicate_key_policy_v<KeyPolicy>,
                     "KeyPolicy must provide static bool on_duplicate(vector<pair<CborValue,CborValue>>&, "
                     "CborValue, CborValue)");
@@ -1249,21 +1413,21 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
       std::optional<std::uint64_t> pair_count;
       if (!indefinite) {
         const auto len = decode_length(bytes);
-        if (!len) return std::nullopt;
+        if (!len) return unexpected(len.error());
         consumed = len->bytes_consumed;
         pair_count = len->value;
       }
       std::uint64_t pairs_read = 0;
       while (indefinite ? true : pairs_read < *pair_count) {
         if (indefinite) {
-          if (consumed >= bytes.size()) return std::nullopt;
+          if (consumed >= bytes.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
           if (bytes[consumed] == 0xff) { ++consumed; break; }
         }
         const auto key_result = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(bytes.subspan(consumed), depth + 1);
-        if (!key_result) return std::nullopt;
+        if (!key_result) return unexpected(rebase_error(key_result.error(), consumed));
         consumed += key_result->second;
         const auto value_result = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(bytes.subspan(consumed), depth + 1);
-        if (!value_result) return std::nullopt;
+        if (!value_result) return unexpected(rebase_error(value_result.error(), consumed));
         consumed += value_result->second;
 
         bool is_duplicate = false;
@@ -1275,7 +1439,7 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
         }
         if (is_duplicate) {
           if (!KeyPolicy::on_duplicate(entries, key_result->first, value_result->first)) {
-            return std::nullopt;
+            return unexpected(Error{ErrorReason::DuplicateKey, consumed});
           }
         } else {
           entries.emplace_back(key_result->first, value_result->first);
@@ -1285,11 +1449,11 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
       return std::pair{CborValue(std::move(entries)), consumed};
     }
     case 6: {
-      if (depth >= MaxDepth) return std::nullopt;
+      if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
       const auto len = decode_length(bytes);
-      if (!len) return std::nullopt;
+      if (!len) return unexpected(len.error());
       const auto nested = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(bytes.subspan(len->bytes_consumed), depth + 1);
-      if (!nested) return std::nullopt;
+      if (!nested) return unexpected(rebase_error(nested.error(), len->bytes_consumed));
       if (len->value == 2 || len->value == 3) {
         if (const auto* bytes_value = std::get_if<CborValue::OwnedString>(&nested->first.data);
             bytes_value && bytes_value->kind == CborValue::StringKind::Bytes) {
@@ -1305,7 +1469,7 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
     }
     case 7: {
       const auto s = decode_simple(bytes);
-      if (!s) return std::nullopt;
+      if (!s) return unexpected(s.error());
       using K = DecodedSimple::Kind;
       switch (s->kind) {
         case K::False:
@@ -1321,10 +1485,10 @@ constexpr std::optional<std::pair<CborValue, std::size_t>> decode_value(std::spa
         case K::Simple:
           return std::pair{CborValue(CborValue::SimpleValue{.number = s->simple_value}), s->bytes_consumed};
       }
-      return std::nullopt;
+      return unexpected(Error{ErrorReason::MalformedHeader});
     }
     default:
-      return std::nullopt;
+      return unexpected(Error{ErrorReason::MalformedHeader});
   }
 }
 

@@ -100,4 +100,20 @@ constexpr bool test_array_roundtrips_nested() {
 }
 static_assert(test_array_roundtrips_nested());
 
+// Proves Error.offset telescopes to an absolute position, not just that a
+// refusal happened: array([1, <truncated uint>]) with the truncated
+// element starting at byte 2 (header at 0, element 0 at 1, the malformed
+// one-byte-length-prefix uint at 2 with its required follow-on byte
+// missing) -- the reported offset must point at byte 2, not 0 (the array
+// header) or 1 (the first, perfectly well-formed element).
+consteval bool test_decode_error_offset_points_at_the_failing_element() {
+  using namespace CompileTimeUnitTesting;
+  constexpr std::uint8_t vec[] = {0x83, 0x01, 0x18};  // [1, <truncated>] (array announces 3, only 2 present)
+  expect_false<decode_value(vec).has_value()>();
+  expect_eq<decode_value(vec).error().reason, ErrorReason::TruncatedInput>();
+  expect_eq<decode_value(vec).error().offset, std::size_t{2}>();
+  return true;
+}
+static_assert(test_decode_error_offset_points_at_the_failing_element());
+
 int main() { return 0; }
