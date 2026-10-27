@@ -62,11 +62,41 @@ consteval bool round_trips() {
 static_assert(round_trips());   // fails the build if the round-trip breaks
 ```
 
-`decode_value` returns `std::optional<std::pair<CborValue, std::size_t>>` (the decoded
-value and how many bytes it consumed); a refused/malformed input is `std::nullopt`, not
-a thrown exception or an out-of-bounds read. `encode_value` always emits the
-shortest ("preferred"/canonical) encoding for a given value, which is what makes
-byte-for-byte round-trip comparison against RFC 8949's own vectors meaningful.
+`decode_value` returns `ConstexprCbor::Expected<std::pair<CborValue, std::size_t>,
+ConstexprCbor::Error>` (the decoded value and how many bytes it consumed); a refused/
+malformed input is `unexpected(Error{...})`, not a thrown exception or an out-of-bounds
+read. `Error` is `{ErrorReason reason; std::size_t offset;}` — a reason (`TruncatedInput`,
+`MaxDepthExceeded`, `InvalidUtf8`, `DuplicateKey`, ...) plus, where meaningful, the absolute
+byte position the refusal happened at, so a caller can tell *why* and *where* a decode
+failed instead of just getting a bare "no." `Expected<T, E>` behaves like `std::optional<T>`
+(`operator bool`/`operator*`/`operator->`/`.value_or()`) with an `.error()` accessor added —
+see "Why `Expected`, not `std::optional` or `std::expected` directly" below for what it
+actually is and why. `encode_value` always emits the shortest ("preferred"/canonical)
+encoding for a given value, which is what makes byte-for-byte round-trip comparison against
+RFC 8949's own vectors meaningful.
+
+## Why `Expected`, not `std::optional` or `std::expected` directly
+
+Every refusal in this library used to collapse to a bare `std::nullopt` — correct in
+spirit (no exceptions, no UB) but it threw away *why* a decode failed. `std::expected<T,
+E>` is the obvious fix, except it's gated to C++23 in libstdc++: `g++ -std=c++20` rejects
+it outright with "`std::expected` is only available from C++23 onwards" — a language-mode
+restriction, confirmed empirically, not a compiler-version problem a newer GCC/Clang would
+fix. Making `std::expected` the literal public return type would have silently raised this
+library's documented **C++20 minimum** to C++23 for every consumer.
+
+`ConstexprCbor::Expected<T, E>` resolves the tension: it's real `std::expected<T, E>` when
+the including compiler's standard library actually has it (feature-detected via the
+standard `__cpp_lib_expected` macro, not guessed from a version number), and a small,
+`std::variant`-backed fallback — covering exactly the operations this library and its
+tests use (`has_value()`/`operator bool`/`operator*`/`operator->()`/`.value_or()`/
+`.error()`/`.value()`, plus comparing directly against a `T`-ish value, the same way
+`std::optional`/`std::expected` both do) — otherwise. One alias, one call-site spelling,
+regardless of which backend is actually active; `unexpected(Error{...})` works the same
+way either side. Verified explicitly against both backends (a plain C++20 build and an
+explicit `-DCMAKE_CXX_STANDARD=23` build), not just whichever one a given toolchain happens
+to pick by default — see `docker/README.md`'s compiler matrix, which now builds and tests
+every compiler at both standards where it supports both.
 
 ## RFC 8949 Appendix A vectors as compile-time proof
 
@@ -240,20 +270,21 @@ What's structurally different from the heap-based API, and why:
   trailing slots from dropped pairs are harmless (`MapRef.count` only ever
   covers the pairs actually written).
 - **Running out of `MaxNodes`, `MaxRefs`, or `MaxBytes` is a refusal**
-  (`std::nullopt`), exactly like a malformed-input refusal elsewhere in this
-  library — never a crash or a silent truncation. Sizing `NoAllocStorage` is the
-  caller's job, the same way sizing an output buffer for `NoAlloc::encode_value`
-  is. `MaxRefs` is independent of `MaxNodes`: every node that's ever an
-  array/map child needs one reference slot, so `MaxRefs == MaxNodes` is a safe
-  default, but a caller decoding shallow, mostly-scalar data can size it
-  smaller.
+  (`unexpected(Error{NodeCapacityExhausted/RefCapacityExhausted/
+  ByteCapacityExhausted, ...})`), exactly like a malformed-input refusal
+  elsewhere in this library — never a crash or a silent truncation. Sizing
+  `NoAllocStorage` is the caller's job, the same way sizing an output buffer
+  for `NoAlloc::encode_value` is. `MaxRefs` is independent of `MaxNodes`:
+  every node that's ever an array/map child needs one reference slot, so
+  `MaxRefs == MaxNodes` is a safe default, but a caller decoding shallow,
+  mostly-scalar data can size it smaller.
 - **`NoAlloc::encode_value` writes into a caller-supplied `std::span<std::uint8_t>`**
   instead of returning a `std::vector`, returning how many bytes it used or
-  `std::nullopt` if the buffer was too small — never a truncated or
-  out-of-bounds write. Like the heap-based encoder, it always emits the
-  canonical (shortest) form: an indefinite-length input decodes fine but
-  re-encodes to its definite-length equivalent, not byte-for-byte back to the
-  original bytes.
+  `unexpected(Error{OutputBufferTooSmall, ...})` if the buffer was too small —
+  never a truncated or out-of-bounds write. Like the heap-based encoder, it
+  always emits the canonical (shortest) form: an indefinite-length input
+  decodes fine but re-encodes to its definite-length equivalent, not
+  byte-for-byte back to the original bytes.
 - **A CBOR length field is checked before it's ever cast to `std::size_t`.**
   The wire format allows an array/map to claim up to 2^64-1 items, but the
   reference-slot array indexes with `std::size_t`, which can be narrower than
@@ -263,9 +294,9 @@ What's structurally different from the heap-based API, and why:
   libcbor PR #387's bug: a huge count wraps to a small one, the reservation
   "succeeds" against that undersized number, and the loop — which still
   iterates the real, untruncated count — writes past it.
-  `NoAlloc::detail::checked_node_count` refuses (`std::nullopt`) instead, the
-  same contract every other refusal in this codec uses; it also guards the
-  `*2` a map's key+value slot pairs need.
+  `NoAlloc::detail::checked_node_count` refuses (`Error{CountOverflow, ...}`)
+  instead, the same contract every other refusal in this codec uses; it also
+  guards the `*2` a map's key+value slot pairs need.
 - **Running out of capacity, and the buffer-lifetime precondition.** Every
   `Node*` this file ever hands back is a raw, unchecked pointer into whatever
   `NoAllocStorage` the caller constructed `NodePool` over — safe as long as that
@@ -339,6 +370,15 @@ consteval bool sums_to_six() {
 static_assert(sums_to_six());
 ```
 
+An `Error`-kind event's `.error` field carries the same `ConstexprCbor::Error`
+(`ErrorReason` + byte offset) the heap and `NoAlloc` decoders report — all three paths
+share one error vocabulary, not just the two that happened to be `std::optional`-based
+before this one was Expected-ified too. One SAX-only reason exists alongside the shared
+ones: `ErrorReason::KeyTrackingCapacityExhausted`, for `MaxTrackedKeys` running out (see
+the duplicate-key policy discussion below — there's no real analog to this in the
+heap/`NoAlloc` capacity reasons, since neither of those decoders has a separate
+key-tracking budget).
+
 **Why new control flow was unavoidable, not just new API surface**: both
 the heap and no-malloc decoders always decode one fully-contained
 subtree per recursive call and return only once it's done — there's no
@@ -402,8 +442,9 @@ the duplicate-key-policy cases above.
 Both `CborValue` and the NoAlloc's `NoAllocView` support an nlohmann::json-style
 ergonomic interface on top of the raw `std::get`/`std::visit` access shown
 above — entirely additive, and kept exception-free throughout: a miss or
-type mismatch returns a shared sentinel or `std::optional`, never throws,
-preserving `-fno-exceptions` compatibility and `consteval`-safety for every
+type mismatch returns a shared sentinel or `Expected<T, Error>` (with
+`ErrorReason::TypeMismatch`), never throws, preserving `-fno-exceptions`
+compatibility and `consteval`-safety for every
 path. Their iteration is a genuine `std::ranges::forward_range` too, the
 same bar `SaxRange` is held to below (`.begin()`/`.end()`/`.items()` all
 return copyable iterators with no shared external cursor) — proven, not
@@ -415,8 +456,8 @@ just asserted, via a `static_assert(std::ranges::forward_range<...>)` in
 using namespace ConstexprCbor;
 
 CborValue config = {{"name", "sensor-1"}, {"thresholds", {10, 20, 30}}};
-config["name"].get<std::string>();          // -> std::optional<std::string>{"sensor-1"}
-config["thresholds"][1].get<std::uint64_t>();  // -> std::optional<std::uint64_t>{20}
+config["name"].get<std::string>();          // -> Expected<std::string, Error>{"sensor-1"}
+config["thresholds"][1].get<std::uint64_t>();  // -> Expected<std::uint64_t, Error>{20}
 config["missing"].is_undefined();           // -> true, no throw, no crash
 
 for (const auto& v : config["thresholds"]) { /* ... */ }
@@ -431,7 +472,7 @@ built["y"][2] = "z";       // auto-promotes/null-pads -> Array
 `is_binary()`/`is_simple()`/`is_array()`/`is_map()` (alias `is_object()`)/
 `is_tag()`, plus `size()`/`empty()`/`contains()`, `operator[]` (index, key,
 or any type implicitly convertible to `CborValue`, including string
-literals), `.get<T>()` (built-ins return `std::optional<T>`; see below for
+literals), `.get<T>()` (built-ins return `Expected<T, Error>`; see below for
 user types), range-for iteration (array elements, or map *values* — matching
 nlohmann's own default), and `.items()` (map key/value pairs).
 
@@ -474,7 +515,7 @@ constexpr bool from_cbor(const CborValue& in, Point& p) {
 }
 
 CborValue v = mylib::Point{3, 4};
-auto p = v.get<mylib::Point>();  // std::optional<mylib::Point>
+auto p = v.get<mylib::Point>();  // Expected<mylib::Point, Error>
 ```
 
 A `.get<T>()` call for a `T` with no built-in support, no ADL hook, and no
@@ -494,7 +535,7 @@ using namespace ConstexprCbor::NoAlloc;
 
 NoAllocStorage<32, 32, 32> storage;
 auto pool = storage.make_pool();
-const auto view = decode_view(pool, bytes);  // std::optional<NoAllocView>
+const auto view = decode_view(pool, bytes);  // Expected<NoAllocView, Error>
 view->operator[]("name").get<std::string>();
 for (const auto& v : (*view)["thresholds"]) { /* ... */ }
 ```
@@ -506,7 +547,7 @@ see "No-malloc decoding/encoding" above). It also provides a minimal,
 explicitly pool-exhaustion-aware **builder** (`NoAllocBuilder`, `make_null`/
 `make_bool`/`make_uint`/`make_int`/`make_float`/`make_text`/`make_bytes`/
 `make_array`/`make_map`) that writes new nodes into an *existing* pool's remaining
-capacity — every write returns `std::optional`, since pool exhaustion is an
+capacity — every write returns `Expected<NoAllocView, Error>`, since pool exhaustion is an
 ordinary, expected failure here (unlike the heap builder, where `std::vector`
 growth can't fail). `make_array`/`make_map` take already-built (post-order)
 child `NoAllocView`s into the *same* pool; `make_map` does no duplicate-key

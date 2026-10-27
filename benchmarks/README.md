@@ -460,7 +460,7 @@ specifically for).
 | Max nesting depth | Caller-tunable **per call** (`MaxDepth` NTTP, default 32, shared across all three decode paths) | Unbounded (recursion-stack-bound only — no built-in limit) | **Fixed at compile time** (`QCBOR_MAX_ARRAY_NESTING = 15`, a `#define`, not a per-call parameter) | Unbounded (recursion-stack-bound only, same as tinycbor) | varies |
 | Pluggable UTF-8 validation | Yes (`NoUtf8Validation`/`Rough`/`Complete`, policy template param, shared across all three decode paths) | No validation | No validation | No validation | No (industry-wide gap, per earlier research) |
 | Pluggable duplicate-key policy | Yes — heap/NoAlloc: `Reject`/`KeepFirst`/`KeepLast`; SAX: `Reject`/`KeepFirst`/`NoDuplicateKeyCheck` (no `KeepLast` — see top-level README for why a push-forward event stream can't support it) | No (silently accepts) | No (silently accepts) | No (silently accepts) | No |
-| Exception-free | Yes (`std::optional`, proven to compile under `-fno-exceptions`) | Yes (C) | Yes (C) | Yes (C) | varies |
+| Exception-free | Yes (`Expected<T, Error>`, proven to compile under `-fno-exceptions`) | Yes (C) | Yes (C) | Yes (C) | varies |
 | Bignum (tag 2/3) as a native value, not an opaque tag | Yes (heap/NoAlloc; SAX surfaces it as `Tag` + `ByteString`, the same shape tinycbor/libcbor already use) | No (generic tag) | Yes (`QCBOR_TYPE_POSBIGNUM`/`NEGBIGNUM`) | No (generic tag) | varies |
 | Browser/WebAssembly target proven in CI | Yes (`docker/wasm.Dockerfile`, `webapp/`) | Not out of the box | Not out of the box | Not out of the box | No |
 | Code size (this benchmark, full decode+walk) | 5.4-21 KB `.text` for one call, depending on decode path | 6.5 KB | 6.0 KB | 15.3 KB | — |

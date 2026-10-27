@@ -46,9 +46,9 @@ void decode_and_inspect() {
   // RFC 8949 Appendix A: {"a": 1, "b": [2, 3]} -> 0xa26161016162820203
   constexpr std::uint8_t bytes[] = {0xa2, 0x61, 0x61, 0x01, 0x61, 0x62, 0x82, 0x02, 0x03};
 
-  // decode_value returns std::optional<std::pair<CborValue, bytes_consumed>>
-  // -- std::nullopt on anything malformed, never a thrown exception or an
-  // out-of-bounds read.
+  // decode_value returns Expected<std::pair<CborValue, bytes_consumed>, Error>
+  // -- unexpected(Error{...}) on anything malformed, never a thrown exception
+  // or an out-of-bounds read.
   const auto decoded = decode_value(bytes);
   if (!decoded) {
     std::cout << "decode failed\n";
@@ -56,7 +56,7 @@ void decode_and_inspect() {
   }
   const CborValue& value = decoded->first;
 
-  // operator[] (by key or index), .get<T>() (returns std::optional<T>, no
+  // operator[] (by key or index), .get<T>() (returns Expected<T, Error>, no
   // throw on a miss or type mismatch), and range-for all work the same
   // way nlohmann::json's do.
   std::cout << "a = " << *value["a"].get<std::uint64_t>() << '\n';
@@ -122,6 +122,22 @@ void policy_choices() {
   std::cout << "KeepLastDuplicateKey's surviving value for key 1: " << surviving_value << " (expected 3)\n";
 }
 
+void inspect_a_decode_error() {
+  std::cout << "\n--- inspecting a refusal's Error (reason + byte offset) ---\n";
+
+  // [1, <truncated uint>]: a well-formed 1 at byte 1, then a one-byte-
+  // length-prefix uint header at byte 2 with its required follow-on byte
+  // missing. decode_value doesn't just say "no" -- it says *why* and
+  // *where*.
+  constexpr std::uint8_t truncated[] = {0x83, 0x01, 0x18};
+  const auto decoded = decode_value(truncated);
+  if (!decoded) {
+    const Error& err = decoded.error();
+    std::cout << "refused: reason=" << static_cast<int>(err.reason) << " (TruncatedInput="
+              << static_cast<int>(ErrorReason::TruncatedInput) << ") offset=" << err.offset << " (expected 2)\n";
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -129,5 +145,6 @@ int main() {
   build_and_encode();
   user_type_hook();
   policy_choices();
+  inspect_a_decode_error();
   return 0;
 }
