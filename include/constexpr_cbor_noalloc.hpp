@@ -5,66 +5,35 @@
 
 #include "constexpr_cbor.hpp"
 
-// assert() is used deliberately, not a bespoke contract-check helper: it
-// never throws (abort()s directly, so it's -fno-exceptions-compatible),
-// NDEBUG strips it in release builds, and inside a consteval/constexpr
-// evaluation a *failing* assert() simply makes the enclosing expression
-// not a core constant expression -- GCC/Clang report that as an ordinary
-// compile error, which is exactly the desired "foreign pointer => hard
-// failure" behavior. It never actually fires on the legitimate decode
-// path (every Node* a well-formed decode ever sees genuinely came from
-// this pool's own nodes_ array); it exists for the genuine-misuse case
-// NodePool::owns() documents.
+// assert() is used deliberately: it never throws (so it works with
+// -fno-exceptions), NDEBUG strips it, and a failing assert() inside constant
+// evaluation makes the expression non-constant, which compilers report as an
+// ordinary error. It never fires on the legitimate decode path; it exists for
+// the misuse case NodePool::owns() documents.
 #define NOALLOC_ASSERT(cond) assert(cond)
 
 // ---------------------------------------------------------------------------
-// No-malloc counterpart of constexpr_cbor.hpp, for environments where a heap
-// (and therefore std::vector) isn't available at all. CborValue's own design
-// relies on std::vector<CborValue> permitting an incomplete element type
-// (for the recursive Array/Map/Tag alternatives); std::array<T,N> has no
-// such allowance, so a self-referential type cannot be stored inline in a
-// fixed-size array no matter how it's declared -- some indirection is
-// unavoidable. Here that indirection is a pointer into caller-owned Node
-// storage, rather than a heap pointer: every decoded value (including
-// every array/map element and every tag's nested value) is a Node living
-// in caller-supplied storage, and a node never contains another node by
-// value, only by pointer.
+// No-malloc counterpart of constexpr_cbor.hpp, for environments without a heap.
+// CborValue relies on std::vector permitting an incomplete element type for its
+// recursive alternatives; std::array does not, so some indirection is
+// unavoidable. Here every decoded value is a Node in caller-supplied storage,
+// and a node refers to other nodes only by pointer.
 //
-// The caller owns three things: a Node[] (every scalar and composite node),
-// a Node*[] (reference slots -- see ArrayRef/MapRef below for why these are
-// a separate category from Node[] itself), and a byte[] (the flat backing
-// store for every string/bignum's content). NodePool is a small, non-
-// owning, trivially-copyable VIEW over those three caller-owned spans --
-// never itself the thing that owns storage, the same relationship
-// std::span has to the container it views. This is a deliberate split: the
-// one thing this whole design depends on is that the caller's buffers
-// don't move or get destroyed while any decoded tree pointing into them is
-// still alive (every Node* this file ever hands back is a raw, unchecked
-// pointer into that caller storage) -- and separating "the view" from "the
-// storage" means the view can be freely copied/returned/reassigned without
-// that ever being a concern, while the storage itself is the caller's own,
-// ordinary local/static object, whose lifetime the caller already
-// understands and controls (a std::array on their stack, a static, a
-// member of a longer-lived object -- anything with a stable address for as
-// long as the decoded tree is used). See NodePool::owns() below for a
-// defensive, best-effort runtime check against a *different* mistake
-// (handing this pool a Node* that was never actually one of its own) --
-// it is not, and cannot be, a substitute for the caller upholding the
-// buffer's lifetime, which no runtime check can establish after the fact.
+// The caller owns three buffers: a Node[] (scalar and composite nodes), a
+// Node*[] (reference slots; see ArrayRef/MapRef), and a byte[] (string and
+// bignum content). NodePool is a non-owning, trivially copyable view over them,
+// like std::span, so it can be copied freely while the storage stays an
+// ordinary object whose lifetime the caller controls.
 //
-// This file #includes constexpr_cbor.hpp rather than duplicating its
-// shared, non-allocating primitives (decode_length, decode_uint/negint,
-// the UTF-8 policies, decode_byte_string/decode_text_string, decode_simple)
-// or its duplicate-key policy types: RejectDuplicateKeys/KeepFirstDuplicateKey/
-// KeepLastDuplicateKey are the exact same types usable with both
-// ConstexprCbor::decode_value and ConstexprCbor::NoAlloc::decode_value (see
-// their NoAlloc-shaped on_duplicate overload in constexpr_cbor.hpp), not a
-// parallel NoAlloc-only copy of each -- "it's still a policy" means one
-// coherent type per policy. A project that only wants the heap-based API
-// includes just constexpr_cbor.hpp and never pays for any of this (every
-// symbol below is a template, and templates cost nothing unless
-// instantiated); a project that only wants the no-malloc API includes just
-// this file, which pulls in constexpr_cbor.hpp transitively.
+// The caller must keep those buffers alive and in place for as long as any
+// decoded tree points into them. NodePool::owns() is a best-effort check for a
+// different mistake (a Node* that never belonged to this pool); no runtime
+// check can establish the lifetime precondition.
+//
+// This file includes constexpr_cbor.hpp and reuses its primitives and
+// duplicate-key policy types, so one policy type works with both
+// ConstexprCbor::decode_value and NoAlloc::decode_value. Everything here is a
+// template, so including only constexpr_cbor.hpp costs nothing.
 namespace ConstexprCbor::NoAlloc {
 
 struct StringRef {
@@ -106,17 +75,13 @@ struct Node {
   friend constexpr bool operator==(const Node&, const Node&) = default;
 };
 
-// A small, non-owning, trivially-copyable VIEW over three caller-owned
-// spans -- see this file's own top-of-file comment for the ownership split
-// this embodies and the precondition it rests on (the caller's storage
-// must not move or die while any decoded tree into it is alive).
+// Non-owning view over three caller-owned spans (see the top-of-file comment for
+// the ownership rules).
 //
-// node_storage holds every scalar and composite Node this value's whole
-// decoded tree may need; ref_storage holds the flat Node* reference slots
-// array/map children are indexed through (see ArrayRef/MapRef above);
-// byte_storage backs every string/bignum's content. Running out of any of
-// the three during decode is a refusal, not a crash -- exactly like every
-// other contract violation in this codec.
+// node_storage holds every Node the decoded tree needs; ref_storage holds the
+// Node* slots that array/map children are indexed through (see ArrayRef/MapRef);
+// byte_storage backs string and bignum content. Running out of any of them is
+// an error, not a crash.
 struct NodePool {
   Node* nodes_ = nullptr;
   std::size_t node_capacity_ = 0;
@@ -145,12 +110,9 @@ struct NodePool {
     return &nodes_[node_count_++];
   }
 
-  // Reserves `count` contiguous reference slots (left uninitialized --
-  // every caller of this immediately overwrites each one before anyone
-  // reads it back), returning a pointer to the first one, or nullptr if
-  // they wouldn't fit. This is the slot array ArrayRef/MapRef index
-  // through; it is NOT a Node allocation, which is the whole point of
-  // this design -- see this file's own top comment.
+  // Reserves `count` contiguous reference slots (left uninitialized; callers
+  // overwrite each before reading) and returns the first, or nullptr if they
+  // do not fit. This is not a Node allocation.
   constexpr Node** reserve_refs(std::size_t count) {
     if (count > ref_capacity_ - ref_count_) return nullptr;
     Node** first = &refs_[ref_count_];
@@ -161,11 +123,7 @@ struct NodePool {
   constexpr const std::uint8_t* allocate_bytes(std::span<const std::uint8_t> src) {
     if (src.size() > byte_capacity_ - byte_count_) return nullptr;
     std::uint8_t* dest = bytes_begin_ + byte_count_;
-    // std::copy over a contiguous range of a trivial type lowers to
-    // memmove at -O2 (unlike the equivalent index-and-increment loop,
-    // which a compiler is free to but isn't guaranteed to recognize the
-    // same way); std::copy is constexpr since C++20, so this stays valid
-    // in the consteval decode paths too.
+    // std::copy lowers to memmove at -O2 and is constexpr since C++20.
     std::copy(src.begin(), src.end(), dest);
     byte_count_ += src.size();
     return dest;
@@ -178,24 +136,12 @@ struct NodePool {
     return std::span<const std::uint8_t>(ref.data, ref.length);
   }
 
-  // Best-effort, debug-only (NDEBUG-stripped, like the plain assert() it
-  // wraps elsewhere) check that `ptr` genuinely points somewhere inside
-  // this pool's own node storage -- a pure address-range comparison, never
-  // a dereference, so it works regardless of whether `*ptr` itself would
-  // be safe to read. This catches a Node* that doesn't belong to this pool
-  // at all: one left over from an unrelated or already-destroyed pool,
-  // one derived from bad pointer arithmetic, a null/garbage value. It does
-  // NOT, and cannot, catch the pool's own storage having moved out from
-  // under it: nodes_/node_capacity_ are themselves just members of this
-  // object, captured once, and if the whole buffer relocates without this
-  // NodePool's members being updated to match, every pointer involved --
-  // including nodes_ itself -- is equally stale, and the comparison below
-  // tells you nothing about that (it would still report ptr as "in range"
-  // relative to those equally-stale bounds). That category of mistake --
-  // the backing buffer itself moving -- is the one genuinely uncatchable
-  // precondition violation this design has; see this file's own top
-  // comment for why pointers are safe to use here regardless, as long as
-  // that precondition holds.
+  // Best-effort, debug-only check that `ptr` points inside this pool's node
+  // storage. A pure address-range comparison, never a dereference. Catches a
+  // Node* from an unrelated or destroyed pool, bad pointer arithmetic, or
+  // null/garbage. Cannot catch the backing buffer itself having moved: the
+  // pool's own bounds would be equally stale, so the comparison would still
+  // pass.
   constexpr bool owns(const Node* ptr) const { return ptr != nullptr && ptr >= nodes_ && ptr < nodes_ + node_capacity_; }
 
   constexpr const Node& child(const ArrayRef& ref, std::size_t i) const {
@@ -216,14 +162,10 @@ struct NodePool {
   }
 };
 
-// Owning storage for a NodePool: the direct successor of this file's
-// earlier NTTP-sized NodePool<MaxNodes,MaxBytes>, now explicitly "the
-// buffer" rather than "the allocator" (NodePool above is the allocator --
-// see the split explained in this file's top comment). MaxRefs is an
-// independently-tunable third capacity, distinct from MaxNodes: every node
-// that's ever an array/map child needs exactly one reference slot, so
-// MaxRefs == MaxNodes is a safe, conservative default, but a caller
-// decoding shallowly-nested, mostly-scalar data can size it much smaller.
+// Owning storage for a NodePool (NodePool is the view, this is the buffer).
+// MaxRefs is tunable independently of MaxNodes: every array/map child needs one
+// reference slot, so MaxRefs == MaxNodes is a safe default, but shallow,
+// mostly-scalar data can use far fewer.
 template <std::size_t MaxNodes, std::size_t MaxRefs, std::size_t MaxBytes>
 struct NoAllocStorage {
   std::array<Node, MaxNodes> nodes{};
@@ -233,16 +175,13 @@ struct NoAllocStorage {
   constexpr NodePool make_pool() { return NodePool(nodes, refs, bytes); }
 };
 
-// skip_item<MaxDepth> itself now lives in constexpr_cbor.hpp, shared with
-// the SAX decoder -- this file only adds the indefinite-length pre-counting
-// built on top of it, which is specific to needing a reference-slot count
-// before any child is decoded.
+// skip_item lives in constexpr_cbor.hpp (shared with the SAX decoder). This file
+// adds the pre-counting of indefinite-length containers, needed because the
+// reference slots must be reserved before any child is decoded.
 namespace detail {
 
-// Counts how many items precede the 0xff break in an indefinite-length
-// array, without allocating anything -- the pre-pass that lets the real
-// decode below reserve the right-sized contiguous slot before decoding
-// any child, instead of after.
+// Counts the items before the 0xff break in an indefinite-length array, without
+// allocating, so the real decode can reserve slots first.
 template <std::size_t MaxDepth>
 constexpr Expected<std::uint64_t, Error> count_indefinite_array_items(std::span<const std::uint8_t> body) {
   std::uint64_t count = 0;
@@ -257,7 +196,7 @@ constexpr Expected<std::uint64_t, Error> count_indefinite_array_items(std::span<
   }
 }
 
-// Same idea, but walks key+value pairs.
+// Same, for key+value pairs.
 template <std::size_t MaxDepth>
 constexpr Expected<std::uint64_t, Error> count_indefinite_map_pairs(std::span<const std::uint8_t> body) {
   std::uint64_t count = 0;
@@ -275,43 +214,30 @@ constexpr Expected<std::uint64_t, Error> count_indefinite_map_pairs(std::span<co
   }
 }
 
-// A CBOR length/count field is a uint64_t (the wire format allows up to
-// 2^64-1 items), but the reference-slot array indexes with std::size_t,
-// which can be narrower (32 bits on common embedded targets).
-// NoAlloc::decode_value reserves a reference slot for every item *before*
-// decoding any of them (see the array/map cases below), so a silently-
-// truncating cast here would be exactly the libcbor PR #387 shape of bug:
-// a huge count wraps to a small one, reserve_refs "succeeds" against that
-// undersized number, and the loop -- which still iterates the real,
-// untruncated uint64_t count -- then writes past the reservation.
-// `multiplier` additionally guards the *2 the map case needs for its
-// key+value slot pairs. Returns nullopt (the same refusal every other
-// contract violation in this codec uses) instead of truncating.
+// A CBOR count is a uint64_t, but reference slots are indexed with size_t, which
+// is 32 bits on common embedded targets. decode_value reserves slots for all
+// items before decoding any, so a truncating cast would be the libcbor PR #387
+// bug: a huge count wraps small, the reservation succeeds, and the loop (which
+// still runs the real count) writes past it.
+// `multiplier` also guards the *2 the map case needs for key+value slots.
+// Returns nullopt instead of truncating.
 constexpr Expected<std::size_t, Error> checked_node_count(std::uint64_t count, std::size_t multiplier = 1) {
   const std::uint64_t size_max = std::numeric_limits<std::size_t>::max();
   const std::uint64_t wide_multiplier = multiplier;
   if (multiplier > 1 && count > size_max / wide_multiplier) return unexpected(Error{ErrorReason::CountOverflow});
   if (count > size_max) return unexpected(Error{ErrorReason::CountOverflow});
-  // ConstexprCbor::detail::narrow, not a plain copy-init: size_t and
-  // uint64_t are the identical type on a 64-bit target (where an explicit
-  // static_cast between them is a literal no-op GCC's -Wuseless-cast
-  // flags), but genuinely different widths on a 32-bit one (wasm32 via
-  // Emscripten, or a 32-bit embedded target), where this is exactly the
-  // narrowing this function exists to guard, not hide -- narrow<>() picks
-  // whichever of those two is actually true for the target at hand.
+  // narrow<> rather than a plain copy: size_t and uint64_t are the same type on
+  // 64-bit targets but differ on 32-bit ones, where this is exactly the
+  // narrowing the function guards.
   return ConstexprCbor::detail::narrow<std::size_t>(count * wide_multiplier);
 }
 
 }  // namespace detail
 
-// Structural equality between two already-decoded nodes, by pointer --
-// needed to detect a duplicate map key, since a no-alloc map has no flat,
-// directly-comparable entries container the way the heap-based decoder's
-// std::vector<pair<CborValue,CborValue>> does. Mirrors CborValue's own
-// generated operator== in both scope (every alternative, including
-// Array/Map/Tag keys, which are legal CBOR map keys even if unusual) and
-// semantics (order-sensitive for arrays/maps, no canonical-equivalence
-// resolution -- bytes are bytes, same stance as the rest of this library).
+// Structural equality between two decoded nodes, by pointer, used to detect
+// duplicate map keys (a no-alloc map has no flat entries container to compare).
+// Matches CborValue's operator==: every alternative, order-sensitive for
+// arrays/maps, and no canonical-equivalence resolution (bytes are bytes).
 constexpr bool node_equal(const NodePool& pool, const Node* a_ptr, const Node* b_ptr) {
   NOALLOC_ASSERT(pool.owns(a_ptr));
   NOALLOC_ASSERT(pool.owns(b_ptr));
@@ -359,23 +285,11 @@ constexpr bool node_equal(const NodePool& pool, const Node* a_ptr, const Node* b
       a.data);
 }
 
-// NoAlloc-shaped counterpart of ::ConstexprCbor::is_duplicate_key_policy_v:
-// checks the on_duplicate(NodePool&, Node**, size_t, Node*, Node*) member
-// each policy in the enclosing namespace also provides. Once NodePool
-// carries no NTTPs, this overload no longer needs to be a member
-// *template* either -- but that also means a bare `&P::on_duplicate` is
-// now ambiguous between it and the heap-shaped std::vector overload (both
-// are plain, non-template overloads of the same name), so this needs the
-// same static_cast-to-a-concrete-function-pointer-type pin
-// ::ConstexprCbor::is_duplicate_key_policy_v uses for exactly that reason
-// -- see that trait's own comment for why a plain std::is_invocable_r_v
-// on a bare decltype(&P::on_duplicate) won't compile, and why the void_t
-// partial specialization (not a direct bool_constant) is required: for a
-// P that provides no NoAlloc-shaped overload at all, the static_cast itself
-// is a hard "no matching function" error, and a class template's
-// base-class list isn't a SFINAE context, so void_t's own substitution-
-// failure-is-not-an-error protection is what lets this trait still
-// evaluate to false instead of aborting compilation.
+// NoAlloc counterpart of ConstexprCbor::is_duplicate_key_policy_v, checking the
+// on_duplicate(NodePool&, Node**, size_t, Node*, Node*) overload. A bare
+// &P::on_duplicate is ambiguous against the std::vector overload, so it is
+// pinned with a static_cast inside a void_t partial specialization, which makes
+// the trait false (instead of a hard error) for a P without this overload.
 template <typename P, typename = void>
 struct is_duplicate_key_policy : std::false_type {};
 
@@ -392,12 +306,9 @@ struct DecodedNode {
   std::size_t bytes_consumed;
 };
 
-// The no-alloc counterpart of ConstexprCbor::decode_value: same contract
-// (pure function over an immutable span, std::nullopt on any refusal),
-// but every allocation goes into the caller-supplied `pool` instead of the
-// heap -- running out of pool capacity is just another refusal,
-// indistinguishable from a malformed-input one, exactly like
-// NodePool::allocate_node/reserve_refs/allocate_bytes already do.
+// No-alloc counterpart of ConstexprCbor::decode_value: a pure function over an
+// immutable span that returns nullopt on any failure. Allocations come from the
+// caller-supplied `pool`, and running out of capacity is just another failure.
 template <std::size_t MaxDepth = 32, typename Utf8Policy = NoUtf8Validation, typename KeyPolicy = RejectDuplicateKeys>
 constexpr Expected<DecodedNode, Error> decode_value(NodePool& pool, std::span<const std::uint8_t> bytes,
                                                       std::size_t depth = 0) {
@@ -467,12 +378,9 @@ constexpr Expected<DecodedNode, Error> decode_value(NodePool& pool, std::span<co
       if (!safe_count) return unexpected(safe_count.error());
       const auto first_slot = pool.reserve_refs(*safe_count);
       if (!first_slot) return unexpected(Error{ErrorReason::RefCapacityExhausted, consumed});
-      // size_t loop counter, not uint64_t: count == *safe_count numerically
-      // (checked_node_count already proved count fits in size_t), so
-      // iterating directly in size_t avoids ever narrowing a uint64_t loop
-      // index into item_index -- the narrowing itself, not just the value,
-      // is what a 32-bit size_t target (e.g. wasm32 via Emscripten) flags,
-      // even though the value was always in range.
+      // size_t loop counter: checked_node_count proved the count fits, and a
+      // uint64_t index narrowed into item_index would warn on 32-bit size_t
+      // targets even though the value is in range.
       for (std::size_t i = 0; i < *safe_count; ++i) {
         if (consumed > bytes.size()) return unexpected(Error{ErrorReason::TruncatedPayload, consumed});
         const auto item = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(pool, bytes.subspan(consumed), depth + 1);
@@ -507,16 +415,10 @@ constexpr Expected<DecodedNode, Error> decode_value(NodePool& pool, std::span<co
         consumed = len->bytes_consumed;
         pair_count = len->value;
       }
-      // Upper-bound reservation: every parsed pair reserves a slot, but a
-      // pair a policy drops (KeepFirstDuplicateKey) or merges into an
-      // earlier one (KeepLastDuplicateKey) never advances `written`, so
-      // some reserved slots at the tail may go unused -- harmless, since
-      // MapRef.count == written and map_key/map_value only ever index
-      // [0, written). checked_node_count(pair_count, 2) guards both the
-      // *2 and the uint64_t->size_t narrowing in one place (see its own
-      // comment for why: a silently-truncating cast here would reserve an
-      // undersized block for a count the loop below still iterates in
-      // full, the same shape as libcbor PR #387).
+      // Upper-bound reservation. A pair dropped by KeepFirstDuplicateKey or
+      // merged by KeepLastDuplicateKey never advances `written`, so tail slots
+      // may go unused; that is harmless because MapRef.count == written.
+      // checked_node_count guards the *2 and the narrowing (see its comment).
       const auto safe_pair_count = detail::checked_node_count(pair_count, 2);
       if (!safe_pair_count) return unexpected(safe_pair_count.error());
       const auto first_pair = pool.reserve_refs(*safe_pair_count);
@@ -655,11 +557,8 @@ constexpr bool append_bytes_into(std::span<std::uint8_t> out, std::size_t& pos, 
   return true;
 }
 
-// Mirrors ConstexprCbor::encode_float, but reuses this file's own
-// detail-free primitives instead of duplicating the half/single-float
-// derivation -- half/single candidate search doesn't allocate, so it is
-// shared as-is via the free functions in the enclosing ::ConstexprCbor
-// namespace (try_encode_half_float, try_encode_single_float).
+// Mirrors ConstexprCbor::encode_float, sharing its non-allocating half/single
+// candidate search (try_encode_half_float, try_encode_single_float).
 constexpr bool append_float_into(std::span<std::uint8_t> out, std::size_t& pos, double value) {
   if (const auto h = ConstexprCbor::detail::try_encode_half_float(value)) {
     if (out.size() < pos + 3) return false;
@@ -684,10 +583,9 @@ constexpr bool append_float_into(std::span<std::uint8_t> out, std::size_t& pos, 
 
 }  // namespace detail
 
-// The no-alloc counterpart of ConstexprCbor::encode_value: writes into a
-// caller-supplied fixed buffer and returns how many bytes it used, or
-// nullopt if the value doesn't fit -- never allocates, same discipline as
-// decode_value above.
+// No-alloc counterpart of ConstexprCbor::encode_value: writes into a
+// caller-supplied buffer and returns the byte count, or nullopt if it does not
+// fit.
 constexpr Expected<std::size_t, Error> encode_value(const NodePool& pool, const Node* node, std::span<std::uint8_t> out,
                                                       std::size_t pos = 0) {
   NOALLOC_ASSERT(pool.owns(node));
@@ -782,18 +680,12 @@ constexpr Expected<std::size_t, Error> encode_value(const NodePool& pool, const 
 
 namespace ConstexprCbor {
 
-// Out-of-line definition, placed here (rather than in constexpr_cbor.hpp)
-// because NoAlloc::Node needs to be complete (see the forward declaration
-// and the in-class declaration in constexpr_cbor.hpp, next to
-// RejectDuplicateKeys and KeepFirstDuplicateKey's own NoAlloc overloads). A
-// project that includes only constexpr_cbor.hpp never instantiates this
-// template, so it never needs this definition at all; a project that
-// includes this file gets it.
+// Defined here rather than in constexpr_cbor.hpp because NoAlloc::Node must be
+// complete. Projects that include only constexpr_cbor.hpp never instantiate it.
 constexpr bool KeepLastDuplicateKey::on_duplicate(NoAlloc::NodePool&, NoAlloc::Node** first_pair,
                                                    std::size_t existing_pair_index, NoAlloc::Node* /*new_key*/,
                                                    NoAlloc::Node* new_value) {
-  // Overwrite the existing pair's value slot in place -- the pair stays
-  // at its original position, only the reference it points to changes.
+  // Overwrite the existing pair's value reference; the pair keeps its position.
   first_pair[2 * existing_pair_index + 1] = new_value;
   return true;
 }

@@ -1,7 +1,6 @@
-// Wires the drop zone / file picker to the Emscripten-compiled
-// constexpr-cbor decoder (dist/cbor.js, loaded as a global `CborModule`
-// factory via -sMODULARIZE=1 -sEXPORT_NAME=CborModule). No framework, no
-// build step for this file itself -- it's the whole viewer's logic.
+// Viewer logic: wires the drop zone and file picker to the Emscripten-compiled
+// decoder (dist/cbor.js, a global `CborModule` factory built with
+// -sMODULARIZE=1 -sEXPORT_NAME=CborModule). No framework or build step.
 (() => {
   const dropEl = document.getElementById('drop');
   const fileInputEl = document.getElementById('file-input');
@@ -60,11 +59,8 @@
     }
   }
 
-  // Encodes the given JSON text (following the same conventions decode()
-  // produces, documented in README.md) to CBOR bytes, or returns null if
-  // the text isn't well-formed JSON / doesn't match one of those
-  // conventions -- the encode side of the same "refuse, don't crash"
-  // contract the decoder follows.
+  // Encodes JSON text (using the conventions decode() produces, see README.md) to
+  // CBOR bytes, or returns null if it is malformed or does not match them.
   function encode(jsonText) {
     const Module = moduleRef;
     const textBytes = new TextEncoder().encode(jsonText);
@@ -186,8 +182,6 @@
   downloadBtn.addEventListener('click', handleDownload);
   jsonEl.addEventListener('input', clearEncodeError);
 
-  // `CborModule` is the global factory dist/cbor.js exports under
-  // -sMODULARIZE=1 -sEXPORT_NAME=CborModule.
   CborModule()
     .then((Module) => {
       moduleRef = Module;

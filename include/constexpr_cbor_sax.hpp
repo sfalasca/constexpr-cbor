@@ -5,36 +5,23 @@
 #include "constexpr_cbor.hpp"
 
 // A third decode strategy alongside constexpr_cbor.hpp (heap tree) and
-// constexpr_cbor_noalloc.hpp (no-malloc tree): no tree is built at all here.
-// SaxRange pulls one CBOR *event* at a time directly off the wire --
-// BeginArray, Uint, TextString, EndMap, and so on -- the same shape tinycbor
-// and QCBOR's own pull-style APIs already expose. It reuses every one of
+// constexpr_cbor_noalloc.hpp (no-malloc tree): no tree is built.
+// SaxRange pulls one CBOR event at a time off the wire (BeginArray, Uint,
+// TextString, EndMap, ...), like the pull APIs of tinycbor and QCBOR. It reuses
 // constexpr_cbor.hpp's byte-level primitives unchanged (decode_length,
-// decode_uint/negint, decode_byte_string/decode_text_string<Utf8Policy>,
-// decode_simple, skip_item) -- nothing here reimplements wire parsing, only
-// the control flow that decides WHICH primitive to call next and WHEN to
-// suspend is new.
+// decode_uint/negint, decode_byte_string/decode_text_string, decode_simple,
+// skip_item); only the control flow that decides which to call next is new.
 //
-// Why new control flow was unavoidable: both existing decoders always
-// decode one fully-contained subtree per recursive call and return only
-// once it's done -- there's no "decode just the next event and pause"
-// shape to borrow. Coroutines (co_yield) were considered and rejected:
-// this library's whole point is consteval-provable decoding, and C++20
-// coroutines cannot be evaluated in a constant expression -- a mode that
-// can't run at compile time would contradict the project's own value
-// proposition. Instead, SaxIterator keeps an explicit frame stack bounded
-// by MaxDepth, exactly mirroring the existing recursion-depth cap in both
-// tree decoders (a pathological chain of nested containers is a clean
-// refusal here too, just enforced by an array-index check instead of a
-// recursive function-call depth).
+// The existing decoders recurse over whole subtrees, so there is no
+// "decode one event and pause" shape to reuse. Coroutines were rejected because
+// C++20 coroutines cannot be evaluated in a constant expression, which would
+// defeat the library's consteval point. Instead SaxIterator keeps an explicit
+// frame stack bounded by MaxDepth, mirroring the depth cap of the tree decoders.
 //
-// Because every byte of iteration state (position, frame stack, the
-// duplicate-key tracking buffer) lives BY VALUE inside the iterator itself
-// -- there's no hidden shared external cursor the way istream_iterator has
-// -- two copies of the same iterator genuinely support independent,
-// non-interfering advancement. SaxRange is therefore a real
-// std::ranges::forward_range (not just input_range), and implements
-// std::ranges::view_interface so it composes directly with range adaptors.
+// All iteration state (position, frame stack, key-tracking buffer) lives by
+// value in the iterator, so copies advance independently. SaxRange is therefore
+// a std::ranges::forward_range (not just input_range) and implements
+// std::ranges::view_interface, composing with range adaptors.
 namespace ConstexprCbor::Sax {
 
 enum class EventKind {
@@ -55,18 +42,15 @@ enum class EventKind {
   Error,
 };
 
-// What role the item this event describes plays in its immediate parent.
-// Lets a consumer tell "this scalar is a map key" (etc.) without a separate
-// event kind for every (scalar kind) x (role) combination. A tag does not
-// introduce its own role: Tag events and the event(s) for whatever they
-// wrap inherit the SAME context as the tag's own position, since a tag is
-// a modifier on the next item, not a container with its own child slot.
+// The role the item plays in its immediate parent, so a consumer can tell "this
+// scalar is a map key" without a separate event kind per (kind, role) pair.
+// A tag has no role of its own: Tag events and the events of the item they wrap
+// inherit the tag's context, since a tag modifies the next item rather than
+// holding a child slot.
 enum class EventContext { TopLevel, ArrayElement, MapKey, MapValue };
 
-// Reuses the existing decoded-payload shapes directly rather than
-// reinventing them: uint_value/negint_value/float_value/bytes/simple_value
-// are exactly what DecodedUint/DecodedNegint/DecodedSimple/DecodedBytes
-// already carry. Only the union-by-switch-on-kind is new.
+// Reuses the decoded-payload shapes (DecodedUint, DecodedNegint, DecodedSimple,
+// DecodedBytes); only the switch on kind is new.
 struct Event {
   EventKind kind = EventKind::Error;
   EventContext context = EventContext::TopLevel;
@@ -83,17 +67,14 @@ struct Event {
 
 namespace detail {
 
-// A no-malloc map frame's duplicate-key tracking is a flat, caller-sized
-// array of (offset, length) spans into the original input, shared across
-// every currently-open map (each map's own slice is [tracked_keys_begin,
-// tracked_keys_begin + tracked_keys_count)). Comparing keys by raw encoded
-// bytes rather than decoded structural value equality (what node_equal /
-// CborValue's operator== do) is a deliberate, documented simplification:
-// two non-canonically-but-value-equal encodings of the same integer key
-// (0x00 vs 0x18 0x00) won't be caught as duplicates here, unlike in the
-// heap/no-alloc decoders. Byte-equality is the only option that doesn't
-// require decoding both keys into a comparable value first -- which would
-// mean building exactly the kind of tree this decoder exists to avoid.
+// Duplicate-key tracking is a flat, caller-sized array of (offset, length) spans
+// into the input, shared by all open maps (each map's slice is
+// [tracked_keys_begin, tracked_keys_begin + tracked_keys_count)).
+// Keys are compared by raw encoded bytes, not by value as node_equal and
+// CborValue::operator== do, so non-canonical encodings of one integer key
+// (0x00 vs 0x18 0x00) are not caught here, unlike in the other decoders.
+// Comparing by value would require decoding both keys, which builds the kind of
+// tree this decoder exists to avoid.
 struct KeySpan {
   std::size_t offset = 0;
   std::size_t length = 0;
@@ -113,15 +94,11 @@ struct Frame {
 
 }  // namespace detail
 
-// MaxDepth bounds total structural nesting (array/map/tag combined, same
-// contract as the other two decoders' MaxDepth). MaxTrackedKeys bounds how
-// many map keys may be remembered, summed across every simultaneously-open
-// map, for RejectDuplicateKeys/KeepFirstDuplicateKey's duplicate-key
-// detection; 0 (the only sensible default alongside NoDuplicateKeyCheck,
-// which never tracks anything) means that detection is unavailable and
-// selecting either of those two policies with a 0 capacity is a refusal
-// the moment a map is actually entered, not earlier -- sized generously if
-// you need it, exactly like NoAllocStorage's MaxNodes/MaxRefs/MaxBytes.
+// MaxDepth bounds total nesting (array, map and tag combined), as in the other
+// decoders. MaxTrackedKeys bounds the map keys remembered across all
+// simultaneously open maps, for RejectDuplicateKeys/KeepFirstDuplicateKey.
+// With 0 (fine alongside NoDuplicateKeyCheck, which tracks nothing), those two
+// policies fail as soon as a map is entered.
 template <std::size_t MaxDepth = 32, std::size_t MaxTrackedKeys = 0, typename Utf8Policy = NoUtf8Validation,
           typename KeyPolicy = NoDuplicateKeyCheck>
 struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys, Utf8Policy, KeyPolicy>> {
@@ -177,13 +154,10 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
     constexpr bool operator==(const Iterator& other) const {
       return pos == other.pos && depth == other.depth && at_end == other.at_end && errored == other.errored;
     }
-    // Deliberately NOT `|| errored`: an error is delivered as one visible
-    // Error event first (same as reaching a normal end -- the iterator
-    // stays != end() for that one event), and only the NEXT advance() call
-    // -- made after the consumer's loop has already seen it -- flips
-    // at_end. A plain range-for loop checks the sentinel BEFORE
-    // dereferencing, so folding `errored` into this comparison would make
-    // the loop stop silently without the consumer ever seeing why.
+    // Not `|| errored`: an error is delivered as one visible Error event first
+    // (the iterator stays != end() for it), and only the next advance() sets
+    // at_end. A range-for checks the sentinel before dereferencing, so folding
+    // `errored` in here would stop the loop without the consumer seeing why.
     constexpr bool operator==(Sentinel) const { return at_end; }
 
    private:
@@ -399,13 +373,11 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
       }
     }
 
-    // Called only when about to start a new map pair with dedup tracking
-    // enabled: skips over zero or more leading duplicate pairs (per
-    // KeyPolicy's verdict), recording the first non-duplicate key's span.
-    // Returns true if a non-duplicate key is now ready to be decoded
-    // normally (via decode_one_item); false if the map was exhausted while
-    // skipping (the caller's outer loop re-checks frame exhaustion) or an
-    // error occurred (errored_ is already set).
+    // Called when about to start a map pair with dedup tracking enabled: skips
+    // leading duplicate pairs (per KeyPolicy's verdict) and records the first
+    // non-duplicate key's span. Returns true if a non-duplicate key is ready for
+    // decode_one_item; false if the map was exhausted while skipping (the caller
+    // re-checks frame exhaustion) or an error occurred (errored_ is set).
     constexpr bool skip_duplicate_pairs(detail::Frame& frame) {
       for (;;) {
         const auto key_len = skip_item<MaxDepth>(bytes.subspan(pos));
@@ -445,9 +417,8 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
    public:
     constexpr void advance() {
       if (errored) {
-        // The Error event from a prior call was already delivered and seen
-        // by the consumer's loop (this call only happens once that
-        // iterator has been incremented past it) -- now actually stop.
+        // The Error event was already delivered; this advance() runs after the
+        // consumer saw it, so now stop.
         at_end = true;
         return;
       }

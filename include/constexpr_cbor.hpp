@@ -26,20 +26,16 @@
 #endif
 #endif
 
-// constexpr-cbor: a from-scratch, consteval-evaluable C++20 decoder/encoder for
-// RFC 8949 (CBOR). Every decoder here is a pure function over an immutable
-// std::span, returning a fresh ConstexprCbor::Expected -- there is no
-// persistent mutable decoder-state object to corrupt on a failed sub-decode.
+// constexpr-cbor: header-only, consteval-evaluable C++20 codec for RFC 8949.
+// Decoders are pure functions over an immutable std::span and return a fresh
+// Expected, so there is no mutable decoder state to corrupt on a failed decode.
 namespace ConstexprCbor {
 
 // ---------------------------------------------------------------------------
-// Every refusal in this library (malformed/truncated input, a capacity
-// limit, a type mismatch) carries one of these, plus (where meaningful) a
-// byte offset -- "truncated at byte 412" instead of just "no." offset is
-// absolute within whichever buffer is relevant (the input span while
-// decoding, the output span while encoding), and is 0/not meaningful for
-// TypeMismatch and UnsupportedUserType, which aren't buffer-position
-// failures at all -- they're "you asked for the wrong thing," not "the
+// Every failure carries an ErrorReason and, where meaningful, a byte offset
+// (absolute within the input span when decoding, the output span when encoding).
+// TypeMismatch and UnsupportedUserType are not buffer-position failures; their
+// offset is 0.
 // wire format broke down at some point."
 enum class ErrorReason {
   TruncatedInput,        // ran out of bytes before a complete header/field
@@ -69,17 +65,9 @@ struct Error {
 
 namespace detail {
 
-// `ConstexprCbor::Expected<T, E>` is this library's one return-type
-// spelling for "a value, or why there isn't one" -- std::expected itself
-// when the including compiler actually has it (feature-detected via the
-// standard __cpp_lib_expected macro, not guessed from a compiler version
-// number), or a small fallback otherwise. This split exists because
-// std::expected is gated to C++23 in libstdc++ (confirmed empirically:
-// `g++ -std=c++20` rejects it outright, a language-mode restriction, not
-// merely "needs a newer compiler") -- making it the literal public return
-// type everywhere would silently raise this library's documented "C++20
-// minimum" to C++23 for every consumer. One alias name, one call-site
-// spelling, regardless of which backend is actually active.
+// Expected<T, E> is std::expected when the compiler provides it (detected via
+// __cpp_lib_expected), otherwise a small fallback. libstdc++ gates std::expected
+// on C++23, so using it unconditionally would raise the library's C++20 minimum.
 #if defined(__cpp_lib_expected)
 
 template <typename T, typename E>
@@ -97,32 +85,16 @@ constexpr Unexpected<E> unexpected(E e) {
   return Unexpected<E>{e};
 }
 
-// Covers exactly the operations this codebase and its tests use
-// (has_value()/operator bool, operator*/operator->() const, value_or(),
-// error(), value()) -- not a claim of full std::expected API parity (no
-// and_then/transform/or_else; nothing here calls them). Built on
-// std::variant, the same constexpr-proven building block every other
-// recursive type in this header already relies on.
+// Only the operations this library and its tests use; no and_then/transform/or_else.
 template <typename T, typename E>
 class ExpectedImpl {
   std::variant<T, E> storage_;
 
  public:
-  // A forwarding-reference constructor, not `ExpectedImpl(T v)` taking T
-  // by value and std::move-ing it into storage_ -- empirically, the
-  // by-value-then-move shape triggers a real constexpr evaluation bug in
-  // at least one toolchain this library targets (arm-none-eabi-g++
-  // 13.2.1's newlib libstdc++, confirmed via a minimal repro): moving an
-  // already-materialized std::string built via a non-trivial constructor
-  // (e.g. the iterator-range ctor decode_text_string's result goes
-  // through) into a std::variant's union storage loses track of which
-  // union member (_M_local_buf vs. _M_allocated_capacity) is active.
-  // Forwarding the original argument straight into std::in_place_index's
-  // construction (no intermediate named T object ever exists) avoids it
-  // -- confirmed fixed by the same minimal repro. Excludes Unexpected<E>
-  // (its own constructor below handles that) and ExpectedImpl itself (the
-  // classic "forwarding reference shadows copy/move constructor" trap,
-  // same guard CborValue's own converting constructor uses).
+  // Forwarding reference rather than by-value-then-move: moving a materialized
+  // std::string into the variant's union storage breaks constexpr evaluation on
+  // arm-none-eabi-g++ 13.2.1 (newlib libstdc++).
+  // Excludes Unexpected<E> and ExpectedImpl itself so copy/move are not shadowed.
   template <typename U = T>
     requires(!std::same_as<std::remove_cvref_t<U>, Unexpected<E>> &&
              !std::same_as<std::remove_cvref_t<U>, ExpectedImpl> && std::constructible_from<T, U&&>)
@@ -135,23 +107,12 @@ class ExpectedImpl {
   constexpr const T& operator*() const { return std::get<0>(storage_); }
   constexpr const T* operator->() const { return &std::get<0>(storage_); }
   constexpr const E& error() const { return std::get<1>(storage_); }
-  // Both std::optional and real std::expected support comparing directly
-  // against a value convertible to T (not just against another
-  // optional/expected); several call sites in this codebase's own test
-  // suite rely on that. Declared as a hidden friend so C++20's rewritten
-  // candidates synthesize the reversed (U == ExpectedImpl) and the != forms
-  // automatically.
+  // Compare directly against a value convertible to T, like std::optional.
+  // Hidden friend, so C++20 synthesizes the reversed and != forms.
   template <typename U>
   friend constexpr bool operator==(const ExpectedImpl& lhs, const U& rhs) {
     if (!lhs.has_value()) return false;
-    // std::cmp_equal for the integral case: an ordinary `==` between, say,
-    // a stored std::size_t and an int literal a test compares it against
-    // is exactly the kind of mixed-signedness comparison -Wsign-compare
-    // exists to catch -- real std::optional/std::expected never trips it
-    // because their comparison operators live inside a system header,
-    // exempted from this project's own warnings; this one doesn't get
-    // that exemption, so it earns the same safe-comparison treatment
-    // ConstexprCbor::detail::narrow<>() gives width narrowing elsewhere.
+    // cmp_equal avoids -Wsign-compare on mixed-signedness integral comparisons.
     if constexpr (std::integral<T> && std::integral<U>) {
       return std::cmp_equal(std::get<0>(lhs.storage_), rhs);
     } else {
@@ -162,10 +123,7 @@ class ExpectedImpl {
   constexpr T value_or(U&& fallback) const {
     return has_value() ? std::get<0>(storage_) : static_cast<T>(std::forward<U>(fallback));
   }
-  // Mirrors std::expected<T,E>::value()'s "throw on empty access" contract
-  // when exceptions are available; aborts instead under -fno-exceptions,
-  // the same fallback this library's own ARENA/NOALLOC_ASSERT-style checks
-  // already use elsewhere -- never silently returns a garbage T.
+  // Throws like std::expected::value(); aborts under -fno-exceptions.
   constexpr const T& value() const {
     if (!has_value()) {
 #if defined(__cpp_exceptions)
@@ -187,10 +145,9 @@ using Expected = detail::ExpectedImpl<T, E>;
 using detail::unexpected;
 
 // ---------------------------------------------------------------------------
-// Negative integers: CBOR encodes major type 1 as -1 - n, n in [0, 2^64-1].
-// The true value can be as negative as -2^64, which does not fit std::int64_t
-// (min -2^63), so n is kept as-is rather than ever negated into a type that
-// cannot hold the result (the exact shape of tinycbor issue #347).
+// Negative integers: major type 1 encodes -1 - n for n in [0, 2^64-1].
+// The value can reach -2^64, below int64_t's range, so n is stored unnegated
+// (cf. tinycbor issue #347).
 struct NegativeInt {
   std::uint64_t n;  // value == -1 - n
   friend constexpr bool operator==(const NegativeInt&, const NegativeInt&) = default;
@@ -203,17 +160,9 @@ struct NegativeInt {
 };
 
 namespace detail {
-// Narrows an already-bounds-checked value from `From` to `To`, without
-// ever writing a cast that's a no-op on some target and a real narrowing
-// on another. size_t and uint64_t are the identical type on a 64-bit
-// target (where a static_cast between them is a literal no-op GCC's
-// -Wuseless-cast flags), but genuinely different widths on a 32-bit one
-// (wasm32 via Emscripten, or a 32-bit embedded target) -- there, the
-// static_cast is the correct, intentional way to perform a value that's
-// already been proven in-range, not an accident -Wshorten-64-to-32 (part
-// of Clang's -Wconversion) should flag. if constexpr picks whichever of
-// those two is actually true for the target at hand, so only one of the
-// two ever exists in the compiled output.
+// Narrows a value already proven in range. size_t and uint64_t are the same type
+// on 64-bit targets (where a static_cast trips -Wuseless-cast) but differ on
+// 32-bit ones (wasm32, embedded), so the cast is chosen with if constexpr.
 template <typename To, typename From>
 constexpr To narrow(From v) {
   if constexpr (std::is_same_v<To, From>) {
@@ -225,10 +174,9 @@ constexpr To narrow(From v) {
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
-// The shared length-encoding primitive. additional_info 0-23 is a direct
-// value; 24/25/26/27 mean "the value is in the following 1/2/4/8 bytes."
-// No opinion on major type -- decode_uint, decode_negint, and every
-// length-prefixed type (byte/text string, array, map) build on this.
+// Shared length decoding. Additional info 0-23 is the value itself; 24/25/26/27
+// mean it follows in the next 1/2/4/8 bytes. The major type is not checked;
+// every length-prefixed type builds on this.
 struct DecodedUint {
   std::uint64_t value;
   std::size_t bytes_consumed;
@@ -256,8 +204,7 @@ constexpr Expected<DecodedUint, Error> decode_length(std::span<const std::uint8_
   return DecodedUint{.value = value, .bytes_consumed = 1 + length_bytes};
 }
 
-// Returns true iff this header's additional info is 31 (the indefinite-length /
-// break marker), for whatever major type bytes[0] carries.
+// True iff the header's additional info is 31 (indefinite length or break).
 constexpr bool is_indefinite_or_break(std::span<const std::uint8_t> bytes) {
   return !bytes.empty() && (bytes[0] & 0x1f) == 31;
 }
@@ -290,11 +237,9 @@ constexpr Expected<DecodedNegint, Error> decode_negint(std::span<const std::uint
 }
 
 // ---------------------------------------------------------------------------
-// UTF-8 validation policies for text strings. RFC 8949 Section 5.3.1 says a
-// decoder "might or might not want to verify" text-string content is valid
-// UTF-8 -- it's an explicit option in the spec, not an oversight, so it's
-// modeled as one here: a type supplied as a template parameter, checked
-// against an actual interface contract rather than just hoped-for.
+// UTF-8 validation policies for text strings. RFC 8949 Section 5.3.1 makes
+// validation optional, so it is a template parameter checked against an
+// interface contract.
 template <typename P>
 struct is_utf8_validation_policy
     : std::bool_constant<std::is_invocable_r_v<bool, decltype(&P::is_valid), std::span<const std::uint8_t>>> {};
@@ -302,8 +247,7 @@ struct is_utf8_validation_policy
 template <typename P>
 inline constexpr bool is_utf8_validation_policy_v = is_utf8_validation_policy<P>::value;
 
-// Skip validation entirely -- RFC 8949 permits this, so it's a real, named,
-// first-class policy rather than a missing feature.
+// Skip validation (permitted by RFC 8949).
 struct NoUtf8Validation {
   static constexpr bool is_valid(std::span<const std::uint8_t>) { return true; }
 };
@@ -373,10 +317,8 @@ struct RoughUtf8Validation {
   }
 };
 
-// Full RFC 3629 conformance: everything RoughUtf8Validation does, plus
-// rejects overlong encodings (RFC 8949's own example of well-formed-but-
-// invalid CBOR, 0x62c0ae, is exactly this), lone/paired surrogate-half code
-// points (U+D800-U+DFFF), and code points beyond U+10FFFF.
+// Full RFC 3629 conformance: also rejects overlong encodings (RFC 8949's 0x62c0ae
+// example), surrogate halves (U+D800-U+DFFF), and code points beyond U+10FFFF.
 struct CompleteUtf8Validation {
   static constexpr bool is_valid(std::span<const std::uint8_t> bytes) {
     if (!detail::is_structurally_valid_utf8(bytes)) {
@@ -398,12 +340,8 @@ struct CompleteUtf8Validation {
   }
 };
 
-// Stricter than valid UTF-8, not another strictness level of it: ASCII is
-// a subset of UTF-8 (any byte 0x00-0x7F is already a complete, single-byte
-// UTF-8 code point), but the reverse isn't true -- "café" is
-// perfectly valid UTF-8 and still fails this policy. For systems or
-// protocol fields that can't handle multi-byte sequences at all, not for
-// deciding how strictly to check UTF-8 itself.
+// ASCII only. Not a strictness level of UTF-8: valid UTF-8 such as "café" fails
+// this policy.
 struct AsciiOnlyValidation {
   static constexpr bool is_valid(std::span<const std::uint8_t> bytes) {
     for (const std::uint8_t b : bytes) {
@@ -416,9 +354,8 @@ struct AsciiOnlyValidation {
 };
 
 // ---------------------------------------------------------------------------
-// Major types 2 and 3: byte strings and text strings. Both are a length
-// (decoded via decode_length) followed by that many raw bytes; text strings
-// add exactly one clause on top, the UTF-8 policy check.
+// Major types 2 and 3: a length followed by that many bytes.
+// Text strings additionally run the UTF-8 policy.
 struct DecodedBytes {
   std::span<const std::uint8_t> bytes;
   std::size_t bytes_consumed;
@@ -466,9 +403,7 @@ constexpr Expected<DecodedBytes, Error> decode_text_string(std::span<const std::
 // ---------------------------------------------------------------------------
 // Major type 7: floats, booleans, null, undefined.
 struct DecodedSimple {
-  // Simple covers additional info 0-19 (unassigned simple values, still
-  // well-formed and decodable per RFC 8949, just with no defined meaning)
-  // and the one-byte form (additional info 24, for simple values 32-255).
+  // Simple: unassigned values (additional info 0-19, or 24 for 32-255).
   enum class Kind { False, True, Null, Undefined, Float, Simple };
   Kind kind;
   double as_double = 0.0;
@@ -549,30 +484,17 @@ constexpr Expected<DecodedSimple, Error> decode_simple(std::span<const std::uint
   }
 }
 
-// Walks exactly one CBOR item structurally (definite or indefinite form)
-// and reports how many bytes it occupies, without building any value or
-// allocating anything -- shared by the no-malloc decoder (which must
-// pre-count an indefinite-length array/map's items before reserving their
-// contiguous slot, since that reservation has to happen before any child
-// is actually decoded) and the SAX decoder (which uses it to skip past an
-// item a consumer doesn't step into, without emitting its events).
-// Deliberately duplicates some of decode_value's own structure rather than
-// sharing it: unifying "count bytes only" with "materialize a value" into
-// one templated walk would add real complexity for a marginal gain here.
-// Propagates a nested call's Error upward, adding `base` (how far into
-// *this* function's own `bytes` the failed sub-call's span started) to its
-// offset -- the sub-call reported its offset relative to its own span,
-// having no way to know where that span sits within the original
-// top-level buffer. Every recursive decoder in this header already has
-// exactly this `base`/`consumed` value in scope at every propagation
-// site, so this telescopes to a correct, absolute offset by the time an
-// error reaches the public entry point, with no new parameters threaded
-// through any signature.
+// Shifts a nested error's offset (relative to its own sub-span) by `base`, making
+// it absolute within the caller's buffer.
 constexpr Error rebase_error(Error e, std::size_t base) {
   e.offset += base;
   return e;
 }
 
+// Measures one CBOR item (definite or indefinite) without building a value.
+// The no-alloc decoder uses it to pre-count indefinite containers, and the SAX
+// decoder to skip items. It deliberately duplicates decode_value's structure
+// instead of unifying the two walks.
 template <std::size_t MaxDepth = 32>
 constexpr Expected<std::size_t, Error> skip_item(std::span<const std::uint8_t> bytes, std::size_t depth = 0) {
   if (bytes.empty()) return unexpected(Error{ErrorReason::TruncatedInput});
@@ -596,18 +518,14 @@ constexpr Expected<std::size_t, Error> skip_item(std::span<const std::uint8_t> b
           if (bytes.size() < consumed + chunk_len->bytes_consumed + chunk_len->value) {
             return unexpected(Error{ErrorReason::TruncatedPayload, consumed});
           }
-          // The check above already proved consumed+bytes_consumed+value fits
-          // within bytes.size() (a std::size_t), so narrowing the uint64_t
-          // header-claimed `value` back down to std::size_t here is lossless
-          // -- same already-bounds-checked situation detail::narrow exists
-          // for, used identically by decode_byte_string/decode_text_string.
+          // Bounds-checked above, so the narrowing is lossless.
           consumed += chunk_len->bytes_consumed + detail::narrow<std::size_t>(chunk_len->value);
         }
       }
       const auto len = decode_length(bytes);
       if (!len) return unexpected(len.error());
       if (bytes.size() < len->bytes_consumed + len->value) return unexpected(Error{ErrorReason::TruncatedPayload});
-      // Same reasoning as above: the check just above proves this fits.
+      // Bounds-checked above.
       return len->bytes_consumed + detail::narrow<std::size_t>(len->value);
     }
     case 4: {
@@ -678,18 +596,13 @@ constexpr Expected<std::size_t, Error> skip_item(std::span<const std::uint8_t> b
   }
 }
 
-// Forward declaration only: CborValue's own templated constructor/.get<T>()
-// fall back to this (ADL user-type hook dispatch, see the definition below
-// this class) for any T that isn't one of the built-in CBOR alternatives.
-// Declaring it here (not yet defining it) is enough, the same forward-
-// declare-then-define-later pattern already used for NoAlloc::NodePool below.
+// Forward declaration: CborValue falls back to CborSerializer<T> (ADL hook
+// dispatch, defined below) for types that are not built-in alternatives.
 template <typename T, typename = void>
 struct CborSerializer;
 
-// Reflection-style customization point, declaration only: a user specializes
-// this (inside namespace ConstexprCbor, mirroring how CborSerializer<T>
-// itself is specialized) to describe T's fields as a tuple of (name, member
-// pointer) pairs, e.g.:
+// Customization point: specialize in namespace ConstexprCbor to describe T's
+// fields as (name, member pointer) pairs, e.g.:
 //
 //   namespace ConstexprCbor {
 //   template <> constexpr auto cbor_fields<mylib::Point>() {
@@ -698,31 +611,21 @@ struct CborSerializer;
 //   }
 //   }
 //
-// CborSerializer<T>'s default implementation builds a generic to_cbor/
-// from_cbor from it when T has no ADL to_cbor/from_cbor hook -- see below.
+// CborSerializer<T> builds to_cbor/from_cbor from it when T has no ADL hook.
 template <typename T>
 auto cbor_fields();
 
 struct CborValue;
 
 // ---------------------------------------------------------------------------
-// The recursive value type arrays, maps, and tags are built from. Byte/text
-// string content here is owned (a copy), not a zero-copy span like
-// decode_byte_string/decode_text_string above: an indefinite-length string's
-// chunks aren't contiguous in the original buffer (each chunk has its own
-// header interspersed), so concatenating them can't stay zero-copy, and
-// CborValue needs one uniform representation that covers both the definite
-// and indefinite case.
+// The recursive value type. String content is owned (copied) because an
+// indefinite-length string's chunks are not contiguous in the input.
 //
-// Beyond the raw variant, CborValue also provides an nlohmann::json-style
-// ergonomic interface (is_*()/operator[]/.get<T>()/iteration/brace-init
-// construction) -- entirely additive, kept exception-free throughout (no
-// throwing anywhere: a miss/type-mismatch returns a shared sentinel or
-// std::optional, never throws, preserving -fno-exceptions compatibility and
-// consteval-safety for every existing decode/encode path). Adding the
-// builder constructor below necessarily makes CborValue a non-aggregate
-// (a deliberate, accepted break from the old CborValue{.data = ...}
-// construction syntax -- .data itself stays public and unchanged).
+// Also offers an nlohmann::json-style interface (is_*(), operator[], get<T>(),
+// iteration, brace-init). It never throws: a miss or type mismatch yields a
+// sentinel or Expected, keeping it -fno-exceptions and consteval safe.
+// The brace-init constructor makes CborValue a non-aggregate, so
+// CborValue{.data = ...} no longer compiles; .data itself remains public.
 struct CborValue {
   enum class StringKind { Bytes, Text };
   struct OwnedString {
@@ -735,21 +638,15 @@ struct CborValue {
     std::vector<CborValue> value;  // always exactly one element
     friend constexpr bool operator==(const Tag&, const Tag&) = default;
   };
-  // Tags 2 and 3 (positive/negative bignum, RFC 8949 Section 3.4.3) are
-  // recognized automatically rather than left as an opaque Tag wrapping a
-  // byte string: major types 0/1 are wire-format-limited to 64-bit
-  // magnitude (no length marker wider than 8 bytes exists), and this is
-  // CBOR's actual mechanism for integers past that ceiling, not a detail
-  // worth hiding behind a generic tag number a caller has to know to
-  // interpret. value == magnitude (tag 2) or -1 - magnitude (tag 3),
-  // mirroring NegativeInt's own -1-n convention.
+  // Tags 2 and 3 (bignums, RFC 8949 Section 3.4.3) are recognized rather than
+  // left as an opaque Tag, since they are how CBOR represents integers beyond
+  // 64 bits. value == magnitude (tag 2) or -1 - magnitude (tag 3).
   struct BigNum {
     bool negative;
     std::vector<std::uint8_t> magnitude;  // big-endian
     friend constexpr bool operator==(const BigNum&, const BigNum&) = default;
   };
-  // additional info 0-19 (unassigned, still well-formed) or 24 (one-byte
-  // form, for 32-255): a simple value with no defined meaning of its own.
+  // Unassigned simple value (additional info 0-19, or 24 for 32-255).
   struct SimpleValue {
     std::uint8_t number;
     friend constexpr bool operator==(const SimpleValue&, const SimpleValue&) = default;
@@ -773,38 +670,22 @@ struct CborValue {
 
   constexpr CborValue() = default;
 
-  // The three self-referential/recursive alternatives (containing CborValue
-  // itself, directly or via pair) get their OWN constructor, member-
-  // initializing `data` directly via the variant's own constructor, rather
-  // than default-constructing `data` to monostate first and then switching
-  // it to a different active alternative via assignment in the body below
-  // -- a strictly better, more direct construction path under GCC/libstdc++
-  // (this project's only toolchain with full, verified support; see
-  // README's "Toolchain support" section). Note for the record: this does
-  // NOT make these three alternatives constructible under Clang -- Clang's
-  // handling of std::variant's in_place_index-based constructor for a
-  // self-referential alternative this deep fails ("placement new would
-  // change type of storage from '__aligned_membuf<...>' to '...'") even for
-  // a single, fresh, first-ever construction, with no prior "switch"
-  // involved at all. Confirmed empirically (including against the
-  // pre-ergonomics commit, before this constructor existed at all) to be a
-  // pre-existing Clang/libstdc++ limitation this codebase cannot work
-  // around from user code, not something introduced or fixable here.
+  // The recursive alternatives (those containing CborValue) are initialized
+  // directly through the variant constructor rather than default-constructing
+  // monostate and then assigning.
+  // Clang with libstdc++ still rejects these alternatives ("placement new would
+  // change type of storage"), even on first construction. This is a pre-existing
+  // toolchain limitation (see the README's toolchain support section).
   template <typename T>
     requires(std::same_as<std::remove_cvref_t<T>, std::vector<CborValue>> ||
              std::same_as<std::remove_cvref_t<T>, std::vector<std::pair<CborValue, CborValue>>> ||
              std::same_as<std::remove_cvref_t<T>, Tag>)
   constexpr CborValue(T&& v) : data(std::forward<T>(v)) {}  // NOLINT(google-explicit-constructor)
 
-  // The single converting constructor every other ergonomic construction
-  // path goes through -- one if-constexpr dispatch chain (matching the
-  // codebase's own encode_value-visitor idiom) rather than a proliferation
-  // of overloads, which would recreate exactly the overload-ambiguity
-  // problems described below for the array/map literal case. Excludes
-  // T == CborValue itself so it never hijacks the implicitly-declared
-  // copy/move constructor (the classic "forwarding reference shadows copy
-  // constructor" trap), and excludes the three recursive alternatives
-  // above (handled by the dedicated constructor instead).
+  // Single converting constructor for all other alternatives, dispatched with
+  // if constexpr because overloads would be ambiguous for array/map literals.
+  // Excludes CborValue (so copy/move are not hijacked) and the recursive
+  // alternatives handled above.
   template <typename T>
     requires(!std::same_as<std::remove_cvref_t<T>, CborValue> &&
              !std::same_as<std::remove_cvref_t<T>, std::vector<CborValue>> &&
@@ -842,15 +723,10 @@ struct CborValue {
     return *this;
   }
 
-  // Array-vs-map brace-init disambiguation, adapted from nlohmann's own
-  // mechanism (a single constructor + a runtime heuristic over the
-  // materialized elements, not plain overloading -- nlohmann itself
-  // abandoned overloading for the exact same ambiguity a nested braced
-  // element like `{"a", 1}` creates against either an initializer_list<T>
-  // or an initializer_list<pair<T,T>> element type). Generalized here vs.
-  // nlohmann's string-only-key heuristic: CBOR map keys are unrestricted,
-  // so the rule is purely structural -- every element a 2-element array, not
-  // "every element a 2-element array whose first is a string."
+  // Array-vs-map brace-init disambiguation, as in nlohmann: a runtime check over
+  // the built elements, because overloading is ambiguous for nested braces like
+  // {"a", 1}. CBOR keys are unrestricted, so the rule is purely structural:
+  // every element a 2-element array means map.
   static constexpr CborValue build_array_or_map(std::initializer_list<CborValue> init, bool type_deduction) {
     bool all_pairs = type_deduction && init.size() > 0;
     if (all_pairs) {
@@ -874,21 +750,15 @@ struct CborValue {
   }
 
   constexpr CborValue(std::initializer_list<CborValue> init, bool type_deduction = true)
-      // Delegates to the move constructor (itself constructing `data`
-      // directly via the recursive constructor above) rather than default-
-      // constructing `data` and assigning into it here.
+      // Delegate so `data` is constructed directly.
       : CborValue(build_array_or_map(init, type_deduction)) {}  // NOLINT(google-explicit-constructor)
 
-  // Forces array interpretation, bypassing the heuristic above -- covers
-  // `{}` (ambiguous between empty array/empty map) and any genuine array
-  // of 2-element sub-arrays the heuristic would otherwise misread as a map.
+  // Forces array interpretation: covers `{}` and arrays of 2-element sub-arrays
+  // that the heuristic would read as a map.
   static constexpr CborValue array(std::initializer_list<CborValue> init = {}) { return CborValue(init, false); }
 
-  // Forces map interpretation; the always-unambiguous spelling, especially
-  // once keys aren't plain strings: object({ {1u, "one"}, {array({1,2}),
-  // "composite-key"} }). Every element must be a 2-element array (key,
-  // value) -- not re-checked here, same discipline as the rest of this
-  // ergonomic layer trusting caller-authored-in-code input.
+  // Forces map interpretation, e.g. object({{1u, "one"}, {array({1,2}), "k"}}).
+  // Each element must be a 2-element array (key, value); this is not re-checked.
   static constexpr CborValue object(std::initializer_list<CborValue> init) {
     std::vector<std::pair<CborValue, CborValue>> entries;
     for (const auto& elem : init) {
@@ -898,9 +768,8 @@ struct CborValue {
     return CborValue(std::move(entries));
   }
 
-  // A dedicated factory, not an implicit path: a bare byte sequence is
-  // exactly as ambiguous with "array of small integers" as in nlohmann,
-  // which solved it identically with json::binary(...).
+  // Factory rather than implicit conversion: a byte sequence is ambiguous with an
+  // array of small integers (nlohmann uses json::binary the same way).
   static constexpr CborValue binary(std::span<const std::uint8_t> bytes) {
     return CborValue(OwnedString{.kind = StringKind::Bytes, .content = {bytes.begin(), bytes.end()}});
   }
@@ -946,16 +815,11 @@ struct CborValue {
     }
     return false;
   }
-  // No separate std::string_view overload: a string literal already
-  // converts to CborValue implicitly via the converting constructor above,
-  // and adding one creates a genuine ambiguity (both std::string_view and
-  // CborValue are reachable from `const char*` via exactly one user-defined
-  // conversion, so overload resolution can't prefer either).
+  // No string_view overload: string literals already convert to CborValue, and a
+  // second conversion path would make calls ambiguous.
 
-  // Declared here, defined out-of-line after null_sentinel (below this
-  // class) is complete -- the miss-case return path needs a CborValue to
-  // bind a reference to, and a static member of CborValue's own type can't
-  // be initialized inside this still-incomplete class body.
+  // Defined after null_sentinel: the miss path needs a CborValue to reference,
+  // and a static member of the incomplete class cannot hold one.
   constexpr const CborValue& operator[](std::size_t i) const;
   constexpr CborValue& operator[](std::size_t i);
   constexpr const CborValue& operator[](const CborValue& key) const;
@@ -1002,9 +866,8 @@ struct CborValue {
     }
   }
 
-  // Iteration: array yields elements in order; map yields values only
-  // (matching nlohmann's own `for (auto& v : j)` default). No primitive
-  // iteration arm -- iterating a scalar is simply not supported here.
+  // Iteration: arrays yield elements, maps yield values only (as in nlohmann).
+  // Scalars are not iterable.
   struct const_iterator {
     using value_type = CborValue;
     using difference_type = std::ptrdiff_t;
@@ -1049,8 +912,7 @@ struct CborValue {
     return const_iterator{std::vector<CborValue>::const_iterator{}};
   }
 
-  // .items(): key/value pairs for a map; an empty range for anything else
-  // (not ill-formed -- this is ergonomic sugar, not decode validation).
+  // .items(): key/value pairs for a map; an empty range for anything else.
   struct ItemsProxy {
     std::vector<std::pair<CborValue, CborValue>>* entries;
     struct Item {
@@ -1084,14 +946,9 @@ struct CborValue {
   }
 };
 
-// Shared, namespace-scope (not function-local -- see the comment on
-// detail::call_to_cbor below for why that distinction matters here too)
-// sentinel every miss-case const operator[] below binds its return
-// reference to, giving `j["x"]["y"]` chainability even through a miss
-// (detect it via .is_undefined()). inline constexpr gives exactly one
-// address across translation units and is constant-initialized, so it's
-// simultaneously usable inside consteval evaluation, at ordinary runtime,
-// and safe under concurrent read access (it is never mutated).
+// Returned by const operator[] on a miss, so `j["x"]["y"]` chains through misses
+// (test with .is_undefined()). inline constexpr gives one address across
+// translation units and works in consteval and at runtime.
 inline constexpr CborValue null_sentinel{};
 
 constexpr const CborValue& CborValue::operator[](std::size_t i) const {
@@ -1134,21 +991,13 @@ constexpr CborValue& CborValue::operator[](const CborValue& key) {
 }
 
 // ---------------------------------------------------------------------------
-// to_cbor/from_cbor ADL hooks: mirrors nlohmann's adl_serializer pattern.
-// The real reason for this indirection isn't "ADL needs a wrapper" (an
-// unqualified call already gets ADL) -- it's that it creates a second,
-// independent customization point for types a user can't attach a free
-// function to at all (third-party/std types), via specializing
-// CborSerializer<T> directly instead.
+// to_cbor/from_cbor ADL hooks, as in nlohmann's adl_serializer.
+// Specializing CborSerializer<T> directly covers types that cannot take a free
+// function (third-party and std types).
 //
-// call_to_cbor/call_from_cbor MUST be free functions, not members of
-// CborSerializer itself: inside a member function body, unqualified lookup
-// finds the enclosing class's own member of the same name first (if
-// CborSerializer<T>::to_cbor called an unqualified `to_cbor(...)` directly,
-// it would find itself and recurse, never reaching ADL -- ordinary lookup
-// finding a class member suppresses ADL entirely, per [basic.lookup.argdep]).
-// A free function has no enclosing class, so ordinary lookup here finds
-// nothing and ADL fires normally against T's own associated namespaces.
+// call_to_cbor/call_from_cbor must be free functions: inside a CborSerializer
+// member, an unqualified `to_cbor(...)` finds the member itself, which
+// suppresses ADL and recurses.
 namespace detail {
 template <typename T>
 concept HasFreeToCbor = requires(CborValue& out, const T& v) {
@@ -1168,11 +1017,9 @@ constexpr bool call_from_cbor(const CborValue& in, T& value) {
   return from_cbor(in, value);
 }
 
-// cbor_fields<T>() reflection: a second, lower-priority fallback behind the
-// ADL hooks above. HasCborFields<T> is true exactly when a user has
-// specialized cbor_fields<T>() for T (the unspecialized primary template
-// declared above has no definition, so calling it for any other T is a
-// substitution failure here, not a link error).
+// cbor_fields<T>() fallback, lower priority than the ADL hooks. True exactly when
+// the user specialized it (the primary template is undefined, so other types
+// fail substitution instead of linking).
 template <typename T>
 concept HasCborFields = requires { cbor_fields<T>(); };
 
@@ -1201,12 +1048,8 @@ constexpr bool cbor_fields_to_cbor(CborValue& out, const T& value) {
 
 template <typename T>
 constexpr bool cbor_fields_from_cbor(const CborValue& in, T& value) {
-  // CborValue::get<T>() only recognizes a fixed set of canonical scalar
-  // types (bool/uint64_t/int64_t/double/string/vector<uint8_t>/...), not
-  // every arithmetic type a member might actually be declared as (e.g.
-  // `int`, `float`, `unsigned short`) -- the same reason the hand-written
-  // ADL fixtures decode through std::int64_t and narrow afterwards instead
-  // of calling .get<int>() directly. Mirror that here per field.
+  // get<T>() only recognizes canonical scalar types, so integral and floating
+  // members are read as int64_t/double and narrowed per field.
   bool ok = true;
   std::apply(
       [&](auto const&... field) {
@@ -1278,50 +1121,24 @@ struct CborSerializer {
   }
 };
 
-// Forward declarations only: ConstexprCbor::NoAlloc::NodePool/Node are
-// defined later in this header (after this ConstexprCbor namespace
-// closes), but the duplicate-key policies just below need to declare an
-// NoAlloc-shaped on_duplicate overload alongside their std::vector-shaped
-// one, so that the exact same policy TYPE works for both decode_value
-// (this namespace) and NoAlloc::decode_value -- "it's still a policy" means
-// one coherent type per policy, not a parallel NoAlloc-only copy of each.
-// Declaring (not yet defining) these here is enough: the member functions
-// below are only instantiated once actually called, by which point
-// NoAlloc's own definitions have long since appeared in the same
-// translation unit. Neither type carries NTTPs: NodePool is a small,
-// non-owning, trivially-copyable view over caller-supplied storage, not a
-// container sized by template parameters.
+// Forward declarations so the duplicate-key policies below can declare
+// NoAlloc-shaped on_duplicate overloads, letting one policy type serve both
+// decoders. NodePool is a non-owning view over caller-supplied storage.
 namespace NoAlloc {
 struct NodePool;
 struct Node;
 }  // namespace NoAlloc
 
 // ---------------------------------------------------------------------------
-// Duplicate map keys: RFC 8949 Section 5.3.1 leaves this implementation-
-// defined, and there's no settled industry norm (confirmed against QCBOR,
-// tinycbor, zcbor, libcbor, NanoCBOR -- none of them treat it as a fixed
-// "bug," just an acknowledged open design question). Modeled the same way
-// as the UTF-8 policy: a type, checked against a real interface contract.
-// A concrete target function-pointer type, not a bare `decltype(&P::on_duplicate)`,
-// is required here: once the NoAlloc-shaped on_duplicate overload below
-// exists too (a member function *template*), an unqualified address-of
-// has no target type to resolve the overload against and is ill-formed
-// ("decltype cannot resolve address of overloaded function") even for a
-// concrete, non-template P. The static_cast pins exactly this
-// std::vector-shaped overload, leaving the NoAlloc-shaped template one to
-// its own trait in constexpr_cbor_noalloc.hpp.
-// Partial specialization + void_t, not a plain std::is_invocable_r_v on a
-// bare decltype(&P::on_duplicate): the static_cast that pins the overload
-// is itself ill-formed for a P with the wrong shape entirely (casting
-// between two unrelated function-pointer types isn't just "not
-// invocable," it's a hard error) -- and a class template's base-class
-// list isn't a SFINAE context, so that error would abort compilation
-// instead of making the trait evaluate to false. The void_t in the
-// partial specialization's template argument list is a SFINAE context:
-// substitution failure there is quietly rejected, selecting the primary
-// (false) template instead, which is exactly what lets this trait still
-// report false (rather than hard-erroring) for a mismatched P, so the
-// friendly static_assert message above actually fires.
+// Duplicate map keys: RFC 8949 Section 5.3.1 leaves handling
+// implementation-defined and the surveyed libraries (QCBOR, tinycbor, zcbor,
+// libcbor, NanoCBOR) disagree, so it is a policy type like the UTF-8 one.
+//
+// The trait pins the std::vector overload with a static_cast, because
+// &P::on_duplicate is ambiguous once the NoAlloc overload exists. The cast is a
+// hard error for a mis-shaped P, so it sits in a void_t partial specialization
+// (a SFINAE context) to make the trait false instead of aborting compilation
+// before the static_assert can fire.
 template <typename P, typename = void>
 struct is_duplicate_key_policy : std::false_type {};
 
@@ -1334,17 +1151,12 @@ struct is_duplicate_key_policy<
 template <typename P>
 inline constexpr bool is_duplicate_key_policy_v = is_duplicate_key_policy<P>::value;
 
-// on_duplicate is called when `key` has already been seen in `entries`; it
-// mutates `entries` as needed and returns false to abort the whole map's
-// decode (reject), true to continue. Each policy below also provides an
-// NoAlloc-shaped overload (same decision, same return-value contract, just
-// expressed over pointers into the pool instead of a std::vector<pair<...>> --
-// NoAlloc::decode_value has no flat, directly-comparable entries container
-// to search or mutate, only a pool and references into it): `first_pair`
-// is the base of the pair's contiguous Node* reference-slot block,
-// `existing_pair_index` is which already-written pair (0-based) the new
-// key matched, and `new_key`/`new_value` are where the newly-decoded
-// pair's key and value nodes already live in the pool.
+// on_duplicate runs when `key` is already in `entries`. It may mutate `entries`
+// and returns false to reject the whole map, true to continue.
+// Each policy also provides a NoAlloc overload (same contract, over pool
+// pointers): `first_pair` is the base of the pair's Node* slot block,
+// `existing_pair_index` is the matching earlier pair, and `new_key`/`new_value`
+// are the newly decoded nodes.
 struct RejectDuplicateKeys {
   static constexpr bool on_duplicate(std::vector<std::pair<CborValue, CborValue>>&, CborValue, CborValue) {
     return false;
@@ -1354,12 +1166,8 @@ struct RejectDuplicateKeys {
                                       NoAlloc::Node* /*new_value*/) {
     return false;
   }
-  // SAX-shaped overload (constexpr_cbor_sax.hpp): the decision never
-  // depends on the already-decoded key/value the other two overloads see,
-  // since the SAX decoder has no tree to hand back -- just the same
-  // reject-or-continue verdict, by raw byte-span equality of the keys'
-  // encodings instead of structural value equality (see SaxRange's own
-  // header comment for why that's a deliberate, documented difference).
+  // SAX overload: no tree exists, so the verdict is a plain reject. Keys are
+  // compared by encoded bytes (see SaxRange).
   static constexpr bool on_duplicate() { return false; }
 };
 struct KeepFirstDuplicateKey {
@@ -1384,33 +1192,19 @@ struct KeepLastDuplicateKey {
     }
     return true;
   }
-  // Defined out-of-line, after NoAlloc::Node is complete: GCC's
-  // -Wtemplate-body checks aggregate-initializer syntax eagerly against a
-  // member function's body even though it's only truly instantiated once
-  // called (by which point NoAlloc's own types have long since been fully
-  // defined later in this header) -- an inline body here would hit that
-  // check while Node is still just a forward declaration.
+  // Defined out of line after NoAlloc::Node is complete; GCC checks the
+  // aggregate initialization eagerly.
   static constexpr bool on_duplicate(NoAlloc::NodePool& pool, NoAlloc::Node** first_pair,
                                       std::size_t existing_pair_index, NoAlloc::Node* new_key,
                                       NoAlloc::Node* new_value);
-  // Deliberately NO 0-arg SAX-shaped overload: "keep the last value for
-  // this key" means retroactively overwriting an already-emitted event,
-  // which a push-forward event stream cannot do without buffering the
-  // whole map first (defeating the point of being a SAX decoder at all).
-  // Selecting this policy with SaxRange is a compile error (see
-  // is_sax_duplicate_key_policy_v's static_assert in constexpr_cbor_sax.hpp)
-  // rather than a silent behavior change.
+  // No SAX overload: keeping the last value would mean rewriting an
+  // already-emitted event. Using this policy with SaxRange is a compile error
+  // (see is_sax_duplicate_key_policy_v).
 };
 
-// A fourth policy, added for the SAX decoder (constexpr_cbor_sax.hpp): "don't
-// track keys at all." For the heap/NoAlloc decoders this is behaviorally
-// identical to KeepFirstDuplicateKey -- both of them already pay for the
-// per-pair duplicate scan every map decode does regardless of policy, so
-// there's no cost to avoid here, only a choice of what happens once a
-// duplicate is found. It earns its keep on the SAX path, which has no
-// per-map entries container to scan in the first place: there, selecting
-// this policy means genuinely skipping the key-tracking buffer altogether
-// (see SaxRange's MaxTrackedKeys), not just "don't reject."
+// Don't track keys. For the heap and NoAlloc decoders this behaves like
+// KeepFirstDuplicateKey, since they scan for duplicates anyway. For SAX it skips
+// the key-tracking buffer entirely (see SaxRange's MaxTrackedKeys).
 struct NoDuplicateKeyCheck {
   static constexpr bool on_duplicate(std::vector<std::pair<CborValue, CborValue>>&, CborValue, CborValue) {
     return true;
@@ -1420,17 +1214,12 @@ struct NoDuplicateKeyCheck {
                                       NoAlloc::Node* /*new_value*/) {
     return true;
   }
-  // SAX: never actually called (dedup tracking is skipped outright when
-  // this policy is selected), but still provided so the type satisfies
-  // is_sax_duplicate_key_policy_v and can be named as SaxRange's default.
+  // SAX: never called (tracking is skipped), but required by
+  // is_sax_duplicate_key_policy_v.
   static constexpr bool on_duplicate() { return true; }
 };
 
-// SAX-shaped counterpart of ::ConstexprCbor::is_duplicate_key_policy_v,
-// pinning the 0-arg on_duplicate() overload the same static_cast way (see
-// that trait's own comment for why a plain std::is_invocable_r_v on a bare
-// decltype(&P::on_duplicate) won't compile once a policy has more than one
-// overload of the name).
+// SAX counterpart of is_duplicate_key_policy_v, pinning the 0-arg overload.
 template <typename P, typename = void>
 struct is_sax_duplicate_key_policy : std::false_type {};
 
@@ -1441,20 +1230,11 @@ struct is_sax_duplicate_key_policy<P, std::void_t<decltype(static_cast<bool (*)(
 template <typename P>
 inline constexpr bool is_sax_duplicate_key_policy_v = is_sax_duplicate_key_policy<P>::value;
 
-namespace detail {
-// Structural equality for the map-key-comparison case above. Only the
-// alternatives that can plausibly be map keys need to compare correctly;
-// Array/Map/Tag keys are legal CBOR but comparing them structurally is
-// handled by std::variant's own operator== via each alternative's own
-// operator== (vector, pair, and Tag all get one for free if their members do).
-}  // namespace detail
 
 // ---------------------------------------------------------------------------
-// The single recursive decoder every major type ultimately goes through.
-// MaxDepth bounds how deep arrays/maps/tags may nest -- the single most
-// universal hazard surveyed across every real-world CBOR implementation
-// checked (QCBOR, tinycbor, and multiple unrelated CVEs all converged on an
-// explicit cap). Exceeding it is a refusal, not a crash.
+// The recursive decoder behind every major type. MaxDepth caps container nesting,
+// the most common hazard across surveyed CBOR implementations (QCBOR, tinycbor,
+// several CVEs). Exceeding it is an error, not a crash.
 template <std::size_t MaxDepth = 32, typename Utf8Policy = NoUtf8Validation, typename KeyPolicy = RejectDuplicateKeys>
 constexpr Expected<std::pair<CborValue, std::size_t>, Error> decode_value(std::span<const std::uint8_t> bytes,
                                                                            std::size_t depth = 0) {
@@ -1621,9 +1401,8 @@ constexpr Expected<std::pair<CborValue, std::size_t>, Error> decode_value(std::s
 }
 
 // ---------------------------------------------------------------------------
-// Encoding. Always emits the shortest ("preferred"/canonical) form for a
-// given value, which is what makes byte-for-byte round-trip comparison
-// against RFC 8949 Appendix A's own vectors meaningful in the first place.
+// Encoding. Always emits the shortest (preferred) form, so output can be compared
+// byte for byte against RFC 8949 Appendix A.
 
 constexpr void append_header(std::vector<std::uint8_t>& out, std::uint8_t major_type, std::uint64_t value) {
   const std::uint8_t mt = static_cast<std::uint8_t>(major_type << 5);
@@ -1673,15 +1452,8 @@ constexpr std::vector<std::uint8_t> encode_text_string(std::span<const std::uint
 
 namespace detail {
 
-// std::isnan/std::isinf aren't guaranteed constexpr before C++23 (P0533)
-// and several libc++ releases (Clang 19-21's included, and emscripten's
-// libc++) don't mark them constexpr even then as of this writing --
-// confirmed empirically, not assumed, since this codebase's default
-// C++20 floor must stay evaluable under them. `value != value` and a
-// direct comparison against `infinity()` rely only on floating-point
-// comparison operators, which are constexpr in every standard this
-// library supports, so they're used instead everywhere a NaN/Inf check
-// has to happen in a constexpr-evaluated path.
+// std::isnan/isinf are not constexpr in C++20, and some libc++ releases (Clang
+// 19-21, emscripten) lack it even in C++23. Plain comparisons work everywhere.
 constexpr bool is_nan(double value) { return value != value; }
 constexpr bool is_inf(double value) {
   return value == std::numeric_limits<double>::infinity() || value == -std::numeric_limits<double>::infinity();
@@ -1694,23 +1466,15 @@ constexpr bool bit_identical_double(double a, double b) {
   return std::bit_cast<std::uint64_t>(a) == std::bit_cast<std::uint64_t>(b);
 }
 
-// Derives a candidate half-float bit pattern, then verifies it round-trips
-// through decode_half_float back to the exact original value before
-// trusting it -- a hand-derived inverse is exactly the kind of code that's
-// easy to get subtly wrong, so the actual decoder is used as the oracle
-// rather than trusting the forward derivation blindly.
+// Derives a candidate half-float and accepts it only if decode_half_float
+// round-trips it exactly.
 constexpr std::optional<std::uint16_t> try_encode_half_float(double value) {
   std::uint16_t candidate;
   if (is_nan(value)) {
     candidate = 0x7e00;  // canonical NaN
   } else {
     const std::uint64_t bits64 = std::bit_cast<std::uint64_t>(value);
-    // Kept as uint64_t (not narrowed to uint16_t) so every `sign << 15`
-    // below stays in an unsigned type at least as wide as int, the same
-    // discipline used throughout this header: a narrower unsigned type
-    // promotes to a signed int before shifting, which is where the
-    // genuinely subtle (if ultimately harmless here) sign-conversion
-    // warnings further down came from.
+    // uint64_t so `sign << 15` is not promoted to signed int.
     const std::uint64_t sign = bits64 >> 63;
     if (value == 0.0) {
       candidate = static_cast<std::uint16_t>(sign << 15);

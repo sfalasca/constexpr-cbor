@@ -8,34 +8,23 @@
 #include "constexpr_cbor.hpp"
 #include "constexpr_cbor_noalloc.hpp"
 
-// Opt-in ergonomic sugar for the no-malloc NoAlloc decoder, mirroring
-// CborValue's own is_*()/operator[]/.get<T>()/iteration surface
-// (constexpr_cbor.hpp) but read-only: NoAlloc::Node's accessor methods still
-// need the pool passed explicitly for structural operations (contains(),
-// the string_view key overloads, and operator[](const NoAllocView&), all of
-// which go through node_equal), so NoAllocView bundles a (pool, node) pair
-// the same way a CborValue reference bundles its own data directly,
-// letting `view["a"][2]["b"]` chain without the caller re-threading `pool`
-// at every step. NoAllocBuilder is the one mutating piece: it writes new
-// nodes into an *existing* caller-owned NodePool's remaining capacity,
-// with every write returning std::optional (pool exhaustion is an
-// ordinary, expected failure here, unlike the heap builder where
-// std::vector growth can't fail).
+// Opt-in ergonomics for the NoAlloc decoder, mirroring CborValue's
+// is_*()/operator[]/get<T>()/iteration surface, read-only.
+// Structural operations need the pool (contains(), the string_view key
+// overloads and operator[](const NoAllocView&) all use node_equal), so
+// NoAllocView bundles a (pool, node) pair and lets `view["a"][2]["b"]` chain.
+// NoAllocBuilder is the one mutating piece: it writes new nodes into the
+// remaining capacity of an existing NodePool, and every write returns
+// std::optional because pool exhaustion is an expected failure.
 //
-// Deliberately out of scope: a mutable builder-style operator[] on
-// NoAllocView itself (it would need the exact same optional-returning
-// grow/promote machinery as the heap builder, but duplicated under a
-// completely different failure contract -- not a small addition once pool
-// exhaustion is taken seriously), and brace-initializer construction (no
-// array/map literal heuristic is needed here since NoAllocBuilder's
-// make_array/make_map calls are explicit and unambiguous already).
+// Out of scope: a mutable operator[] on NoAllocView (it would duplicate the heap
+// builder's grow/promote machinery under a different failure contract) and
+// brace-init construction (make_array/make_map are explicit, so no array-vs-map
+// heuristic is needed).
 namespace ConstexprCbor::NoAlloc {
 
-// A single, non-template sentinel node -- the pointer-world replacement
-// for the old per-<MaxNodes,MaxBytes> sentinel pool variable template.
-// NoAllocView::sentinel() needs no real pool at all: none of NoAllocView's
-// read-only predicates/accessors ever dereference `pool` for an
-// is_undefined() node, so the pool member can simply be nullptr.
+// Shared sentinel node for NoAllocView::sentinel(). The read-only accessors
+// never dereference `pool` for an undefined node, so the pool can be nullptr.
 inline constexpr Node undefined_sentinel_node{.data = std::monostate{}};
 
 struct NoAllocView {
@@ -91,13 +80,10 @@ struct NoAllocView {
     return sentinel();
   }
 
-  // Only meaningful when `key`'s node lives in this SAME pool -- node_equal
-  // compares two nodes reachable from one pool's byte storage (for
-  // StringRef/BigNumRef content comparison), not across two independent
-  // pools. For the common case of looking a decoded map up by a plain
-  // text key (which doesn't already live in the pool), use the
-  // std::string_view overload below instead, which compares string
-  // *content* directly and needs no shared pool.
+  // `key`'s node must live in this same pool: node_equal compares string and
+  // bignum content within one pool's byte storage, not across pools. To look a
+  // map up by a plain text key, use the std::string_view overload below, which
+  // compares content directly.
   constexpr NoAllocView operator[](const NoAllocView& key) const {
     if (const auto* m = std::get_if<MapRef>(&node->data)) {
       for (std::size_t i = 0; i < m->count; ++i) {
@@ -189,17 +175,11 @@ struct NoAllocView {
     }
   }
 
-  // Iteration: array yields elements in order; map yields values only, no
-  // primitive iteration arm -- same rules as CborValue's own iterator.
+  // Iteration: arrays yield elements, maps yield values only (as CborValue).
   //
-  // const_iterator/ItemsProxy are only forward-declared here, not defined
-  // inline: unlike CborValue (whose own iterator nests inside a template),
-  // NoAllocView is a concrete, non-template type now, and a nested class
-  // whose own fields hold NoAllocView BY VALUE (ItemsProxy::Item below)
-  // needs NoAllocView to already be a complete type -- which it isn't yet,
-  // this early in its own body. Forward-declare, then give each its full
-  // out-of-line definition (qualified as NoAllocView::const_iterator etc.)
-  // right after this struct closes, where NoAllocView is complete.
+  // const_iterator and ItemsProxy are defined out of line after this struct,
+  // because ItemsProxy::Item holds a NoAllocView by value and so needs
+  // NoAllocView to be complete.
   struct const_iterator;
   struct ItemsProxy;
 
@@ -281,15 +261,11 @@ constexpr Expected<NoAllocView, Error> decode_view(NodePool& pool, std::span<con
   return NoAllocView{&pool, decoded->node};
 }
 
-// Minimal builder: writes new nodes into an existing, caller-owned pool's
-// remaining capacity. Every write returns std::optional -- pool exhaustion
-// is an ordinary, expected failure here (applying the same rigor
-// checked_node_count already applies to decode), not a crash. Children
-// passed to make_array/make_map must already be built (post-order) views
-// into the SAME pool; make_map does no duplicate-key handling (unlike
-// decode, which is policy-templated against untrusted wire input, the
-// builder just writes already-assembled pairs in order -- a caller needing
-// dedup resolves it in their own pair list first).
+// Minimal builder: writes new nodes into an existing pool's remaining capacity.
+// Every write returns std::optional because pool exhaustion is an expected
+// failure. Children passed to make_array/make_map must already be built views
+// into the same pool. make_map does no duplicate-key handling (unlike decode,
+// which faces untrusted input); callers who need dedup resolve it first.
 struct NoAllocBuilder {
   NodePool* pool;
 

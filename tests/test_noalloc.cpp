@@ -5,20 +5,13 @@ using namespace ConstexprCbor;
 using namespace ConstexprCbor::NoAlloc;
 using namespace CompileTimeUnitTesting;
 
-// Every check in this file goes through compile_time_ut's expect_true<>()/
-// expect_eq<>() NTTP forms. Those require both operands to be converted
-// constant expressions formed fresh, with no named variable carried in
-// from an earlier statement -- which initially looked like a hard blocker
-// here, since NoAlloc::decode_value takes its NodePool by non-const
-// reference, so the pool itself can never be a constexpr input the way
-// sibling files' plain byte vectors are. The actual rule is narrower than
-// that, though: a variable of automatic storage duration is fine inside a
-// constant expression as long as its lifetime began within that *same*
-// evaluation. A plain constexpr helper function, with its own
-// NoAllocStorage/NodePool declared and consumed entirely inside its own
-// body, is exactly that -- the call `some_helper(vec) == expected` is one
-// self-contained expression, so it's usable directly as an expect_true<>()
-// argument.
+// Every check goes through compile_time_ut's expect_true<>()/expect_eq<>() NTTP
+// forms, which need operands formed fresh as constant expressions. The NodePool
+// is passed by non-const reference, so it cannot be a constexpr input, but an
+// automatic variable is fine inside a constant expression if its lifetime begins
+// within that same evaluation. So each helper is a constexpr function that
+// declares and consumes its own NoAllocStorage/NodePool, making the call
+// `some_helper(vec) == expected` one self-contained expression.
 
 constexpr bool noalloc_decode_ok(std::span<const std::uint8_t> bytes) {
   NoAllocStorage<32, 32, 48> storage;
@@ -50,9 +43,8 @@ constexpr std::uint64_t noalloc_array_child_u64(std::span<const std::uint8_t> by
   return std::get<std::uint64_t>(pool.child(arr, i).data);
 }
 
-// RFC 8949 Appendix A: [1, 2, 3] -> 0x83010203. Same vector test_array.cpp
-// uses for the heap-based decoder, proving the noalloc one reaches the same
-// result through pointer-based reference slots instead of std::vector.
+// RFC 8949 Appendix A: [1, 2, 3] -> 0x83010203, the same vector test_array.cpp
+// uses for the heap decoder.
 consteval bool test_decode_flat_array_matches_official_vector() {
   constexpr std::uint8_t vec[] = {0x83, 0x01, 0x02, 0x03};
   expect_true<noalloc_decode_ok(vec)>();
@@ -64,10 +56,9 @@ consteval bool test_decode_flat_array_matches_official_vector() {
 }
 static_assert(test_decode_flat_array_matches_official_vector());
 
-// RFC 8949 Appendix A: [_ 1, 2, 3] -> 0x9f010203ff. Exercises the
-// count-then-reserve pre-pass (count_indefinite_array_items) this decoder
-// needs that the heap-based one doesn't: a fixed-capacity pool can't grow
-// a slot one element at a time the way std::vector::push_back does.
+// RFC 8949 Appendix A: [_ 1, 2, 3] -> 0x9f010203ff. Exercises the count-then-
+// reserve pre-pass (count_indefinite_array_items), needed because a fixed pool
+// cannot grow one slot at a time.
 consteval bool test_decode_indefinite_array_matches_official_vector() {
   constexpr std::uint8_t vec[] = {0x9f, 0x01, 0x02, 0x03, 0xff};
   expect_eq<noalloc_bytes_consumed(vec), std::size_t{5}>();
@@ -88,10 +79,8 @@ constexpr std::uint64_t noalloc_nested_array_child_u64(std::span<const std::uint
   return std::get<std::uint64_t>(pool.child(inner, inner_i).data);
 }
 
-// RFC 8949 Appendix A: [1, [2, 3]] isn't a Table 6 row verbatim, but is
-// built from two rows in it ([1,2,3] and nested-array handling above);
-// proves the reference-slot indirection resolves correctly when a child is
-// itself a composite that needed its own multi-node subtree.
+// [1, [2, 3]] (not a verbatim Appendix A row): a child that is itself a composite
+// resolves correctly through the reference slots.
 consteval bool test_decode_array_handles_nesting() {
   constexpr std::uint8_t vec[] = {0x82, 0x01, 0x82, 0x02, 0x03};
   expect_eq<noalloc_bytes_consumed(vec), std::size_t{5}>();
@@ -145,8 +134,7 @@ consteval bool test_decode_map_matches_official_vector() {
 }
 static_assert(test_decode_map_matches_official_vector());
 
-// Indefinite-length map, same pre-count-then-reserve mechanism as the
-// indefinite array above but walking key/value pairs
+// Indefinite-length map: the same pre-count as the indefinite array, over pairs
 // (count_indefinite_map_pairs).
 consteval bool test_decode_indefinite_map() {
   constexpr std::uint8_t vec[] = {0xbf, 0x01, 0x02, 0x03, 0x04, 0xff};
@@ -182,10 +170,8 @@ constexpr std::uint8_t noalloc_string_byte_at(std::span<const std::uint8_t> byte
   return pool.bytes_of(s)[i];
 }
 
-// RFC 8949 Appendix A: (_ h'0102', h'030405') -> 0x5f42010243030405ff.
-// Proves chunk content lands contiguously in the byte noalloc via repeated
-// allocate_bytes calls, the same incremental-append discipline the
-// heap-based decoder's content.insert() uses.
+// RFC 8949 Appendix A: (_ h'0102', h'030405') -> 0x5f42010243030405ff. Chunks land
+// contiguously in byte storage via repeated allocate_bytes calls.
 consteval bool test_decode_indefinite_byte_string() {
   constexpr std::uint8_t vec[] = {0x5f, 0x42, 0x01, 0x02, 0x43, 0x03, 0x04, 0x05, 0xff};
   expect_eq<noalloc_bytes_consumed(vec), std::size_t{9}>();
@@ -213,10 +199,9 @@ constexpr bool noalloc_string_is_text_kind_with_policy(std::span<const std::uint
   return std::get<StringRef>(result->node->data).kind == CborValue::StringKind::Text;
 }
 
-// RFC 8949 Appendix A: "IETF" -> 0x6449455446, with the same
-// CompleteUtf8Validation policy test_textstring.cpp exercises on the
-// heap-based decoder -- proves the policy template parameter threads
-// through NoAlloc::decode_value identically.
+// RFC 8949 Appendix A: "IETF" -> 0x6449455446, with the CompleteUtf8Validation
+// policy from test_textstring.cpp, showing the policy threads through
+// NoAlloc::decode_value.
 consteval bool test_decode_text_string_with_utf8_policy() {
   constexpr std::uint8_t vec[] = {0x64, 0x49, 0x45, 0x54, 0x46};
   expect_true<noalloc_string_is_text_kind_with_policy(vec)>();
@@ -250,9 +235,8 @@ constexpr std::uint8_t noalloc_bignum_byte_at(std::span<const std::uint8_t> byte
   return pool.bytes_of(b)[i];
 }
 
-// RFC 8949 Appendix A: 2(h'010203') -> 0xc243010203 (positive bignum).
-// Same automatic tag-2/3 recognition as the heap-based decoder, just
-// producing a BigNumRef into the byte noalloc instead of an owned vector.
+// RFC 8949 Appendix A: 2(h'010203') -> 0xc243010203 (positive bignum). Tags 2/3
+// are recognized as in the heap decoder, producing a BigNumRef.
 consteval bool test_decode_bignum_tag() {
   constexpr std::uint8_t vec[] = {0xc2, 0x43, 0x01, 0x02, 0x03};
   expect_eq<noalloc_bytes_consumed(vec), std::size_t{5}>();
@@ -291,9 +275,8 @@ constexpr std::uint8_t noalloc_tag_child_first_byte(std::span<const std::uint8_t
   return pool.bytes_of(s)[0];
 }
 
-// RFC 8949 Appendix A: 32("http://www.example.com") shape (shortened here)
-// -- an ordinary tag, not a bignum, proving TagRef's direct (non-indirected)
-// child pointer works.
+// RFC 8949 Appendix A: 32("http://www.example.com") shape (shortened). An ordinary
+// tag, not a bignum, whose child pointer is direct (not indirected).
 consteval bool test_decode_plain_tag() {
   constexpr std::uint8_t vec[] = {0xd8, 0x20, 0x61, 0x61};  // tag 32, "a"
   expect_eq<noalloc_bytes_consumed(vec), std::size_t{4}>();
@@ -366,11 +349,9 @@ consteval bool test_decode_refuses_truncated_array() {
 }
 static_assert(test_decode_refuses_truncated_array());
 
-// Running out of node capacity is a refusal, not UB: a 3-element array
-// needs 3 reference slots plus the array node itself (4 node allocations
-// total, since reference slots are their own, separately-capacitied
-// storage now -- see noalloc_decode_ok_tiny_ref_pool below for that axis
-// isolated), which doesn't fit in a 2-node pool.
+// Running out of node capacity is an error, not UB: a 3-element array needs the
+// array node plus 3 element nodes (4 total; reference slots are separate), which
+// does not fit a 2-node pool.
 constexpr bool noalloc_decode_ok_tiny_node_pool(std::span<const std::uint8_t> bytes) {
   NoAllocStorage<2, 8, 32> storage;
   auto pool = storage.make_pool();
@@ -384,12 +365,9 @@ consteval bool test_decode_refuses_when_node_pool_exhausted() {
 }
 static_assert(test_decode_refuses_when_node_pool_exhausted());
 
-// A genuinely new, previously-impossible-to-isolate exhaustion axis: node
-// and byte budgets are generous, but only 2 reference slots are
-// available, so a 3-element array (needing 3 contiguous Node* slots)
-// still gets refused even though every other capacity has plenty of room.
-// Before this redesign, reference slots were IndexCell *nodes*, sharing
-// one budget with every other node -- this axis didn't exist on its own.
+// Reference-slot exhaustion in isolation: node and byte budgets are ample but
+// only 2 slots exist, so a 3-element array (3 contiguous Node* slots) is
+// refused.
 constexpr bool noalloc_decode_ok_tiny_ref_pool(std::span<const std::uint8_t> bytes) {
   NoAllocStorage<32, 2, 32> storage;
   auto pool = storage.make_pool();

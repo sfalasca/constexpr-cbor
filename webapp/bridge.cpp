@@ -1,15 +1,12 @@
-// Emscripten bridge: decodes a CBOR buffer (via the heap CborValue API) and
-// renders it as pretty-printed JSON text, for the browser-based viewer in
-// this directory. Plain `extern "C"` pointer/length functions rather than
-// embind: the viewer only ever needs one call in, one string out, and this
-// keeps the exported surface (and the Emscripten build flags) minimal.
+// Emscripten bridge: decodes a CBOR buffer with the heap CborValue API and renders
+// it as pretty-printed JSON for the browser viewer. Plain `extern "C"`
+// pointer/length functions rather than embind, since the viewer needs only one
+// call in and one string out.
 //
-// JSON has no native representation for several CBOR concepts (byte
-// strings, bignums beyond double precision, simple values, tags, non-string
-// map keys, NaN/Infinity, the undefined/null distinction) -- each is given
-// an explicit, documented textual convention below (see README.md's "How
-// CBOR maps to the displayed JSON" section) rather than silently losing
-// information or producing JSON a strict parser would reject.
+// JSON cannot represent byte strings, big bignums, simple values, tags,
+// non-string map keys, NaN/Infinity, or the undefined/null distinction. Each gets
+// a textual convention below (see README.md, "How CBOR maps to the displayed
+// JSON") so nothing is lost and the output stays valid JSON.
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -64,9 +61,8 @@ void append_escaped_json_string(std::string& out, std::string_view s) {
   out.push_back('"');
 }
 
-// std::to_string(double) always pads to 6 decimal places (e.g. "1.500000");
-// trims the trailing zeros while keeping at least one digit after the
-// point, since a bare trailing "." isn't valid JSON.
+// std::to_string(double) pads to 6 decimals ("1.500000"). Trim trailing zeros but
+// keep one digit after the point, since a bare trailing "." is invalid JSON.
 std::string trim_double(double v) {
   std::string s = std::to_string(v);
   const auto dot = s.find('.');
@@ -87,12 +83,9 @@ std::string bytes_to_hex(std::span<const std::uint8_t> bytes) {
   return out;
 }
 
-// Decimal text of a CBOR negative integer (major type 1: true value is
-// -1-n, n in [0, 2^64-1], so the true value can be as negative as -2^64,
-// which doesn't fit std::int64_t). Computed from n+1 directly rather than
-// negating into a signed type that might not hold the result -- n+1 itself
-// overflows std::uint64_t exactly once, at n == UINT64_MAX, handled as its
-// own literal case.
+// Decimal text of a CBOR negative integer (-1 - n, n in [0, 2^64-1]). Computed
+// from n+1 instead of negating into a signed type; n+1 overflows uint64_t only at
+// n == UINT64_MAX, which is handled as a literal.
 std::string negative_int_decimal(const NegativeInt& v) {
   if (v.n == std::numeric_limits<std::uint64_t>::max()) {
     return "-18446744073709551616";
@@ -100,13 +93,11 @@ std::string negative_int_decimal(const NegativeInt& v) {
   return "-" + std::to_string(v.n + 1);
 }
 
-// Decimal text of a CBOR bignum's magnitude (big-endian bytes), via
-// repeated long division by 10 -- the standard bytes-to-decimal algorithm,
-// since the magnitude can exceed any fixed-width integer type.
+// Decimal text of a bignum magnitude (big-endian bytes) by repeated long division
+// by 10, since it can exceed any fixed-width integer.
 std::string bignum_decimal(bool negative, std::span<const std::uint8_t> magnitude) {
   std::vector<std::uint8_t> digits(magnitude.begin(), magnitude.end());
-  // Strip leading zero bytes so an all-zero magnitude reduces to "0", not
-  // an empty digit string.
+  // Strip leading zero bytes so an all-zero magnitude gives "0", not "".
   std::size_t start = 0;
   while (start + 1 < digits.size() && digits[start] == 0) ++start;
   digits.erase(digits.begin(), digits.begin() + static_cast<std::ptrdiff_t>(start));
@@ -133,19 +124,16 @@ void to_json(const CborValue& value, std::string& out, int depth);
 
 void append_indent(std::string& out, int depth) { out.append(static_cast<std::size_t>(depth) * 2, ' '); }
 
-// A map key becomes a JSON object key. Text-string keys are used as-is;
-// every other CBOR key type (CBOR permits arbitrary keys: integers,
-// byte strings, arrays, even nested maps) is rendered as compact,
-// single-line JSON and used as the object key string -- still lossy
-// versus the original key's own type, but visibly distinct from a real
-// string key rather than silently coerced to look like one.
+// A map key becomes a JSON object key. Text keys are used as-is. Any other key
+// type (CBOR allows integers, byte strings, arrays, even maps) is rendered as
+// compact single-line JSON: lossy, but visibly distinct from a real string key.
 std::string map_key_to_json_string(const CborValue& key) {
   if (key.is_string()) {
     return *key.get<std::string>();
   }
   std::string inline_json;
   to_json(key, inline_json, 0);
-  // Collapse the pretty-printed form to one line for use as a key string.
+  // Collapse to one line for use as a key string.
   std::string compact;
   compact.reserve(inline_json.size());
   bool in_string = false;
@@ -236,11 +224,9 @@ void to_json(const CborValue& value, std::string& out, int depth) {
       value.data);
 }
 
-// Reverses the hand-written JSON parser from above: a small recursive-
-// descent parser whose job is only to invert the specific, documented
-// conventions to_json() produces (see README.md's "How CBOR maps to the
-// displayed JSON" table), not to be a general-purpose JSON library. Used
-// for the viewer's "edit the JSON, download as CBOR" round trip.
+// Recursive-descent JSON parser that inverts the conventions to_json() produces
+// (see README.md), not a general-purpose JSON library. Backs the viewer's "edit
+// the JSON, download as CBOR" round trip.
 class JsonParser {
  public:
   explicit JsonParser(std::string_view text) : s_(text) {}
@@ -409,10 +395,8 @@ class JsonParser {
     return out;
   }
 
-  // Grows a big-endian magnitude by one more decimal digit (Horner's
-  // method applied directly to the byte vector): multiply the existing
-  // value by 10, add the digit, propagating carry from the least
-  // significant byte (the back of the vector) towards the front.
+  // Appends a decimal digit to a big-endian magnitude (Horner's method): multiply
+  // by 10, add the digit, and carry from the least significant byte (the back).
   static std::vector<std::uint8_t> append_decimal_digit(std::vector<std::uint8_t> mag, char digit) {
     std::uint32_t carry = static_cast<std::uint32_t>(digit - '0');
     for (auto it = mag.rbegin(); it != mag.rend(); ++it) {
@@ -434,12 +418,9 @@ class JsonParser {
     return mag;
   }
 
-  // Only a *pure*-digit string (optional leading '-') whose magnitude
-  // overflows std::uint64_t is read back as a bignum -- anything that
-  // fits in 64 bits is left as plain text, since to_json() above never
-  // quotes a number that small as a string in the first place, so a
-  // user-typed numeric-looking string that small is presumed to really
-  // mean a string.
+  // Only a pure-digit string (optional leading '-') that overflows uint64_t is
+  // read back as a bignum. Smaller ones stay text, because to_json() never quotes
+  // a number that small, so such a string was presumably meant as a string.
   static std::optional<CborValue> try_parse_oversized_decimal(const std::string& str) {
     if (str.empty()) return std::nullopt;
     const bool negative = str.front() == '-';
@@ -459,11 +440,9 @@ class JsonParser {
     return CborValue(CborValue::BigNum{.negative = negative, .magnitude = decimal_to_bignum_magnitude(trimmed)});
   }
 
-  // Reverses the string conventions to_json() introduces for CBOR
-  // concepts JSON strings don't otherwise carry: a `h'<hex>'` literal
-  // becomes a byte string, the three float-sentinel strings become the
-  // matching double, an over-64-bit digit string becomes a bignum, and
-  // everything else is a plain text string.
+  // Reverses to_json()'s string conventions: `h'<hex>'` is a byte string, the
+  // three float-sentinel strings are doubles, an over-64-bit digit string is a
+  // bignum, and everything else is text.
   static std::optional<CborValue> interpret_string(const std::string& str) {
     if (str.size() >= 3 && str.front() == 'h' && str[1] == '\'' && str.back() == '\'') {
       const auto bytes = hex_decode(std::string_view(str).substr(2, str.size() - 3));
@@ -504,10 +483,8 @@ class JsonParser {
     const bool negative = text.front() == '-';
     std::string_view digits(text);
     if (negative) digits.remove_prefix(1);
-    // A bare (unquoted) JSON number this large never comes out of
-    // to_json() in the first place (that path only exists for the
-    // quoted-bignum-string convention above), so overflow here just
-    // falls back to a double rather than needing its own bignum path.
+    // to_json() never emits a bare number this large (bignums are quoted), so
+    // overflow here falls back to a double.
     std::uint64_t magnitude = 0;
     bool overflow = false;
     for (const char c : digits) {
@@ -564,11 +541,9 @@ class JsonParser {
         return std::nullopt;
       }
     }
-    // Reverses the `{"$simple": N}` / `{"$tag": N, "value": V}`
-    // conventions to_json() uses above. Falls through to a plain map if
-    // the shape doesn't match exactly (e.g. a genuine map that happens to
-    // use one of these key names with a non-numeric tag), rather than
-    // misinterpreting it.
+    // Reverses the `{"$simple": N}` / `{"$tag": N, "value": V}` conventions. A
+    // map that merely uses one of these key names with a non-numeric tag stays a
+    // plain map.
     if (entries.size() == 1 && entries[0].first == "$simple" &&
         std::holds_alternative<std::uint64_t>(entries[0].second.data)) {
       const auto n = std::get<std::uint64_t>(entries[0].second.data);
@@ -604,11 +579,8 @@ class JsonParser {
 extern "C" {
 
 // Decodes `len` bytes at `data` and returns a malloc'd, NUL-terminated
-// pretty-printed JSON string on success, or nullptr if the input isn't
-// well-formed CBOR (the same refusal-not-crash contract as the rest of
-// this library -- never partial/garbage output on bad input). The caller
-// (the viewer's JS) owns the returned pointer and must free it via
-// cbor_free_string.
+// pretty-printed JSON string, or nullptr if the input is not well-formed CBOR.
+// The caller owns the pointer and must release it with cbor_free_string.
 char* cbor_to_json(const std::uint8_t* data, std::size_t len) {
   const auto decoded = decode_value(std::span<const std::uint8_t>(data, len));
   if (!decoded) {
@@ -627,13 +599,11 @@ char* cbor_to_json(const std::uint8_t* data, std::size_t len) {
 
 void cbor_free_string(char* s) { std::free(s); }
 
-// Parses `len` bytes of JSON text at `text` (the edited-in-the-browser
-// text, following the conventions documented above and in README.md),
-// encodes it to canonical CBOR, and returns a malloc'd buffer with its
-// length written to `*out_len`. Returns nullptr (and `*out_len == 0`) on
-// any parse failure -- malformed JSON, or JSON that doesn't fit one of
-// the documented shapes. The caller owns the returned buffer and must
-// free it via cbor_free_bytes.
+// Parses `len` bytes of JSON text (following the conventions above and in
+// README.md), encodes it to canonical CBOR, and returns a malloc'd buffer with
+// its length in `*out_len`. Returns nullptr (and `*out_len == 0`) on malformed
+// JSON or JSON that does not fit a documented shape. The caller must release the
+// buffer with cbor_free_bytes.
 std::uint8_t* cbor_from_json(const char* text, std::size_t len, std::size_t* out_len) {
   JsonParser parser(std::string_view(text, len));
   auto value = parser.parse();

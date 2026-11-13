@@ -1,34 +1,22 @@
-// Proves NoAlloc::decode_value/encode_value genuinely work at *runtime*, not
-// just inside a consteval function: every other NoAlloc test only exercises
-// them inside consteval functions/static_assert, where the compiler's own
-// constant-evaluation machinery handles any transient allocation
-// internally -- a compile-time-only proof says nothing about what actually
-// runs on a target decoding a real sensor or network buffer at runtime.
-// The functions below are ordinary (non-constexpr) functions instead, so
-// their bodies are real, compiled, executed code; ctest runs the compiled
-// binary and checks its exit code like any other test in this suite. This
-// is also the one file where the NOALLOC_ASSERT(owns(...)) checks wired
-// into NodePool's accessors run as genuine, compiled runtime checks
-// rather than participating in constant evaluation.
+// Checks NoAlloc::decode_value/encode_value at runtime. Every other NoAlloc test
+// runs inside consteval or static_assert, which proves nothing about code
+// executing on a target against a real buffer. These are ordinary
+// (non-constexpr) functions; ctest runs the binary and checks its exit code.
+// This is also the only file where the NOALLOC_ASSERT(owns(...)) checks in
+// NodePool's accessors run as compiled runtime checks.
 //
-// Deleting the global operator new/delete to additionally prove no
-// allocation happens at compile-enforced link time was tried and
-// abandoned: a deleted definition must be the function's first
-// declaration, which it can't be once <new> (pulled in transitively by
-// <vector>/<array>/etc.) has already declared it undeleted -- there's no
-// portable way to turn "this calls operator new" into a hard compile
-// error after the fact. Standalone: no compile_time_ut dependency,
-// matching noexcept_tests.cpp's own convention (the bare-metal images
-// only copy include/, not a fetched sibling library).
+// A deleted global operator new was tried to prove nothing allocates, and
+// abandoned: a deleted definition must be the first declaration, which <new>
+// (included transitively) already precludes.
+// Standalone, with no compile_time_ut dependency, like noexcept_tests.cpp (the
+// bare-metal images copy only include/).
 #include "constexpr_cbor_noalloc.hpp"
 
 using namespace ConstexprCbor;
 using namespace ConstexprCbor::NoAlloc;
 
-// Deliberately a plain function, not constexpr/consteval: its body is
-// ordinary runtime code the compiler must actually generate, the same as
-// it would for a real caller decoding a byte buffer that only exists at
-// runtime (sensor data, a network packet, ...).
+// Plain function, not constexpr: the body is real runtime code, as for a caller
+// decoding a buffer that exists only at runtime (sensor data, network packet).
 bool run_noalloc_roundtrip(std::span<const std::uint8_t> bytes, std::span<std::uint8_t> out) {
   NoAllocStorage<16, 16, 32> storage;
   auto pool = storage.make_pool();
