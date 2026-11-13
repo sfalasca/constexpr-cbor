@@ -4,18 +4,8 @@
 using namespace ConstexprCbor;
 using namespace CompileTimeUnitTesting;
 
-// operator[] exact-match retrieval, plus the miss-case sentinel's identity
-// (the same CborValue::null_sentinel address every time, no per-call copy
-// or allocation) -- proven both via static_assert (consteval, the whole
-// point of this library) and a plain runtime check, since the rejected
-// function-local-static sentinel design would have failed exactly the
-// consteval path this file exercises.
-//
-// Each check below is a self-contained helper (build + query inside one
-// function body), matching test_noalloc.cpp's established convention: a
-// named variable from an *earlier statement* can't be referenced forming
-// a later expect_eq<>()/expect_true<>() NTTP, but one whose lifetime began
-// within that same evaluation (i.e. entirely inside its own helper) can.
+// operator[] exact-match retrieval, and the miss sentinel's identity: always the
+// same null_sentinel address, checked by static_assert and at runtime.
 constexpr std::uint64_t array_elem(std::size_t i) {
   return CborValue::array({10, 20, 30})[i].get<std::uint64_t>().value_or(0);
 }
@@ -39,8 +29,7 @@ constexpr bool test_sentinel_identity_const() {
   const CborValue arr = CborValue::array({1});
   const CborValue& miss_a = arr[5];
   const CborValue& miss_b = arr[6];
-  // Both misses must bind to the exact same shared object -- no per-call
-  // sentinel copy -- proven by address identity, not just value equality.
+  // Both misses bind to the same shared object (address identity).
   return &miss_a == &miss_b && &miss_a == &null_sentinel;
 }
 static_assert(test_sentinel_identity_const());

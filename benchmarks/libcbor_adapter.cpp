@@ -1,6 +1,4 @@
-// The only translation unit that includes libcbor's own header -- see
-// libcbor_adapter.hpp for why (a genuine extern "C" symbol collision with
-// tinycbor, not just an include-path ambiguity).
+// The only translation unit that includes libcbor's header (see libcbor_adapter.hpp).
 #include "libcbor_adapter.hpp"
 
 #include <malloc.h>
@@ -13,28 +11,19 @@ void walk(cbor_item_t* item, std::uint64_t& items, std::int64_t& isum, double& f
   items++;
   switch (cbor_typeof(item)) {
     case CBOR_TYPE_UINT:
-      // cbor_get_uint64 requires the item to actually be stored at
-      // CBOR_INT_64 width internally (it's a raw *(uint64_t*)item->data
-      // reinterpret, guarded only by a CBOR_ASSERT that's a no-op in a
-      // release build) -- most small values in real payloads are stored
-      // at a narrower width, so calling it unconditionally silently reads
-      // garbage past the actual (narrower) buffer. cbor_get_int is the
-      // width-generic accessor: it switches on cbor_int_get_width() and
-      // calls the correctly-sized getter, zero-extending the result.
+      // cbor_get_uint64 reads raw memory at 64-bit width, guarded only by an assert
+      // that is disabled in release builds, so it reads garbage for narrower stored
+      // widths. cbor_get_int dispatches on the stored width.
       isum += static_cast<std::int64_t>(cbor_get_int(item));
       break;
     case CBOR_TYPE_NEGINT:
-      // cbor_get_int returns the raw encoded magnitude n (CBOR's own -1-n
-      // convention for negative integers, same as this project's own
-      // NegativeInt) -- not the already-negated logical value.
+      // cbor_get_int returns the raw magnitude n (value == -1 - n for negative integers).
       isum += -1 - static_cast<std::int64_t>(cbor_get_int(item));
       break;
     case CBOR_TYPE_FLOAT_CTRL:
       if (!cbor_float_ctrl_is_ctrl(item)) {
         fsum += cbor_float_get_float(item);
       }
-      // true/false/null/undefined (a ctrl value): nothing to fold in,
-      // matching every other walker in this benchmark.
       break;
     case CBOR_TYPE_BYTESTRING:
       strbytes += cbor_bytestring_length(item);
@@ -95,14 +84,8 @@ bool accepted_by_libcbor(std::span<const std::uint8_t> bytes) {
 
 namespace {
 
-// Builds libcbor's own cbor_item_t tree from a CborValue -- libcbor has no
-// streaming encoder the way tinycbor/QCBOR do, so "encode via libcbor"
-// genuinely means "build a tree, then serialize it," the same DOM-only
-// shape its decode side already has. Each cbor_array_push/cbor_map_add
-// call increments its own reference to the child it's given (per
-// libcbor's own documented contract), so this decref's its local
-// reference immediately after handing it to the parent -- the parent's
-// own reference is what keeps it alive from here on.
+// Builds libcbor's tree from a CborValue. cbor_array_push/cbor_map_add take their
+// own reference to the child, so the local reference is released right after.
 cbor_item_t* build_libcbor(const ConstexprCbor::CborValue& v) {
   using CV = ConstexprCbor::CborValue;
   return std::visit(
@@ -160,9 +143,7 @@ cbor_item_t* build_libcbor(const ConstexprCbor::CborValue& v) {
           cbor_decref(&child);
           return tag;
         } else {
-          // BigNum/SimpleValue: not exercised by this benchmark's
-          // payloads (see gen_payloads.py) -- fail loud rather than
-          // silently encode something wrong if that ever changes.
+          // BigNum/SimpleValue are not in the benchmark payloads; fail loudly if that changes.
           return nullptr;
         }
       },

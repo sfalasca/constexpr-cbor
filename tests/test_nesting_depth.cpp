@@ -3,10 +3,7 @@
 
 using namespace ConstexprCbor;
 
-// [[[1]]] -> 0x818181 01 is exactly 3 levels deep (the outermost array is
-// depth 0; its one element, another array, is depth 1; its one element,
-// another array, is depth 2; its one element, the integer 1, is depth 3's
-// content but doesn't itself descend further).
+// [[[1]]] is exactly 3 levels deep (the outermost array is depth 0).
 consteval bool test_nesting_depth_accepts_exactly_at_the_bound() {
   using namespace CompileTimeUnitTesting;
   constexpr std::uint8_t vec[] = {0x81, 0x81, 0x81, 0x01};
@@ -23,8 +20,7 @@ consteval bool test_nesting_depth_refuses_one_level_past_the_bound() {
 }
 static_assert(test_nesting_depth_refuses_one_level_past_the_bound());
 
-// The default bound (32) must accept ordinary, shallow real-world structures
-// without the caller ever having to think about it.
+// The default bound (32) accepts ordinary shallow structures.
 consteval bool test_nesting_depth_default_bound_is_generous_enough_for_ordinary_input() {
   using namespace CompileTimeUnitTesting;
   constexpr std::uint8_t vec[] = {0x83, 0x01, 0x82, 0x02, 0x03, 0x82, 0x04, 0x05};  // [1, [2, 3], [4, 5]]

@@ -48,8 +48,7 @@ constexpr bool text_and_map_round_trip() {
   return map->operator[]("a").get<std::uint64_t>() == 1;
 }
 
-// Pool exhaustion must be refused (nullopt), never UB/overflow -- the same
-// rigor checked_node_count already applies to decode.
+// Pool exhaustion is refused (nullopt), never UB.
 constexpr bool exhaustion_is_refused_not_ub() {
   NoAllocStorage<2, 2, 16> storage;  // exactly 2 node slots
   auto pool = storage.make_pool();
@@ -61,10 +60,8 @@ constexpr bool exhaustion_is_refused_not_ub() {
   return !three.has_value();
 }
 
-// Ref-slot exhaustion is its own, independently-exhaustible axis now (see
-// test_noalloc.cpp's test_decode_refuses_when_ref_pool_exhausted for the
-// decode-side equivalent): node capacity is generous, but only 1 of the 2
-// reference slots make_array needs for its two children is available.
+// Ref-slot exhaustion in isolation: node capacity is ample, but only 1 of the 2
+// reference slots make_array needs is available.
 constexpr bool array_reservation_exhaustion_is_refused() {
   NoAllocStorage<3, 1, 16> storage;  // 3 node slots, but only 1 ref slot
   auto pool = storage.make_pool();

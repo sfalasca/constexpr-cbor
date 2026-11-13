@@ -3,10 +3,7 @@
 
 using namespace ConstexprCbor;
 
-// std::isnan isn't guaranteed constexpr before C++23 and several libc++
-// releases don't mark it constexpr even then (see the matching comment in
-// constexpr_cbor.hpp) -- this test runs under static_assert, so it needs
-// the same portable, comparison-operator-only NaN check the library uses.
+// std::isnan is not constexpr everywhere; use a comparison-only NaN check.
 constexpr bool is_nan(double v) { return v != v; }
 
 // RFC 8949 Appendix A: false -> 0xf4, true -> 0xf5, null -> 0xf6, undefined -> 0xf7.
@@ -100,9 +97,7 @@ consteval bool test_decode_simple_matches_official_double_float_vectors() {
 }
 static_assert(test_decode_simple_matches_official_double_float_vectors());
 
-// RFC 8949 Appendix A: simple(16) -> 0xf0, simple(255) -> 0xf8ff. Additional
-// info 0-19 is "unassigned" but still well-formed and decodable; 24 is the
-// one-byte form for values 32-255.
+// RFC 8949 Appendix A: simple(16) -> 0xf0, simple(255) -> 0xf8ff.
 consteval bool test_decode_simple_matches_official_simple_value_vectors() {
   using namespace CompileTimeUnitTesting;
   constexpr std::uint8_t vec_16[] = {0xf0};
@@ -147,10 +142,7 @@ consteval bool test_decode_simple_rejects_wrong_major_type() {
 }
 static_assert(test_decode_simple_rejects_wrong_major_type());
 
-// Canonical encoding: every finite value that fits half-precision exactly
-// must encode there, not single or double, even though RFC 8949's own
-// appendix lists Infinity/NaN at all three widths as valid (just not all
-// preferred) encodings of the same value.
+// Canonical encoding: every finite value that fits half precision exactly encodes there.
 consteval bool test_encode_float_always_picks_the_shortest_exact_width() {
   using namespace CompileTimeUnitTesting;
   constexpr std::array<std::uint8_t, 3> expected_zero{0xf9, 0x00, 0x00};

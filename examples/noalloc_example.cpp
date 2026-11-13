@@ -1,13 +1,6 @@
-// constexpr-cbor, no-malloc mode (ConstexprCbor::NoAlloc)
-// ---------------------------------------------------------------------
-// For environments without a heap at all (or that simply don't want one
-// in the decode path): decodes into a NodePool, a small, non-owning view
-// over storage the *caller* provides and sizes. Every decoded value is a
-// Node living in that storage; there's no malloc anywhere in decode_value
-// or encode_value below. See README.md's "No-malloc decoding/encoding"
-// section for the full design rationale (why pointers into caller-owned
-// storage are safe here, and the one precondition -- the storage must
-// outlive every decoded reference into it -- that safety rests on).
+// constexpr-cbor no-malloc mode: decodes into a NodePool, a non-owning view over
+// caller-provided storage. The storage must outlive every decoded reference
+// into it (see README).
 #include <array>
 #include <iostream>
 
@@ -21,19 +14,14 @@ namespace {
 void decode_and_inspect() {
   std::cout << "--- decode into caller-owned storage + ergonomic access ---\n";
 
-  // Same payload as heap_example.cpp: {"a": 1, "b": [2, 3]}.
   constexpr std::uint8_t bytes[] = {0xa2, 0x61, 0x61, 0x01, 0x61, 0x62, 0x82, 0x02, 0x03};
 
-  // NoAllocStorage<MaxNodes, MaxRefs, MaxBytes> is what the caller actually
-  // owns (three plain arrays); NodePool is a trivially-copyable VIEW over
-  // it, never itself the thing holding storage. Sized generously here --
-  // see "Running out of capacity" below for what happens when it isn't.
+  // NoAllocStorage<MaxNodes, MaxRefs, MaxBytes> is the caller-owned storage;
+  // NodePool is a view over it.
   NoAllocStorage<32, 32, 32> storage;
   NodePool pool = storage.make_pool();
 
-  // decode_view is the one-call ergonomic entry point: decode_value()
-  // directly into a NoAllocView, nlohmann::json-style access on top of
-  // the raw pool/Node* pair.
+  // decode_view decodes straight into a NoAllocView.
   const auto view = decode_view(pool, bytes);
   if (!view) {
     std::cout << "decode failed\n";
@@ -51,9 +39,7 @@ void decode_and_inspect() {
 void raw_pool_access() {
   std::cout << "\n--- the same decode, via the raw NodePool/Node* API ---\n";
 
-  // NoAllocView above is sugar over exactly this -- useful to see once,
-  // since a genuinely minimal embedded consumer may skip the ergonomics
-  // header entirely and only pay for this layer.
+  // The raw pool/Node* layer that NoAllocView wraps.
   constexpr std::uint8_t bytes[] = {0x83, 0x01, 0x02, 0x03};  // [1, 2, 3]
 
   NoAllocStorage<16, 16, 16> storage;
@@ -79,9 +65,7 @@ void build_and_encode() {
   NodePool pool = storage.make_pool();
   NoAllocBuilder builder{&pool};
 
-  // Children must already be built (post-order) before the array/map that
-  // references them -- no deferred/lazy construction, since every write
-  // just advances the pool's own cursors.
+  // Children must be built before the array/map that references them.
   const auto a = builder.make_uint(10);
   const auto b = builder.make_uint(20);
   const std::array<NoAllocView, 2> children = {*a, *b};
@@ -99,9 +83,8 @@ void build_and_encode() {
 void capacity_exhaustion_is_a_refusal() {
   std::cout << "\n--- running out of capacity is a clean refusal, not UB ---\n";
 
-  // [1, 2, 3] needs 4 Node slots (the array itself + 3 elements) and 3
-  // reference slots -- this pool only has room for 2 nodes, so decode
-  // must refuse rather than overrun anything.
+  // Needs 4 nodes and 3 reference slots; the pool has 2 nodes, so decode fails
+  // instead of overrunning.
   constexpr std::uint8_t bytes[] = {0x83, 0x01, 0x02, 0x03};
   NoAllocStorage<2, 2, 16> tiny_storage;
   NodePool tiny_pool = tiny_storage.make_pool();

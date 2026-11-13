@@ -4,24 +4,15 @@
 
 #include "constexpr_cbor.hpp"
 
-// A third decode strategy alongside constexpr_cbor.hpp (heap tree) and
-// constexpr_cbor_noalloc.hpp (no-malloc tree): no tree is built.
-// SaxRange pulls one CBOR event at a time off the wire (BeginArray, Uint,
-// TextString, EndMap, ...), like the pull APIs of tinycbor and QCBOR. It reuses
-// constexpr_cbor.hpp's byte-level primitives unchanged (decode_length,
-// decode_uint/negint, decode_byte_string/decode_text_string, decode_simple,
-// skip_item); only the control flow that decides which to call next is new.
+// Pull-style SAX decoder: SaxRange yields one CBOR event at a time (BeginArray,
+// Uint, TextString, EndMap, ...) without building a tree.
 //
-// The existing decoders recurse over whole subtrees, so there is no
-// "decode one event and pause" shape to reuse. Coroutines were rejected because
-// C++20 coroutines cannot be evaluated in a constant expression, which would
-// defeat the library's consteval point. Instead SaxIterator keeps an explicit
-// frame stack bounded by MaxDepth, mirroring the depth cap of the tree decoders.
+// Coroutines are not used because C++20 coroutines cannot be evaluated in a
+// constant expression. SaxIterator instead keeps an explicit frame stack bounded
+// by MaxDepth.
 //
-// All iteration state (position, frame stack, key-tracking buffer) lives by
-// value in the iterator, so copies advance independently. SaxRange is therefore
-// a std::ranges::forward_range (not just input_range) and implements
-// std::ranges::view_interface, composing with range adaptors.
+// All iteration state lives by value in the iterator, so copies advance
+// independently and SaxRange is a std::ranges::forward_range.
 namespace ConstexprCbor::Sax {
 
 enum class EventKind {
@@ -42,15 +33,10 @@ enum class EventKind {
   Error,
 };
 
-// The role the item plays in its immediate parent, so a consumer can tell "this
-// scalar is a map key" without a separate event kind per (kind, role) pair.
-// A tag has no role of its own: Tag events and the events of the item they wrap
-// inherit the tag's context, since a tag modifies the next item rather than
-// holding a child slot.
+// The role the item plays in its immediate parent. A tag has no role of its own:
+// Tag events and the events of the item it wraps inherit the tag's context.
 enum class EventContext { TopLevel, ArrayElement, MapKey, MapValue };
 
-// Reuses the decoded-payload shapes (DecodedUint, DecodedNegint, DecodedSimple,
-// DecodedBytes); only the switch on kind is new.
 struct Event {
   EventKind kind = EventKind::Error;
   EventContext context = EventContext::TopLevel;
@@ -61,8 +47,7 @@ struct Event {
   double float_value = 0.0;            // Float
   std::span<const std::uint8_t> bytes{};  // TextString/ByteString content -- zero-copy, same as decode_byte_string
   std::uint8_t simple_value = 0;       // Simple
-  Error error{};                       // Error only -- the same reason+offset type the heap/NoAlloc
-                                        // decoders report, so all three paths share one error vocabulary
+  Error error{};                       // Error only
 };
 
 namespace detail {
@@ -70,11 +55,8 @@ namespace detail {
 // Duplicate-key tracking is a flat, caller-sized array of (offset, length) spans
 // into the input, shared by all open maps (each map's slice is
 // [tracked_keys_begin, tracked_keys_begin + tracked_keys_count)).
-// Keys are compared by raw encoded bytes, not by value as node_equal and
-// CborValue::operator== do, so non-canonical encodings of one integer key
-// (0x00 vs 0x18 0x00) are not caught here, unlike in the other decoders.
-// Comparing by value would require decoding both keys, which builds the kind of
-// tree this decoder exists to avoid.
+// Keys are compared by raw encoded bytes, so non-canonical encodings of one
+// integer key (0x00 vs 0x18 0x00) are not caught, unlike in the other decoders.
 struct KeySpan {
   std::size_t offset = 0;
   std::size_t length = 0;
@@ -183,7 +165,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
     // and updates whatever is now the new top (or finishes the range).
     constexpr void pop_and_emit_end() {
       detail::Frame& top = stack[depth - 1];
-      if (top.indefinite) ++pos;  // consume the 0xff break byte
+      if (top.indefinite) ++pos;
       const EventContext closing_role = top.role_in_parent;
       const EventKind end_kind = (top.kind == detail::Frame::Kind::Array) ? EventKind::EndArray : EventKind::EndMap;
       current = Event{.kind = end_kind, .context = closing_role};
@@ -193,7 +175,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
         detail::Frame& parent = stack[depth - 1];
         if (closing_role == EventContext::MapKey) {
           parent.awaiting_value = true;
-        } else {  // ArrayElement or MapValue
+        } else {
           if (closing_role == EventContext::MapValue) parent.awaiting_value = false;
           if (!parent.indefinite) --parent.remaining;
         }
@@ -367,7 +349,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
       detail::Frame& parent = stack[depth - 1];
       if (ctx == EventContext::MapKey) {
         parent.awaiting_value = true;
-      } else {  // ArrayElement or MapValue
+      } else {
         if (ctx == EventContext::MapValue) parent.awaiting_value = false;
         if (!parent.indefinite) --parent.remaining;
       }
@@ -388,7 +370,6 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
         const auto key_span = bytes.subspan(pos, *key_len);
         if (!is_tracked_duplicate(frame, key_span)) {
           if (tracked_keys_used >= MaxTrackedKeys) {
-            // capacity exhaustion is a clean refusal, same stance as NodePool's
             set_error(ErrorReason::KeyTrackingCapacityExhausted, pos);
             return false;
           }
@@ -403,7 +384,7 @@ struct SaxRange : std::ranges::view_interface<SaxRange<MaxDepth, MaxTrackedKeys,
           return false;
         }
         if (!KeyPolicy::on_duplicate()) {
-          set_error(ErrorReason::DuplicateKey, pos);  // RejectDuplicateKeys
+          set_error(ErrorReason::DuplicateKey, pos);
           return false;
         }
         pos += *key_len + *value_len;

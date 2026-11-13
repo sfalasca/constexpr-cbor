@@ -8,19 +8,11 @@
 #include "constexpr_cbor.hpp"
 #include "constexpr_cbor_noalloc.hpp"
 
-// Opt-in ergonomics for the NoAlloc decoder, mirroring CborValue's
-// is_*()/operator[]/get<T>()/iteration surface, read-only.
-// Structural operations need the pool (contains(), the string_view key
-// overloads and operator[](const NoAllocView&) all use node_equal), so
-// NoAllocView bundles a (pool, node) pair and lets `view["a"][2]["b"]` chain.
-// NoAllocBuilder is the one mutating piece: it writes new nodes into the
-// remaining capacity of an existing NodePool, and every write returns
-// std::optional because pool exhaustion is an expected failure.
-//
-// Out of scope: a mutable operator[] on NoAllocView (it would duplicate the heap
-// builder's grow/promote machinery under a different failure contract) and
-// brace-init construction (make_array/make_map are explicit, so no array-vs-map
-// heuristic is needed).
+// Opt-in ergonomics for the NoAlloc decoder. NoAllocView bundles a (pool, node)
+// pair so `view["a"][2]["b"]` chains without re-passing the pool.
+// NoAllocBuilder writes new nodes into the remaining capacity of an existing
+// NodePool; every write returns std::optional because pool exhaustion is an
+// expected failure.
 namespace ConstexprCbor::NoAlloc {
 
 // Shared sentinel node for NoAllocView::sentinel(). The read-only accessors
@@ -253,7 +245,6 @@ constexpr NoAllocView::ItemsProxy NoAllocView::items() const { return ItemsProxy
 
 constexpr NoAllocView view(const NodePool& pool, const Node* node) { return NoAllocView{&pool, node}; }
 
-// One-call ergonomic entry point: decode straight into a view.
 template <std::size_t MaxDepth = 32, typename Utf8Policy = NoUtf8Validation, typename KeyPolicy = RejectDuplicateKeys>
 constexpr Expected<NoAllocView, Error> decode_view(NodePool& pool, std::span<const std::uint8_t> bytes) {
   const auto decoded = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(pool, bytes);

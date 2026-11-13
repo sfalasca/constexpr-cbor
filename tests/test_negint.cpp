@@ -19,9 +19,8 @@ consteval bool test_decode_negint_matches_small_vectors() {
 }
 static_assert(test_decode_negint_matches_small_vectors());
 
-// The boundary tinycbor issue #347 is open about: the true value can be as
-// negative as -2^64, which does not fit int64_t (min -2^63). RFC 8949
-// Appendix A: -18446744073709551616 -> 0x3bffffffffffffffff.
+// tinycbor issue #347: the true value can be -2^64, which does not fit int64_t.
+// RFC 8949 Appendix A: -18446744073709551616 -> 0x3bffffffffffffffff.
 consteval bool test_decode_negint_handles_boundary_out_of_int64_range() {
   using namespace CompileTimeUnitTesting;
   constexpr std::uint8_t vec_min[] = {0x3b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
@@ -30,11 +29,6 @@ consteval bool test_decode_negint_handles_boundary_out_of_int64_range() {
   return true;
 }
 static_assert(test_decode_negint_handles_boundary_out_of_int64_range());
-
-// -18446744073709551617 -> 0xc349010000000000000000 is a tag-2 bignum, out of
-// scope for decode_negint itself (it needs a value even further negative than
-// major type 1 alone can express) -- not tested here, belongs to the tag
-// decoder's own test file once bignum tags are in scope.
 
 consteval bool test_decode_negint_rejects_wrong_major_type() {
   using namespace CompileTimeUnitTesting;

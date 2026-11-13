@@ -6,10 +6,8 @@
 using namespace ConstexprCbor;
 using namespace CompileTimeUnitTesting;
 
-// CborValue is a genuine std::ranges::forward_range (not just "has
-// begin()/end()"), the same bar SaxRange is held to in test_sax.cpp --
-// CborValue::const_iterator/ItemsProxy::iterator are copyable value types
-// with no shared external cursor, so two copies can advance independently.
+// CborValue is a forward_range: its iterators are copyable values with no shared
+// cursor.
 static_assert(std::ranges::forward_range<CborValue>);
 static_assert(std::ranges::forward_range<CborValue::ItemsProxy>);
 

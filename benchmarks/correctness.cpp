@@ -1,13 +1,6 @@
-// Cross-library correctness corpus: feeds the exact same byte vectors to
-// constexpr-cbor, tinycbor, QCBOR, and libcbor, and reports accept/reject
-// per library against the RFC-correct expected answer. Most "reject"
-// vectors are lifted directly from tests/test_malformed_input.cpp (which
-// already cites tinycbor's not_well_formed_cbor.h and QCBOR's own test
-// suite as sources for several of them) -- this file asks the
-// complementary question: when constexpr-cbor refuses something per that
-// file's own static_asserts, do the other libraries actually refuse it
-// too, or is "refuse, don't crash" a claim constexpr-cbor backs up more
-// strictly than its peers?
+// Cross-library correctness corpus: feeds the same byte vectors to constexpr-cbor,
+// tinycbor, QCBOR and libcbor and reports accept/reject against the RFC-correct
+// answer. Most reject vectors come from tests/test_malformed_input.cpp.
 #include <cstdio>
 #include <cstdint>
 #include <span>
@@ -37,10 +30,8 @@ bool accepted_by_constexpr_cbor(const std::vector<std::uint8_t>& bytes) {
   return ConstexprCbor::decode_value(std::span<const std::uint8_t>(bytes)).has_value();
 }
 
-// SaxRange's default KeyPolicy (NoDuplicateKeyCheck) never rejects a
-// duplicate key, so it naturally agrees with should_accept=true on the
-// duplicate_keys_1_1 vector below -- unlike accepted_by_constexpr_cbor,
-// no special-casing is needed here.
+// SaxRange's default KeyPolicy never rejects duplicate keys, so it agrees with
+// should_accept=true on duplicate_keys_1_1 without special-casing.
 bool accepted_by_sax(const std::vector<std::uint8_t>& bytes) {
   for (auto ev : ConstexprCbor::Sax::SaxRange<32>{std::span<const std::uint8_t>(bytes)}) {
     if (ev.kind == ConstexprCbor::Sax::EventKind::Error) return false;
@@ -52,8 +43,6 @@ bool accepted_by_tinycbor(const std::vector<std::uint8_t>& bytes) {
   CborParser parser;
   CborValue it;
   if (cbor_parser_init(bytes.data(), bytes.size(), 0, &parser, &it) != CborNoError) return false;
-  // A single top-level item, fully walked (containers recursively), with
-  // no error anywhere -- matches what "accept" means for the other two.
   struct Walker {
     static bool walk(CborValue* v) {
       while (!cbor_value_at_end(v)) {
@@ -83,20 +72,10 @@ bool accepted_by_qcbor(const std::vector<std::uint8_t>& bytes) {
     if (err == QCBOR_ERR_NO_MORE_ITEMS) break;
     if (err != QCBOR_SUCCESS) return false;
   }
-  // QCBOR's GetNext loop alone cannot distinguish "legitimately ran out
-  // of top-level input" from "ran out of bytes while still inside an
-  // unclosed array/map" -- both surface as QCBOR_ERR_NO_MORE_ITEMS from
-  // GetNext (see its header's own comment on QCBOR_ERR_HIT_END). Calling
-  // Finish(), as QCBOR's own docs say a caller must, is what actually
-  // catches the underfilled/unclosed-container vectors below -- this
-  // corpus has no "valid item + trailing garbage" vectors, so Finish()
-  // can be called unconditionally here.
+  // QCBOR's GetNext cannot tell running out of top-level input from running out
+  // inside an unclosed container; Finish() catches the latter.
   return QCBORDecode_Finish(&ctx) == QCBOR_SUCCESS;
 }
-
-// libcbor's own accept/reject check (::accepted_by_libcbor) lives in
-// libcbor_adapter.cpp -- see libcbor_adapter.hpp's comment for why it
-// can't be included directly here.
 
 }  // namespace
 
@@ -127,18 +106,8 @@ int main() {
       {"bstr_claims_4_has_3", {0x44, 0x01, 0x02, 0x03}, false, "test_malformed_input.cpp"},
       {"tstr_claims_4_has_3", {0x64, 0x49, 0x45, 0x54}, false, "test_malformed_input.cpp"},
       {"huge_claimed_length_tiny_buffer", {0x59, 0xff, 0xf0, 0x00}, false, "test_malformed_input.cpp"},
-      // RFC 8949 Section 5.3.1's own overlong-UTF-8 example: a single
-      // continuation byte (0xae) encoded via the 2-byte lead-byte form
-      // (0xc0) that should have been the 1-byte form -- not well-formed
-      // UTF-8 even though the CBOR framing around it is fine. Neither
-      // tinycbor nor QCBOR validate UTF-8 content by default (confirmed
-      // against their docs), so both are expected to *accept* this at
-      // the CBOR-structural level -- constexpr-cbor also accepts it
-      // under NoUtf8Validation (its default), and only refuses it when
-      // the caller opts into decode_value<32, CompleteUtf8Validation>.
-      // Listed here with should_accept=true to reflect what the
-      // structural (no-UTF-8-check) decode path actually does in all
-      // three libraries, not to claim UTF-8 is being validated.
+      // RFC 8949 Section 5.3.1's overlong-UTF-8 example. tinycbor, QCBOR and
+      // constexpr-cbor's default do not validate UTF-8, so all accept it.
       {"overlong_utf8_structurally_well_formed", {0x62, 0xc0, 0xae}, true, "RFC 8949 Section 5.3.1"},
       // --- should be accepted (controls, not just reject cases) ----
       {"empty_array", {0x80}, true, "RFC 8949 Appendix A"},
@@ -161,12 +130,8 @@ int main() {
     const bool tc = accepted_by_tinycbor(v.bytes);
     const bool qc = accepted_by_qcbor(v.bytes);
     const bool lc = accepted_by_libcbor(std::span<const std::uint8_t>(v.bytes));
-    // constexpr-cbor's *default* decode_value<32, NoUtf8Validation,
-    // RejectDuplicateKeys> intentionally refuses the duplicate-key
-    // vector even though it's structurally well-formed CBOR -- that's a
-    // deliberate policy choice (see README's "Pluggable duplicate-map-
-    // key policies"), not a structural-decode disagreement, so it's
-    // special-cased out of the plain accept/reject diff below.
+    // The default decode_value refuses the duplicate-key vector by policy
+    // (RejectDuplicateKeys), not a structural disagreement, so it is special-cased.
     const bool is_dup_key_policy_case = std::string(v.name) == "duplicate_keys_1_1";
     const bool cc_matches = is_dup_key_policy_case || (cc == v.should_accept);
     if (!cc_matches || sc != v.should_accept || tc != v.should_accept || qc != v.should_accept ||

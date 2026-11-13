@@ -6,11 +6,8 @@ using namespace ConstexprCbor;
 // RFC 8949 Appendix A: [] -> 0x80, [1,2,3] -> 0x83010203,
 // [1, [2, 3], [4, 5]] -> 0x8301820203820405.
 //
-// decode_value's result holds a std::vector, so each assertion below
-// re-decodes fresh inline rather than caching into a named variable: a
-// vector's heap allocation can be used transiently within one constant
-// expression, but can't persist as a frozen constexpr object reused across
-// several independent expect_eq<...>() template-argument formations.
+// Each assertion re-decodes inline: a std::vector allocation cannot persist across
+// expect_eq<>() template arguments.
 consteval bool test_decode_array_matches_official_vectors() {
   using namespace CompileTimeUnitTesting;
   constexpr std::uint8_t vec_empty[] = {0x80};
@@ -27,10 +24,6 @@ consteval bool test_decode_array_matches_official_vectors() {
 }
 static_assert(test_decode_array_matches_official_vectors());
 
-// Here the decode result is only used as an ordinary local variable, inside
-// plain function-body logic, not fed into an NTTP -- so a named variable is
-// fine, the escaping-allocation rule only applies to the expect_eq<A, B>()
-// template-argument form above.
 constexpr bool test_decode_array_handles_nesting() {
   constexpr std::uint8_t vec_nested[] = {0x83, 0x01, 0x82, 0x02, 0x03, 0x82, 0x04, 0x05};
   const auto d = decode_value(vec_nested);
@@ -42,8 +35,7 @@ constexpr bool test_decode_array_handles_nesting() {
 }
 static_assert(test_decode_array_handles_nesting());
 
-// RFC 8949 Appendix A: the 25-element array exercises the one-byte-length
-// array-count marker (additional info 24).
+// RFC 8949 Appendix A: 25 elements, exercising the one-byte array-count marker.
 constexpr bool test_decode_array_matches_25_element_vector() {
   constexpr std::uint8_t vec_25[] = {0x98, 0x19, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
                                       0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
@@ -100,12 +92,7 @@ constexpr bool test_array_roundtrips_nested() {
 }
 static_assert(test_array_roundtrips_nested());
 
-// Proves Error.offset telescopes to an absolute position, not just that a
-// refusal happened: array([1, <truncated uint>]) with the truncated
-// element starting at byte 2 (header at 0, element 0 at 1, the malformed
-// one-byte-length-prefix uint at 2 with its required follow-on byte
-// missing) -- the reported offset must point at byte 2, not 0 (the array
-// header) or 1 (the first, perfectly well-formed element).
+// Error.offset is absolute: [1, <truncated uint>] must report byte 2, not 0 or 1.
 consteval bool test_decode_error_offset_points_at_the_failing_element() {
   using namespace CompileTimeUnitTesting;
   constexpr std::uint8_t vec[] = {0x83, 0x01, 0x18};  // [1, <truncated>] (array announces 3, only 2 present)

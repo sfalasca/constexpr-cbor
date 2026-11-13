@@ -7,18 +7,10 @@ using namespace ConstexprCbor;
 using namespace ConstexprCbor::Sax;
 using namespace CompileTimeUnitTesting;
 
-// SaxRange's whole iteration state lives by value inside the iterator (no
-// shared external cursor the way istream_iterator has), so it should be a
-// genuine forward_range, not just input_range -- verified structurally,
-// not just asserted in a comment.
+// SaxRange keeps all iteration state in the iterator, so it is a forward_range;
+// checked structurally.
 static_assert(std::ranges::forward_range<SaxRange<32>>);
 static_assert(std::ranges::view<SaxRange<32>>);
-
-// Every helper below is a small, self-contained constexpr function (its
-// own SaxRange declared and consumed entirely inside its own body),
-// matching test_noalloc.cpp's established convention for the same reason:
-// compile_time_ut's expect_eq<>()/expect_true<>() need one fresh,
-// self-contained expression per check.
 
 constexpr bool sax_decode_ok(std::span<const std::uint8_t> bytes) {
   for (auto ev : SaxRange<32>{bytes}) {
@@ -72,9 +64,6 @@ constexpr bool sax_nth_has_count(std::span<const std::uint8_t> bytes, std::size_
   return false;
 }
 
-// RFC 8949 Appendix A: [1, 2, 3] -> 0x83010203. Same vector test_array.cpp
-// and test_noalloc.cpp use, proving the SAX decoder reaches the same
-// values through five events instead of a tree.
 consteval bool test_decode_flat_array_matches_official_vector() {
   constexpr std::uint8_t vec[] = {0x83, 0x01, 0x02, 0x03};
   expect_true<sax_decode_ok(vec)>();
@@ -92,7 +81,6 @@ consteval bool test_decode_flat_array_matches_official_vector() {
 }
 static_assert(test_decode_flat_array_matches_official_vector());
 
-// RFC 8949 Appendix A: [_ 1, 2, 3] -> 0x9f010203ff.
 consteval bool test_decode_indefinite_array() {
   constexpr std::uint8_t vec[] = {0x9f, 0x01, 0x02, 0x03, 0xff};
   expect_true<sax_decode_ok(vec)>();
@@ -103,7 +91,6 @@ consteval bool test_decode_indefinite_array() {
 }
 static_assert(test_decode_indefinite_array());
 
-// RFC 8949 Appendix A: {1: 2, 3: 4} -> 0xa201020304.
 consteval bool test_decode_flat_map() {
   constexpr std::uint8_t vec[] = {0xa2, 0x01, 0x02, 0x03, 0x04};
   expect_true<sax_decode_ok(vec)>();
@@ -118,8 +105,7 @@ consteval bool test_decode_flat_map() {
 }
 static_assert(test_decode_flat_map());
 
-// Nested array [1, [2, 3]] -> 0x8201820203, exercising frame-stack push/pop
-// and the parent's remaining-count bookkeeping after a child frame closes.
+// Frame-stack push/pop and the parent's remaining-count bookkeeping.
 consteval bool test_decode_nested_array() {
   constexpr std::uint8_t vec[] = {0x82, 0x01, 0x82, 0x02, 0x03};
   expect_true<sax_decode_ok(vec)>();
@@ -132,9 +118,8 @@ consteval bool test_decode_nested_array() {
 }
 static_assert(test_decode_nested_array());
 
-// A single tagged value: tag 32 ("URI") wrapping the 1-byte text "a" ->
-// 0xd8206161. Tag does not push a frame or get its own End event -- the
-// tagged value's event(s) immediately follow, same context as the tag.
+// A tag gets no frame or End event; the tagged value's events follow with the
+// tag's context.
 consteval bool test_decode_tag() {
   constexpr std::uint8_t vec[] = {0xd8, 0x20, 0x61, 0x61};
   expect_true<sax_decode_ok(vec)>();
@@ -147,13 +132,9 @@ consteval bool test_decode_tag() {
 }
 static_assert(test_decode_tag());
 
-// A chain of nested tags deep enough to exceed MaxDepth must refuse, the
-// same contract as the heap/NoAlloc decoders -- enforced here purely for
-// consistency (a SAX tag chain costs no native call-stack depth, so this
-// decoder doesn't structurally need the cap the way recursive decoders do).
+// A tag chain past MaxDepth is refused, consistent with the other decoders.
 constexpr std::array<std::uint8_t, 7> make_tag_chain() {
-  // Six tags (0xc6 is tag 6, one byte each: major type 6, additional info
-  // <24) wrapping a single true (0xf5) -- 7 bytes, 6 levels deep.
+  // Six tags wrapping a single true (0xf5).
   return {0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0xc6, 0xf5};
 }
 
@@ -178,11 +159,8 @@ consteval bool test_tag_chain_respects_max_depth() {
 }
 static_assert(test_tag_chain_respects_max_depth());
 
-// Malformed input (truncated array header) is a clean refusal, not UB.
-// Returns the ErrorReason of the first Error event in the stream, or
-// MaxDepthExceeded (an arbitrary sentinel distinct from TruncatedInput)
-// if decode actually succeeded -- used only by tests that already assert
-// failure via sax_decode_ok() first, so this fallback is never exercised.
+// ErrorReason of the first Error event, or MaxDepthExceeded as a sentinel if
+// decoding succeeded (callers assert failure first).
 constexpr ErrorReason sax_first_error_reason(std::span<const std::uint8_t> bytes) {
   for (auto ev : SaxRange<32>{bytes}) {
     if (ev.kind == EventKind::Error) return ev.error.reason;
@@ -193,18 +171,13 @@ constexpr ErrorReason sax_first_error_reason(std::span<const std::uint8_t> bytes
 consteval bool test_decode_refuses_truncated_input() {
   constexpr std::uint8_t vec[] = {0x9f, 0x01};  // indefinite array, never closed
   expect_false<sax_decode_ok(vec)>();
-  // All three decode paths (heap/NoAlloc/SAX) now share one error
-  // vocabulary -- this is the same ErrorReason the heap/NoAlloc decoders
-  // would report for the same shape of truncation.
   expect_eq<sax_first_error_reason(vec), ErrorReason::TruncatedInput>();
   return true;
 }
 static_assert(test_decode_refuses_truncated_input());
 
-// Duplicate-key handling: {1: 2, 1: 3} -> 0xa20102010203, with
-// MaxTrackedKeys sized for the map and RejectDuplicateKeys/
-// KeepFirstDuplicateKey selected explicitly (SaxRange's own default,
-// NoDuplicateKeyCheck, never tracks anything and so never rejects).
+// Duplicate keys under RejectDuplicateKeys/KeepFirstDuplicateKey (the default
+// NoDuplicateKeyCheck never tracks, so never rejects).
 
 constexpr bool sax_decode_ok_with_policy_reject(std::span<const std::uint8_t> bytes) {
   for (auto ev : (SaxRange<32, 4, NoUtf8Validation, RejectDuplicateKeys>{bytes})) {
@@ -244,8 +217,7 @@ consteval bool test_duplicate_key_policies() {
   constexpr std::uint8_t vec[] = {0xa2, 0x01, 0x02, 0x01, 0x03};  // {1: 2, 1: 3}
   expect_false<sax_decode_ok_with_policy_reject(vec)>();
   expect_eq<sax_reject_error_reason(vec), ErrorReason::DuplicateKey>();
-  // KeepFirstDuplicateKey: the second pair's events are dropped entirely --
-  // BeginMap, key 1, value 2, EndMap (the duplicate pair never surfaces).
+  // KeepFirstDuplicateKey drops the second pair's events.
   expect_eq<sax_event_count_keep_first(vec), std::size_t{4}>();
   expect_eq<sax_nth_uint_value_keep_first(vec, 0), std::uint64_t{1}>();
   expect_eq<sax_nth_uint_value_keep_first(vec, 1), std::uint64_t{2}>();
@@ -253,8 +225,6 @@ consteval bool test_duplicate_key_policies() {
 }
 static_assert(test_duplicate_key_policies());
 
-// No distinct keys beyond MaxTrackedKeys' capacity is a clean refusal, the
-// same stance as every other capacity exhaustion in this codec.
 constexpr bool sax_decode_ok_tiny_key_capacity(std::span<const std::uint8_t> bytes) {
   for (auto ev : (SaxRange<32, 1, NoUtf8Validation, RejectDuplicateKeys>{bytes})) {
     if (ev.kind == EventKind::Error) return false;
@@ -277,8 +247,7 @@ consteval bool test_duplicate_key_tracking_capacity_exhausted() {
 }
 static_assert(test_duplicate_key_tracking_capacity_exhausted());
 
-// Text string content is zero-copy -- the span points directly into the
-// original input, same discipline as decode_text_string itself.
+// Text content is a zero-copy span into the input.
 constexpr bool sax_text_is_zero_copy(std::span<const std::uint8_t> bytes) {
   for (auto ev : SaxRange<32>{bytes}) {
     if (ev.kind == EventKind::TextString) {
@@ -295,8 +264,6 @@ consteval bool test_text_string_zero_copy() {
 }
 static_assert(test_text_string_zero_copy());
 
-// AsciiOnlyValidation rejects a text string containing a non-ASCII byte,
-// the same Utf8Policy type used by the other two decoders, unchanged.
 constexpr bool sax_decode_ok_with_utf8_policy(std::span<const std::uint8_t> bytes) {
   for (auto ev : (SaxRange<32, 0, AsciiOnlyValidation>{bytes})) {
     if (ev.kind == EventKind::Error) return false;

@@ -1,16 +1,7 @@
-// tinycbor's *encoder* (cborencoder.c), measured in a standalone program
-// rather than inside bench.cpp: it and libcbor both export a handful of
-// identically-named C functions for unrelated purposes (cbor_encode_uint,
-// cbor_encode_tag -- confirmed via an actual link attempt, not assumed),
-// a genuine object-level symbol collision that only ever became live
-// once tinycbor's encoder, not just its decoder, needed linking alongside
-// libcbor. Isolating into a separate translation unit doesn't help here
-// (the final executable still links both static libraries' object code
-// either way) -- the only clean fix is to never link the two into the
-// same process, hence this separate single-purpose binary, the same
-// pattern benchmarks/size/ already uses for isolated per-library
-// measurement. See benchmarks/README.md for how this program's numbers
-// fold into the combined encode comparison table.
+// tinycbor's encoder (cborencoder.c), measured in a standalone program: it and
+// libcbor export identically-named C functions (cbor_encode_uint,
+// cbor_encode_tag), a link-time collision, so they cannot share a process.
+// See benchmarks/README.md for how the numbers fold into the encode comparison.
 #include <sched.h>
 
 #include <algorithm>
@@ -35,11 +26,7 @@ struct EncodeResult {
   std::size_t bytes_written;
 };
 
-// Builds straight off the same shared, already-decoded
-// ConstexprCbor::CborValue every other library's encode benchmark in
-// bench.cpp also builds from -- the fairest way to measure "how fast is
-// tinycbor's own streaming encoder," independent of how any library got
-// its data in the first place.
+// Builds from the same shared decoded CborValue as the other encode benchmarks.
 CborError tinycbor_encode_value(const ConstexprCbor::CborValue& v, CborEncoder& enc) {
   using CV = ConstexprCbor::CborValue;
   return std::visit(
@@ -88,9 +75,7 @@ CborError tinycbor_encode_value(const ConstexprCbor::CborValue& v, CborEncoder& 
           if (err != CborNoError) return err;
           return tinycbor_encode_value(x.value.front(), enc);
         } else {
-          // BigNum/SimpleValue: not exercised by this benchmark's
-          // payloads (see gen_payloads.py) -- fail loud, not silently
-          // wrong, if that ever changes.
+          // BigNum/SimpleValue are not in the benchmark payloads; fail loudly if that changes.
           return CborErrorUnknownType;
         }
       },

@@ -1,10 +1,5 @@
-// A duplicate-key policy missing the right NoAlloc-shaped member function
-// must fail to compile with a clear, named message -- the NoAlloc
-// counterpart of wrong_shape_duplicate_key_policy.cpp, since
-// NoAlloc::decode_value checks its own NoAlloc::is_duplicate_key_policy_v
-// trait (the std::vector-shaped overload checked by the heap-only test
-// doesn't satisfy it; NoAlloc::decode_value needs the NodePool-shaped
-// on_duplicate instead).
+// A duplicate-key policy without the NoAlloc-shaped on_duplicate must fail to
+// compile with a clear message (NoAlloc::is_duplicate_key_policy_v).
 #include "constexpr_cbor_noalloc.hpp"
 
 using namespace ConstexprCbor;

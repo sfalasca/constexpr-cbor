@@ -26,35 +26,27 @@
 #endif
 #endif
 
-// constexpr-cbor: header-only, consteval-evaluable C++20 codec for RFC 8949.
-// Decoders are pure functions over an immutable std::span and return a fresh
-// Expected, so there is no mutable decoder state to corrupt on a failed decode.
 namespace ConstexprCbor {
 
-// ---------------------------------------------------------------------------
 // Every failure carries an ErrorReason and, where meaningful, a byte offset
 // (absolute within the input span when decoding, the output span when encoding).
-// TypeMismatch and UnsupportedUserType are not buffer-position failures; their
-// offset is 0.
-// wire format broke down at some point."
+// TypeMismatch and UnsupportedUserType have offset 0.
 enum class ErrorReason {
-  TruncatedInput,        // ran out of bytes before a complete header/field
-  MalformedHeader,       // reserved additional-info (28-30), wrong major type for
-                          // context, or a break marker where one isn't permitted
-  TruncatedPayload,      // a declared length/argument exceeds what's actually left
+  TruncatedInput,         // ran out of bytes before a complete header
+  MalformedHeader,        // reserved additional info (28-30), wrong major type, or misplaced break
+  TruncatedPayload,       // declared length exceeds the bytes left
   MaxDepthExceeded,
   InvalidUtf8,
-  DuplicateKey,          // rejected by the active KeyPolicy
-  IntegerOutOfRange,     // NegativeInt::to_int64 / get<int64_t> narrowing failure
-  TypeMismatch,          // get<T>() / NoAllocView::get<T>() wrong active alternative
-  UnsupportedUserType,   // CborSerializer<T>::from_cbor returned false
+  DuplicateKey,
+  IntegerOutOfRange,      // value does not fit the requested integer type
+  TypeMismatch,
+  UnsupportedUserType,    // CborSerializer<T>::from_cbor returned false
   NodeCapacityExhausted,  // NoAlloc only
   RefCapacityExhausted,   // NoAlloc only
-  ByteCapacityExhausted,  // NoAlloc only (decode-side storage, or NoAllocBuilder's
-                          // make_text/make_bytes)
-  CountOverflow,          // NoAlloc only -- checked_node_count's uint64_t->size_t / *2 guard
-  KeyTrackingCapacityExhausted,  // Sax only -- SaxRange's MaxTrackedKeys exhausted
-  OutputBufferTooSmall,   // encode_value (NoAlloc only -- heap's std::vector can't fail this way)
+  ByteCapacityExhausted,  // NoAlloc only
+  CountOverflow,          // NoAlloc only: count does not fit size_t, or *2 overflows
+  KeyTrackingCapacityExhausted,  // SAX only: MaxTrackedKeys exceeded
+  OutputBufferTooSmall,   // NoAlloc encode only
 };
 
 struct Error {
@@ -85,7 +77,6 @@ constexpr Unexpected<E> unexpected(E e) {
   return Unexpected<E>{e};
 }
 
-// Only the operations this library and its tests use; no and_then/transform/or_else.
 template <typename T, typename E>
 class ExpectedImpl {
   std::variant<T, E> storage_;
@@ -94,7 +85,6 @@ class ExpectedImpl {
   // Forwarding reference rather than by-value-then-move: moving a materialized
   // std::string into the variant's union storage breaks constexpr evaluation on
   // arm-none-eabi-g++ 13.2.1 (newlib libstdc++).
-  // Excludes Unexpected<E> and ExpectedImpl itself so copy/move are not shadowed.
   template <typename U = T>
     requires(!std::same_as<std::remove_cvref_t<U>, Unexpected<E>> &&
              !std::same_as<std::remove_cvref_t<U>, ExpectedImpl> && std::constructible_from<T, U&&>)
@@ -107,8 +97,6 @@ class ExpectedImpl {
   constexpr const T& operator*() const { return std::get<0>(storage_); }
   constexpr const T* operator->() const { return &std::get<0>(storage_); }
   constexpr const E& error() const { return std::get<1>(storage_); }
-  // Compare directly against a value convertible to T, like std::optional.
-  // Hidden friend, so C++20 synthesizes the reversed and != forms.
   template <typename U>
   friend constexpr bool operator==(const ExpectedImpl& lhs, const U& rhs) {
     if (!lhs.has_value()) return false;
@@ -144,7 +132,6 @@ template <typename T, typename E>
 using Expected = detail::ExpectedImpl<T, E>;
 using detail::unexpected;
 
-// ---------------------------------------------------------------------------
 // Negative integers: major type 1 encodes -1 - n for n in [0, 2^64-1].
 // The value can reach -2^64, below int64_t's range, so n is stored unnegated
 // (cf. tinycbor issue #347).
@@ -173,10 +160,8 @@ constexpr To narrow(From v) {
 }
 }  // namespace detail
 
-// ---------------------------------------------------------------------------
-// Shared length decoding. Additional info 0-23 is the value itself; 24/25/26/27
-// mean it follows in the next 1/2/4/8 bytes. The major type is not checked;
-// every length-prefixed type builds on this.
+// Decodes the length/argument of any major type (the major type is not checked).
+// Additional info 0-23 is the value; 24-27 mean it follows in the next 1/2/4/8 bytes.
 struct DecodedUint {
   std::uint64_t value;
   std::size_t bytes_consumed;
@@ -209,8 +194,6 @@ constexpr bool is_indefinite_or_break(std::span<const std::uint8_t> bytes) {
   return !bytes.empty() && (bytes[0] & 0x1f) == 31;
 }
 
-// ---------------------------------------------------------------------------
-// Major type 0: unsigned integer.
 constexpr Expected<DecodedUint, Error> decode_uint(std::span<const std::uint8_t> bytes) {
   if (bytes.empty() || (bytes[0] >> 5) != 0) {
     return unexpected(Error{ErrorReason::MalformedHeader});
@@ -218,8 +201,6 @@ constexpr Expected<DecodedUint, Error> decode_uint(std::span<const std::uint8_t>
   return decode_length(bytes);
 }
 
-// ---------------------------------------------------------------------------
-// Major type 1: negative integer.
 struct DecodedNegint {
   NegativeInt value;
   std::size_t bytes_consumed;
@@ -236,10 +217,7 @@ constexpr Expected<DecodedNegint, Error> decode_negint(std::span<const std::uint
   return DecodedNegint{.value = NegativeInt{.n = len->value}, .bytes_consumed = len->bytes_consumed};
 }
 
-// ---------------------------------------------------------------------------
-// UTF-8 validation policies for text strings. RFC 8949 Section 5.3.1 makes
-// validation optional, so it is a template parameter checked against an
-// interface contract.
+// A UTF-8 policy P provides `static bool is_valid(std::span<const std::uint8_t>)`.
 template <typename P>
 struct is_utf8_validation_policy
     : std::bool_constant<std::is_invocable_r_v<bool, decltype(&P::is_valid), std::span<const std::uint8_t>>> {};
@@ -247,7 +225,6 @@ struct is_utf8_validation_policy
 template <typename P>
 inline constexpr bool is_utf8_validation_policy_v = is_utf8_validation_policy<P>::value;
 
-// Skip validation (permitted by RFC 8949).
 struct NoUtf8Validation {
   static constexpr bool is_valid(std::span<const std::uint8_t>) { return true; }
 };
@@ -271,13 +248,13 @@ constexpr bool is_structurally_valid_utf8(std::span<const std::uint8_t> bytes) {
     } else if ((b & 0xf8) == 0xf0) {
       continuation_count = 3;
     } else {
-      return false;  // not a valid lead byte (stray continuation byte, or >4-byte form)
+      return false;
     }
     if (i + continuation_count >= bytes.size() && continuation_count > bytes.size() - i - 1) {
       return false;
     }
     if (bytes.size() - i <= continuation_count) {
-      return false;  // truncated: not enough bytes left for the continuations this lead byte demands
+      return false;
     }
     for (std::size_t k = 1; k <= continuation_count; ++k) {
       if ((bytes[i + k] & 0xc0) != 0x80) {
@@ -327,11 +304,9 @@ struct CompleteUtf8Validation {
     std::size_t i = 0;
     while (i < bytes.size()) {
       const auto [code_point, length] = detail::decode_one_code_point(bytes.subspan(i));
-      // Reject overlong encodings: the shortest form must have been used.
       if (length == 2 && code_point < 0x80) return false;
       if (length == 3 && code_point < 0x800) return false;
       if (length == 4 && code_point < 0x10000) return false;
-      // Reject surrogate-half code points and anything past Unicode's range.
       if (code_point >= 0xd800 && code_point <= 0xdfff) return false;
       if (code_point > 0x10ffff) return false;
       i += length;
@@ -353,9 +328,6 @@ struct AsciiOnlyValidation {
   }
 };
 
-// ---------------------------------------------------------------------------
-// Major types 2 and 3: a length followed by that many bytes.
-// Text strings additionally run the UTF-8 policy.
 struct DecodedBytes {
   std::span<const std::uint8_t> bytes;
   std::size_t bytes_consumed;
@@ -400,8 +372,6 @@ constexpr Expected<DecodedBytes, Error> decode_text_string(std::span<const std::
   return DecodedBytes{.bytes = payload, .bytes_consumed = header_size + length};
 }
 
-// ---------------------------------------------------------------------------
-// Major type 7: floats, booleans, null, undefined.
 struct DecodedSimple {
   // Simple: unassigned values (additional info 0-19, or 24 for 32-255).
   enum class Kind { False, True, Null, Undefined, Float, Simple };
@@ -479,7 +449,6 @@ constexpr Expected<DecodedSimple, Error> decode_simple(std::span<const std::uint
       return DecodedSimple{.kind = DecodedSimple::Kind::Float, .as_double = std::bit_cast<double>(bits), .bytes_consumed = 9};
     }
     default:
-      // reserved (28-30), break (31): not well-formed outside an indefinite-length context
       return unexpected(Error{ErrorReason::MalformedHeader});
   }
 }
@@ -491,8 +460,6 @@ constexpr Error rebase_error(Error e, std::size_t base) {
   return e;
 }
 
-// Forward declaration: CborValue falls back to CborSerializer<T> (ADL hook
-// dispatch, defined below) for types that are not built-in alternatives.
 template <typename T, typename = void>
 struct CborSerializer;
 
@@ -512,15 +479,12 @@ auto cbor_fields();
 
 struct CborValue;
 
-// ---------------------------------------------------------------------------
-// The recursive value type. String content is owned (copied) because an
-// indefinite-length string's chunks are not contiguous in the input.
+// String content is owned (copied) because an indefinite-length string's chunks
+// are not contiguous in the input.
 //
-// Also offers an nlohmann::json-style interface (is_*(), operator[], get<T>(),
-// iteration, brace-init). It never throws: a miss or type mismatch yields a
-// sentinel or Expected, keeping it -fno-exceptions and consteval safe.
-// The brace-init constructor makes CborValue a non-aggregate, so
-// CborValue{.data = ...} no longer compiles; .data itself remains public.
+// Never throws: a miss or type mismatch yields a sentinel or Expected, so it is
+// -fno-exceptions and consteval safe. The brace-init constructor makes CborValue
+// a non-aggregate, so CborValue{.data = ...} does not compile; .data stays public.
 struct CborValue {
   enum class StringKind { Bytes, Text };
   struct OwnedString {
@@ -533,9 +497,8 @@ struct CborValue {
     std::vector<CborValue> value;  // always exactly one element
     friend constexpr bool operator==(const Tag&, const Tag&) = default;
   };
-  // Tags 2 and 3 (bignums, RFC 8949 Section 3.4.3) are recognized rather than
-  // left as an opaque Tag, since they are how CBOR represents integers beyond
-  // 64 bits. value == magnitude (tag 2) or -1 - magnitude (tag 3).
+  // Tags 2 and 3 (RFC 8949 Section 3.4.3) decode to BigNum instead of a Tag.
+  // value == magnitude (tag 2) or -1 - magnitude (tag 3).
   struct BigNum {
     bool negative;
     std::vector<std::uint8_t> magnitude;  // big-endian
@@ -549,15 +512,15 @@ struct CborValue {
 
   std::variant<std::monostate,              // Undefined
                std::nullptr_t,               // Null
-               bool,                         // False/True
-               std::uint64_t,                // UnsignedInt
-               NegativeInt,                  // NegativeInt
-               OwnedString,                  // ByteString or TextString
+               bool,
+               std::uint64_t,
+               NegativeInt,
+               OwnedString,
                BigNum,                       // Tag 2/3: integer magnitude beyond 64 bits
-               SimpleValue,                  // Unassigned/extended simple value
-               double,                       // Float
-               std::vector<CborValue>,       // Array
-               std::vector<std::pair<CborValue, CborValue>>,  // Map
+               SimpleValue,
+               double,
+               std::vector<CborValue>,
+               std::vector<std::pair<CborValue, CborValue>>,
                Tag>
       data;
 
@@ -645,7 +608,6 @@ struct CborValue {
   }
 
   constexpr CborValue(std::initializer_list<CborValue> init, bool type_deduction = true)
-      // Delegate so `data` is constructed directly.
       : CborValue(build_array_or_map(init, type_deduction)) {}  // NOLINT(google-explicit-constructor)
 
   // Forces array interpretation: covers `{}` and arrays of 2-element sub-arrays
@@ -885,7 +847,6 @@ constexpr CborValue& CborValue::operator[](const CborValue& key) {
   return entries.back().second;
 }
 
-// ---------------------------------------------------------------------------
 // to_cbor/from_cbor ADL hooks, as in nlohmann's adl_serializer.
 // Specializing CborSerializer<T> directly covers types that cannot take a free
 // function (third-party and std types).
@@ -918,8 +879,6 @@ constexpr bool call_from_cbor(const CborValue& in, T& value) {
 template <typename T>
 concept HasCborFields = requires { cbor_fields<T>(); };
 
-// Pulls the member's value type out of a `Member T::*` pointer type, so
-// cbor_fields_from_cbor knows what to .get<>() for each field.
 template <typename M>
 struct member_pointer_value_type;
 template <typename C, typename M>
@@ -1016,24 +975,19 @@ struct CborSerializer {
   }
 };
 
-// Forward declarations so the duplicate-key policies below can declare
-// NoAlloc-shaped on_duplicate overloads, letting one policy type serve both
-// decoders. NodePool is a non-owning view over caller-supplied storage.
+// Forward declarations so the duplicate-key policies can declare NoAlloc overloads.
 namespace NoAlloc {
 struct NodePool;
 struct Node;
 }  // namespace NoAlloc
 
-// ---------------------------------------------------------------------------
-// Duplicate map keys: RFC 8949 Section 5.3.1 leaves handling
-// implementation-defined and the surveyed libraries (QCBOR, tinycbor, zcbor,
-// libcbor, NanoCBOR) disagree, so it is a policy type like the UTF-8 one.
+// Duplicate map keys are handled by a policy type, since RFC 8949 Section 5.3.1
+// leaves this implementation-defined.
 //
 // The trait pins the std::vector overload with a static_cast, because
 // &P::on_duplicate is ambiguous once the NoAlloc overload exists. The cast is a
 // hard error for a mis-shaped P, so it sits in a void_t partial specialization
-// (a SFINAE context) to make the trait false instead of aborting compilation
-// before the static_assert can fire.
+// to make the trait false instead.
 template <typename P, typename = void>
 struct is_duplicate_key_policy : std::false_type {};
 
@@ -1067,14 +1021,14 @@ struct RejectDuplicateKeys {
 };
 struct KeepFirstDuplicateKey {
   static constexpr bool on_duplicate(std::vector<std::pair<CborValue, CborValue>>&, CborValue, CborValue) {
-    return true;  // first occurrence already in entries; drop this one
+    return true;
   }
   static constexpr bool on_duplicate(NoAlloc::NodePool&, NoAlloc::Node** /*first_pair*/,
                                       std::size_t /*existing_pair_index*/, NoAlloc::Node* /*new_key*/,
                                       NoAlloc::Node* /*new_value*/) {
-    return true;  // first occurrence's pair is left exactly where it is; drop this one
+    return true;
   }
-  static constexpr bool on_duplicate() { return true; }  // SAX: drop the new pair's events, emit nothing for it
+  static constexpr bool on_duplicate() { return true; }
 };
 struct KeepLastDuplicateKey {
   static constexpr bool on_duplicate(std::vector<std::pair<CborValue, CborValue>>& entries, CborValue key,
@@ -1114,7 +1068,6 @@ struct NoDuplicateKeyCheck {
   static constexpr bool on_duplicate() { return true; }
 };
 
-// SAX counterpart of is_duplicate_key_policy_v, pinning the 0-arg overload.
 template <typename P, typename = void>
 struct is_sax_duplicate_key_policy : std::false_type {};
 
@@ -1125,10 +1078,8 @@ struct is_sax_duplicate_key_policy<P, std::void_t<decltype(static_cast<bool (*)(
 template <typename P>
 inline constexpr bool is_sax_duplicate_key_policy_v = is_sax_duplicate_key_policy<P>::value;
 
-
 namespace detail {
 
-// ---------------------------------------------------------------------------
 // The one structural walk behind every tree-shaped decode and skip. It owns
 // everything about well-formedness: headers, definite and indefinite forms,
 // chunk checking, depth, truncation, and error offsets. What it produces is
@@ -1276,7 +1227,6 @@ constexpr Expected<std::pair<typename Builder::Value, std::size_t>, Error> walk(
   }
 }
 
-// Builder that builds nothing, for skip_item.
 struct SkipBuilder {
   struct Value {};
   static constexpr Value make_uint(std::uint64_t) { return {}; }
@@ -1298,7 +1248,6 @@ struct SkipBuilder {
   };
 };
 
-// Builder producing CborValue trees. Duplicate keys are resolved by KeyPolicy.
 template <typename KeyPolicy>
 struct HeapBuilder {
   static_assert(is_duplicate_key_policy_v<KeyPolicy>,
@@ -1379,18 +1328,14 @@ constexpr Expected<std::size_t, Error> skip_item(std::span<const std::uint8_t> b
   return result->second;
 }
 
-// The recursive decoder behind every major type. MaxDepth caps container nesting,
-// the most common hazard across surveyed CBOR implementations (QCBOR, tinycbor,
-// several CVEs). Exceeding it is an error, not a crash.
+// MaxDepth caps container nesting; exceeding it is an error, not a crash.
 template <std::size_t MaxDepth = 32, typename Utf8Policy = NoUtf8Validation, typename KeyPolicy = RejectDuplicateKeys>
 constexpr Expected<std::pair<CborValue, std::size_t>, Error> decode_value(std::span<const std::uint8_t> bytes,
                                                                            std::size_t depth = 0) {
   return detail::walk<MaxDepth, Utf8Policy, detail::HeapBuilder<KeyPolicy>>(bytes, depth);
 }
 
-// ---------------------------------------------------------------------------
-// Encoding. Always emits the shortest (preferred) form, so output can be compared
-// byte for byte against RFC 8949 Appendix A.
+// Always emits the shortest (preferred) form.
 
 constexpr void append_header(std::vector<std::uint8_t>& out, std::uint8_t major_type, std::uint64_t value) {
   const std::uint8_t mt = static_cast<std::uint8_t>(major_type << 5);
@@ -1459,7 +1404,7 @@ constexpr bool bit_identical_double(double a, double b) {
 constexpr std::optional<std::uint16_t> try_encode_half_float(double value) {
   std::uint16_t candidate;
   if (is_nan(value)) {
-    candidate = 0x7e00;  // canonical NaN
+    candidate = 0x7e00;
   } else {
     const std::uint64_t bits64 = std::bit_cast<std::uint64_t>(value);
     // uint64_t so `sign << 15` is not promoted to signed int.
@@ -1498,7 +1443,7 @@ constexpr std::optional<std::uint16_t> try_encode_half_float(double value) {
 
 constexpr std::optional<std::uint32_t> try_encode_single_float(double value) {
   if (is_nan(value)) {
-    return std::uint32_t{0x7fc00000};  // canonical single NaN
+    return std::uint32_t{0x7fc00000};
   }
   const float as_float = static_cast<float>(value);
   if (!bit_identical_double(static_cast<double>(as_float), value)) {
@@ -1530,9 +1475,9 @@ constexpr std::vector<std::uint8_t> encode_value(const CborValue& value) {
       [](const auto& v) -> std::vector<std::uint8_t> {
         using T = std::decay_t<decltype(v)>;
         if constexpr (std::is_same_v<T, std::monostate>) {
-          return {0xf7};  // undefined
+          return {0xf7};
         } else if constexpr (std::is_same_v<T, std::nullptr_t>) {
-          return {0xf6};  // null
+          return {0xf6};
         } else if constexpr (std::is_same_v<T, bool>) {
           return {v ? std::uint8_t{0xf5} : std::uint8_t{0xf4}};
         } else if constexpr (std::is_same_v<T, std::uint64_t>) {

@@ -1,8 +1,5 @@
-// Fair code-size comparison: decodes AND fully walks the same payload
-// every other size_*.c/cpp in this directory decodes and walks (see
-// README.md's "a fairer size comparison" section) -- not just "parse
-// the first item," which undersells libraries that lazily walk on
-// demand versus this one's eager, single-call decode_value.
+// Decodes and fully walks the same payload as the other size_* programs, so the
+// size comparison is fair to libraries that walk lazily (README.md).
 #include "../payloads.h"
 #include "constexpr_cbor.hpp"
 

@@ -4,9 +4,7 @@
 using namespace ConstexprCbor;
 using namespace CompileTimeUnitTesting;
 
-// A plain aggregate struct with no hand-written to_cbor/from_cbor at all --
-// cbor_fields<Vec2>() is the only thing CborSerializer<Vec2>'s default body
-// finds, and it's enough to build a working to_cbor/from_cbor pair.
+// Plain aggregate with no to_cbor/from_cbor: cbor_fields<Vec2>() alone is enough.
 namespace user_ns {
 struct Vec2 {
   int x;
@@ -30,9 +28,7 @@ constexpr bool cbor_fields_round_trip() {
   return back.has_value() && *back == original;
 }
 
-// A struct whose own field is itself a cbor_fields-reflected type -- proves
-// the generic implementation recurses through the same dispatch chain
-// rather than only handling built-in field types.
+// A cbor_fields type nested inside another: the generic path recurses.
 namespace user_ns {
 struct Segment {
   Vec2 from;
@@ -55,9 +51,8 @@ constexpr bool cbor_fields_nested_round_trip() {
   return back.has_value() && *back == original;
 }
 
-// A type with BOTH an ADL to_cbor/from_cbor pair and a cbor_fields<T>()
-// specialization -- the ADL hook must win (checked by the ADL encoding
-// producing an observably different shape: a bare int, not a map).
+// A type with both ADL hooks and cbor_fields<T>(): the ADL hook wins (a bare int,
+// not a map).
 namespace user_ns {
 struct Dual {
   int value;

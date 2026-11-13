@@ -35,8 +35,6 @@ consteval bool test_decode_text_string_rejects_wrong_major_type() {
 }
 static_assert(test_decode_text_string_rejects_wrong_major_type());
 
-// The three UTF-8 policies, against the same three adversarial inputs, so
-// they actually diverge visibly rather than just satisfying the trait.
 consteval bool test_utf8_policies_diverge_on_overlong_encoding() {
   using namespace CompileTimeUnitTesting;
   // RFC 8949's own example of well-formed-but-invalid CBOR: an overlong
@@ -61,10 +59,8 @@ static_assert(test_utf8_policies_diverge_on_lone_continuation_byte());
 
 consteval bool test_utf8_policies_diverge_on_surrogate_half() {
   using namespace CompileTimeUnitTesting;
-  // U+D800 encoded directly as 3-byte UTF-8 (0xed 0xa0 0x80): structurally
-  // well-formed (right continuation-byte shape), so Rough accepts it;
-  // Complete must reject it (surrogate halves are never valid UTF-8 per
-  // RFC 3629).
+  // U+D800 as 3-byte UTF-8 (0xed 0xa0 0x80): well-formed shape, so Rough accepts
+  // it; Complete rejects surrogate halves.
   constexpr std::uint8_t vec_surrogate[] = {0x63, 0xed, 0xa0, 0x80};
   expect_eq<decode_text_string<NoUtf8Validation>(vec_surrogate).has_value(), true>();
   expect_eq<decode_text_string<RoughUtf8Validation>(vec_surrogate).has_value(), true>();
@@ -75,8 +71,6 @@ static_assert(test_utf8_policies_diverge_on_surrogate_half());
 
 consteval bool test_utf8_policies_accept_the_official_vectors() {
   using namespace CompileTimeUnitTesting;
-  // Every official vector above is genuinely valid UTF-8; all three
-  // policies must accept all of them.
   constexpr std::uint8_t vec_u_umlaut[] = {0x62, 0xc3, 0xbc};
   constexpr std::uint8_t vec_supplementary[] = {0x64, 0xf0, 0x90, 0x85, 0x91};
   expect_eq<decode_text_string<RoughUtf8Validation>(vec_u_umlaut).has_value(), true>();
@@ -87,11 +81,8 @@ consteval bool test_utf8_policies_accept_the_official_vectors() {
 }
 static_assert(test_utf8_policies_accept_the_official_vectors());
 
-// AsciiOnlyValidation is a different thing than the three UTF-8 policies
-// above, not a fourth strictness level of the same thing: ASCII is a
-// subset of UTF-8, so every one of the other policies accepts "IETF", but
-// a perfectly valid, non-overlong 2-byte UTF-8 sequence ("ü") that
-// CompleteUtf8Validation accepts still fails this one.
+// AsciiOnlyValidation is not a fourth UTF-8 strictness level: "ü" passes
+// CompleteUtf8Validation but fails it.
 consteval bool test_ascii_only_policy_rejects_valid_non_ascii_utf8() {
   using namespace CompileTimeUnitTesting;
   constexpr std::uint8_t vec_ietf[] = {0x64, 0x49, 0x45, 0x54, 0x46};
@@ -124,16 +115,9 @@ consteval bool test_textstring_roundtrips() {
 }
 static_assert(test_textstring_roundtrips());
 
-// From cbor-wg/cbor-test-vectors (tests/rfc8949/good.edn): two Unicode
-// edge cases beyond RFC 8949's own umlaut/water/supplementary-plane
-// examples. "string: BOM" embeds a byte-order mark (U+FEFF) as ordinary
-// payload content, not a stream prefix -- a decoder that special-cases
-// BOM detection anywhere would mishandle this. "string: combining" is "u"
-// (U+0075) followed by a combining diaeresis (U+0308), which renders
-// identically to the precomposed "ü" this file already tests but is
-// a completely different byte sequence -- canonical-equivalence is a
-// semantic question this library deliberately doesn't resolve (bytes are
-// bytes), which this test documents rather than silently assumes.
+// From cbor-wg/cbor-test-vectors: a BOM (U+FEFF) inside a string is ordinary
+// content, and "u" + combining diaeresis (U+0308) is not canonicalized to "ü"
+// (bytes are bytes).
 consteval bool test_decode_text_string_matches_cbor_test_vectors_unicode_cases() {
   using namespace CompileTimeUnitTesting;
   constexpr std::uint8_t vec_bom[] = {0x66, 0xef, 0xbb, 0xbf, 0x42, 0x4f, 0x4d};

@@ -1,9 +1,6 @@
-// Built with -fno-exceptions -fno-rtti (see docker/esp32.Dockerfile,
-// docker/stm32.Dockerfile, docker/riscv32.Dockerfile): proves the decoder
-// and encoder surface compiles without exceptions or RTTI at all, which
-// several embedded toolchains (ESP-IDF's default, for example) require.
-// Standalone: no compile_time_ut dependency, since the bare-metal images
-// only copy include/, not a fetched sibling library.
+// Built with -fno-exceptions -fno-rtti (docker esp32, stm32 and riscv32 images) to
+// prove the decoder and encoder surface needs neither. Standalone: those images
+// copy only include/.
 #include "constexpr_cbor.hpp"
 #include "constexpr_cbor_sax.hpp"
 

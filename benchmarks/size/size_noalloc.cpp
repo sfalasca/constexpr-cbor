@@ -1,4 +1,3 @@
-// See size_cc.cpp's comment -- same fairness fix, NoAlloc mode.
 #include "constexpr_cbor_noalloc.hpp"
 
 namespace {

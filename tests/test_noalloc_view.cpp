@@ -7,16 +7,13 @@ using namespace ConstexprCbor;
 using namespace ConstexprCbor::NoAlloc;
 using namespace CompileTimeUnitTesting;
 
-// NoAllocView is a genuine std::ranges::forward_range too, the same bar
-// CborValue and SaxRange are held to -- NoAllocView::const_iterator/
-// ItemsProxy::iterator are copyable value types with no shared external
-// cursor, so two copies can advance independently.
+// NoAllocView is a forward_range: its iterators are copyable values with no
+// shared cursor.
 static_assert(std::ranges::forward_range<NoAllocView>);
 static_assert(std::ranges::forward_range<NoAllocView::ItemsProxy>);
 
-// Decode the same bytes via both the heap decoder and NoAlloc::decode_view,
-// prove every predicate/operator[]/.get<T>()/iteration result agrees
-// between the resulting CborValue and the resulting NoAllocView.
+// Decode the same bytes with the heap decoder and decode_view; every predicate,
+// operator[], get<T>() and iteration result must agree.
 constexpr std::uint8_t kBytes[] = {
     0xa2,                                // map(2)
     0x61, 0x61, 0x01,                    //   "a": 1
@@ -77,8 +74,7 @@ constexpr bool miss_returns_undefined_sentinel() {
 }
 
 constexpr bool tags_and_bignums_agree() {
-  // tag(1)(1363896240) -> 0xc1 1a 51 4b 67 b0; both views should report
-  // is_tag() and the same nested scalar.
+  // tag(1)(1363896240): both report is_tag() and the same nested scalar.
   constexpr std::uint8_t tagged[] = {0xc1, 0x1a, 0x51, 0x4b, 0x67, 0xb0};
   const auto heap = decode_value(tagged);
   NoAllocStorage<32, 32, 48> storage;

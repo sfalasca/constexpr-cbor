@@ -5,13 +5,8 @@ using namespace ConstexprCbor;
 using namespace ConstexprCbor::NoAlloc;
 using namespace CompileTimeUnitTesting;
 
-// Every check goes through compile_time_ut's expect_true<>()/expect_eq<>() NTTP
-// forms, which need operands formed fresh as constant expressions. The NodePool
-// is passed by non-const reference, so it cannot be a constexpr input, but an
-// automatic variable is fine inside a constant expression if its lifetime begins
-// within that same evaluation. So each helper is a constexpr function that
-// declares and consumes its own NoAllocStorage/NodePool, making the call
-// `some_helper(vec) == expected` one self-contained expression.
+// The pool is passed by non-const reference, so each helper is a constexpr
+// function that declares and consumes its own NoAllocStorage/NodePool.
 
 constexpr bool noalloc_decode_ok(std::span<const std::uint8_t> bytes) {
   NoAllocStorage<32, 32, 48> storage;
@@ -43,8 +38,6 @@ constexpr std::uint64_t noalloc_array_child_u64(std::span<const std::uint8_t> by
   return std::get<std::uint64_t>(pool.child(arr, i).data);
 }
 
-// RFC 8949 Appendix A: [1, 2, 3] -> 0x83010203, the same vector test_array.cpp
-// uses for the heap decoder.
 consteval bool test_decode_flat_array_matches_official_vector() {
   constexpr std::uint8_t vec[] = {0x83, 0x01, 0x02, 0x03};
   expect_true<noalloc_decode_ok(vec)>();
@@ -56,9 +49,7 @@ consteval bool test_decode_flat_array_matches_official_vector() {
 }
 static_assert(test_decode_flat_array_matches_official_vector());
 
-// RFC 8949 Appendix A: [_ 1, 2, 3] -> 0x9f010203ff. Exercises the count-then-
-// reserve pre-pass (count_indefinite_array_items), needed because a fixed pool
-// cannot grow one slot at a time.
+// Exercises the count-then-reserve pre-pass for indefinite arrays.
 consteval bool test_decode_indefinite_array_matches_official_vector() {
   constexpr std::uint8_t vec[] = {0x9f, 0x01, 0x02, 0x03, 0xff};
   expect_eq<noalloc_bytes_consumed(vec), std::size_t{5}>();
@@ -79,8 +70,6 @@ constexpr std::uint64_t noalloc_nested_array_child_u64(std::span<const std::uint
   return std::get<std::uint64_t>(pool.child(inner, inner_i).data);
 }
 
-// [1, [2, 3]] (not a verbatim Appendix A row): a child that is itself a composite
-// resolves correctly through the reference slots.
 consteval bool test_decode_array_handles_nesting() {
   constexpr std::uint8_t vec[] = {0x82, 0x01, 0x82, 0x02, 0x03};
   expect_eq<noalloc_bytes_consumed(vec), std::size_t{5}>();
@@ -121,7 +110,6 @@ constexpr std::uint64_t noalloc_map_value_u64(std::span<const std::uint8_t> byte
   return std::get<std::uint64_t>(pool.map_value(m, i).data);
 }
 
-// RFC 8949 Appendix A: {1: 2, 3: 4} -> 0xa201020304.
 consteval bool test_decode_map_matches_official_vector() {
   constexpr std::uint8_t vec[] = {0xa2, 0x01, 0x02, 0x03, 0x04};
   expect_eq<noalloc_bytes_consumed(vec), std::size_t{5}>();
@@ -134,8 +122,6 @@ consteval bool test_decode_map_matches_official_vector() {
 }
 static_assert(test_decode_map_matches_official_vector());
 
-// Indefinite-length map: the same pre-count as the indefinite array, over pairs
-// (count_indefinite_map_pairs).
 consteval bool test_decode_indefinite_map() {
   constexpr std::uint8_t vec[] = {0xbf, 0x01, 0x02, 0x03, 0x04, 0xff};
   expect_eq<noalloc_bytes_consumed(vec), std::size_t{6}>();
@@ -170,8 +156,6 @@ constexpr std::uint8_t noalloc_string_byte_at(std::span<const std::uint8_t> byte
   return pool.bytes_of(s)[i];
 }
 
-// RFC 8949 Appendix A: (_ h'0102', h'030405') -> 0x5f42010243030405ff. Chunks land
-// contiguously in byte storage via repeated allocate_bytes calls.
 consteval bool test_decode_indefinite_byte_string() {
   constexpr std::uint8_t vec[] = {0x5f, 0x42, 0x01, 0x02, 0x43, 0x03, 0x04, 0x05, 0xff};
   expect_eq<noalloc_bytes_consumed(vec), std::size_t{9}>();
@@ -199,9 +183,6 @@ constexpr bool noalloc_string_is_text_kind_with_policy(std::span<const std::uint
   return std::get<StringRef>(result->node->data).kind == CborValue::StringKind::Text;
 }
 
-// RFC 8949 Appendix A: "IETF" -> 0x6449455446, with the CompleteUtf8Validation
-// policy from test_textstring.cpp, showing the policy threads through
-// NoAlloc::decode_value.
 consteval bool test_decode_text_string_with_utf8_policy() {
   constexpr std::uint8_t vec[] = {0x64, 0x49, 0x45, 0x54, 0x46};
   expect_true<noalloc_string_is_text_kind_with_policy(vec)>();
@@ -235,8 +216,6 @@ constexpr std::uint8_t noalloc_bignum_byte_at(std::span<const std::uint8_t> byte
   return pool.bytes_of(b)[i];
 }
 
-// RFC 8949 Appendix A: 2(h'010203') -> 0xc243010203 (positive bignum). Tags 2/3
-// are recognized as in the heap decoder, producing a BigNumRef.
 consteval bool test_decode_bignum_tag() {
   constexpr std::uint8_t vec[] = {0xc2, 0x43, 0x01, 0x02, 0x03};
   expect_eq<noalloc_bytes_consumed(vec), std::size_t{5}>();
@@ -275,8 +254,7 @@ constexpr std::uint8_t noalloc_tag_child_first_byte(std::span<const std::uint8_t
   return pool.bytes_of(s)[0];
 }
 
-// RFC 8949 Appendix A: 32("http://www.example.com") shape (shortened). An ordinary
-// tag, not a bignum, whose child pointer is direct (not indirected).
+// Ordinary tag, not a bignum.
 consteval bool test_decode_plain_tag() {
   constexpr std::uint8_t vec[] = {0xd8, 0x20, 0x61, 0x61};  // tag 32, "a"
   expect_eq<noalloc_bytes_consumed(vec), std::size_t{4}>();
@@ -295,7 +273,6 @@ constexpr double noalloc_float_value(std::span<const std::uint8_t> bytes) {
   return std::get<double>(result->node->data);
 }
 
-// RFC 8949 Appendix A: 1.5 -> 0xf93e00 (half-precision float).
 consteval bool test_decode_float() {
   constexpr std::uint8_t vec[] = {0xf9, 0x3e, 0x00};
   expect_eq<noalloc_float_value(vec), 1.5>();
@@ -332,7 +309,6 @@ constexpr bool noalloc_decodes_as_undefined() {
   return result && std::holds_alternative<std::monostate>(result->node->data);
 }
 
-// RFC 8949 Appendix A: true/false/null/undefined.
 consteval bool test_decode_simples() {
   expect_true<noalloc_decodes_as_true()>();
   expect_true<noalloc_decodes_as_false()>();
@@ -349,9 +325,7 @@ consteval bool test_decode_refuses_truncated_array() {
 }
 static_assert(test_decode_refuses_truncated_array());
 
-// Running out of node capacity is an error, not UB: a 3-element array needs the
-// array node plus 3 element nodes (4 total; reference slots are separate), which
-// does not fit a 2-node pool.
+// A 3-element array needs 4 nodes (array + 3 elements); a 2-node pool fails.
 constexpr bool noalloc_decode_ok_tiny_node_pool(std::span<const std::uint8_t> bytes) {
   NoAllocStorage<2, 8, 32> storage;
   auto pool = storage.make_pool();
@@ -365,9 +339,7 @@ consteval bool test_decode_refuses_when_node_pool_exhausted() {
 }
 static_assert(test_decode_refuses_when_node_pool_exhausted());
 
-// Reference-slot exhaustion in isolation: node and byte budgets are ample but
-// only 2 slots exist, so a 3-element array (3 contiguous Node* slots) is
-// refused.
+// Only 2 reference slots, but a 3-element array needs 3.
 constexpr bool noalloc_decode_ok_tiny_ref_pool(std::span<const std::uint8_t> bytes) {
   NoAllocStorage<32, 2, 32> storage;
   auto pool = storage.make_pool();
@@ -381,7 +353,6 @@ consteval bool test_decode_refuses_when_ref_pool_exhausted() {
 }
 static_assert(test_decode_refuses_when_ref_pool_exhausted());
 
-// Same idea for the byte noalloc: a 3-byte string doesn't fit a 2-byte pool.
 constexpr bool noalloc_decode_ok_tiny_byte_pool(std::span<const std::uint8_t> bytes) {
   NoAllocStorage<16, 16, 2> storage;
   auto pool = storage.make_pool();
@@ -402,8 +373,7 @@ constexpr bool noalloc_decode_ok_with_depth(std::span<const std::uint8_t> bytes)
   return decode_value<MaxDepth>(pool, bytes).has_value();
 }
 
-// MaxDepth is caller-tunable here exactly as it is for the heap-based
-// decoder: [[[1]]] is 3 levels deep, refused at MaxDepth=2.
+// [[[1]]] is 3 levels deep, refused at MaxDepth=2.
 consteval bool test_decode_respects_max_depth() {
   constexpr std::uint8_t vec[] = {0x81, 0x81, 0x81, 0x01};  // [[[1]]]
   expect_false<noalloc_decode_ok_with_depth<2>(vec)>();
@@ -411,14 +381,6 @@ consteval bool test_decode_respects_max_depth() {
   return true;
 }
 static_assert(test_decode_respects_max_depth());
-
-// --- Encoding: scalar facts via expect_eq<>()'s NTTP form (self-contained
-// helper calls, same technique as decoding above); buffer *content* via
-// expect_eq(array, array)'s ordinary function-argument form instead --
-// that overload was never subject to the NTTP restriction in the first
-// place (it takes its operands as plain arguments, not template
-// arguments), so a helper returning a std::array by value is usable
-// directly, no extra trick needed.
 
 constexpr std::size_t noalloc_encode_written(std::span<const std::uint8_t> bytes) {
   NoAllocStorage<32, 32, 48> storage;
@@ -471,11 +433,8 @@ consteval bool test_encode_roundtrips_bignum_and_tag() {
 }
 static_assert(test_encode_roundtrips_bignum_and_tag());
 
-// An indefinite-length input decodes to the same logical value as its
-// definite-length equivalent, but NoAlloc::encode_value -- like the
-// heap-based encoder -- always emits the canonical definite-length form,
-// so this does NOT round-trip byte-for-byte; it must re-encode to the
-// shorter, canonical bytes instead.
+// An indefinite-length input re-encodes to the shorter definite form, so it does
+// not round-trip byte for byte.
 consteval bool test_indefinite_array_encodes_as_canonical_definite() {
   constexpr std::uint8_t indefinite_vec[] = {0x9f, 0x01, 0x02, 0x03, 0xff};
   constexpr std::array<std::uint8_t, 4> canonical_vec{0x83, 0x01, 0x02, 0x03};
@@ -485,8 +444,6 @@ consteval bool test_indefinite_array_encodes_as_canonical_definite() {
 }
 static_assert(test_indefinite_array_encodes_as_canonical_definite());
 
-// A buffer too small to hold the encoded output is a refusal, not a
-// truncated or out-of-bounds write.
 constexpr bool noalloc_encode_fits_in_3_bytes(std::span<const std::uint8_t> bytes) {
   NoAllocStorage<32, 32, 48> storage;
   auto pool = storage.make_pool();
@@ -503,15 +460,7 @@ consteval bool test_encode_refuses_when_output_buffer_too_small() {
 }
 static_assert(test_encode_refuses_when_output_buffer_too_small());
 
-// --- Duplicate-key policy: RejectDuplicateKeys/KeepFirstDuplicateKey/
-// KeepLastDuplicateKey are the exact same types usable with
-// ConstexprCbor::decode_value (see constexpr_cbor.hpp), not a parallel
-// NoAlloc-only copy of each -- each one's NoAlloc-shaped on_duplicate overload
-// works over pointers into the pool instead of a std::vector<pair<...>>,
-// since an noalloc map has no flat, directly-comparable entries container to
-// search or mutate.
-
-// {1: 2, 1: 3} -> 0xa2 0102 0103 (two entries, same key 1, values 2 then 3).
+// {1: 2, 1: 3}
 constexpr std::uint8_t duplicate_key_vec[] = {0xa2, 0x01, 0x02, 0x01, 0x03};
 
 template <typename KeyPolicy>
@@ -543,9 +492,6 @@ consteval bool test_keep_last_duplicate_key_keeps_last_value() {
 }
 static_assert(test_keep_last_duplicate_key_keeps_last_value());
 
-// A map with no actual duplicates decodes identically regardless of which
-// policy is selected -- the policy only changes behavior when it actually
-// matters.
 consteval bool test_no_duplicates_same_result_under_every_policy() {
   constexpr std::uint8_t vec[] = {0xa2, 0x01, 0x02, 0x03, 0x04};
   expect_eq<noalloc_map_count<RejectDuplicateKeys>(vec), std::size_t{2}>();
@@ -573,9 +519,7 @@ constexpr std::size_t noalloc_structural_dup_count(std::span<const std::uint8_t>
   return std::get<MapRef>(result->node->data).count;
 }
 
-// Structural (non-scalar) duplicate key: {[1,2]: "a", [1,2]: "b"} under
-// KeepLastDuplicateKey -- proves node_equal's recursive comparison runs
-// for composite keys too, not just scalar ==.
+// Composite duplicate key {[1,2]: "a", [1,2]: "b"}: node_equal recurses.
 consteval bool test_structural_key_duplicate_detection() {
   // [1,2] -> 0x820102 (3 bytes); the map wraps two (key, value) pairs.
   constexpr std::uint8_t vec[] = {0xa2, 0x82, 0x01, 0x02, 0x61, 0x61, 0x82, 0x01, 0x02, 0x61, 0x62};
@@ -585,15 +529,8 @@ consteval bool test_structural_key_duplicate_detection() {
 }
 static_assert(test_structural_key_duplicate_detection());
 
-// --- Overflow-then-undersized-buffer guard: a CBOR length field can claim
-// up to 2^64-1 items, but the reference-slot array indexes with
-// std::size_t (which can be narrower, e.g. 32 bits on common embedded
-// targets). NoAlloc::decode_value reserves reference slots for a whole
-// array/map's children *before* decoding any of them, so a silently-
-// truncating uint64_t->size_t cast there would be the libcbor PR #387
-// shape of bug: a huge count wraps to a small one, the reservation
-// "succeeds" against that undersized number, and the loop -- which still
-// iterates the real, untruncated count -- writes past it.
+// A count of 2^64-1 must be refused, not truncated into an undersized
+// reservation (libcbor PR #387).
 
 // Array claiming 2^64-1 elements (major type 4, additional info 27).
 constexpr std::uint8_t huge_array_count_vec[] = {0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
@@ -604,8 +541,7 @@ consteval bool test_huge_array_count_is_refused_not_truncated() {
 }
 static_assert(test_huge_array_count_is_refused_not_truncated());
 
-// Map claiming 2^64-1 pairs (major type 5, additional info 27) -- also
-// exercises the *2 (key+value slots per pair) overflow check specifically.
+// Map claiming 2^64-1 pairs; exercises the *2 overflow check.
 constexpr std::uint8_t huge_map_count_vec[] = {0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 consteval bool test_huge_map_count_is_refused_not_truncated() {
@@ -614,9 +550,7 @@ consteval bool test_huge_map_count_is_refused_not_truncated() {
 }
 static_assert(test_huge_map_count_is_refused_not_truncated());
 
-// Proves Error.offset telescopes to an absolute position here too, the
-// same as the heap decoder's own equivalent test (test_array.cpp):
-// [1, <truncated uint>] with the truncated element starting at byte 2.
+// Error.offset is absolute: [1, <truncated uint>] fails at byte 2.
 constexpr ErrorReason noalloc_decode_error_reason(std::span<const std::uint8_t> bytes) {
   NoAllocStorage<32, 32, 48> storage;
   auto pool = storage.make_pool();

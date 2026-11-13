@@ -63,7 +63,6 @@ consteval bool test_decode_uint_ignores_trailing_bytes() {
 }
 static_assert(test_decode_uint_ignores_trailing_bytes());
 
-// Encoder: must always emit the shortest form.
 consteval bool test_encode_uint_matches_official_vectors() {
   using namespace CompileTimeUnitTesting;
   constexpr std::array<std::uint8_t, 1> expected_23{0x17};
@@ -76,7 +75,6 @@ consteval bool test_encode_uint_matches_official_vectors() {
 }
 static_assert(test_encode_uint_matches_official_vectors());
 
-// Full decode -> encode round-trip for every vector above.
 consteval bool test_uint_roundtrips() {
   constexpr std::uint8_t vec_1000000[] = {0x1a, 0x00, 0x0f, 0x42, 0x40};
   constexpr std::uint8_t vec_max_u64[] = {0x1b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};

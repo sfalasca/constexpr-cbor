@@ -33,9 +33,7 @@ constexpr bool test_get_string_and_bytes() {
 }
 static_assert(test_get_string_and_bytes());
 
-// The NegativeInt-too-large-for-int64_t boundary: n == 2^64-1 means true
-// value -2^64, which doesn't fit std::int64_t (min -2^63) -- must refuse,
-// not silently truncate/wrap.
+// NegativeInt past int64_t's range (n == 2^64-1) must be refused, not truncated.
 constexpr bool test_get_int64_overflow_boundary() {
   const CborValue huge_negative(NegativeInt{.n = std::numeric_limits<std::uint64_t>::max()});
   if (huge_negative.get<std::int64_t>().has_value()) return false;

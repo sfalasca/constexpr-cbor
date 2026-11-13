@@ -4,8 +4,7 @@
 using namespace ConstexprCbor;
 using namespace CompileTimeUnitTesting;
 
-// A user struct with free to_cbor/from_cbor in its OWN namespace, found via
-// ADL with no `using` declaration anywhere -- the primary escape hatch.
+// Free to_cbor/from_cbor in the type's own namespace, found by ADL.
 namespace user_ns {
 struct Point {
   int x;
@@ -35,10 +34,8 @@ constexpr bool adl_round_trip() {
   return back.has_value() && *back == original;
 }
 
-// A type the user can't attach a free function to at all (modeled here as
-// a type the test deliberately doesn't control, inside an unrelated
-// "third_party" namespace with no to_cbor/from_cbor of its own) -- the
-// escape hatch is specializing CborSerializer<T> directly instead.
+// A type that cannot take a free function (in an unrelated namespace): specialize
+// CborSerializer<T> instead.
 namespace third_party {
 struct Opaque {
   int value;

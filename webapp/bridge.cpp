@@ -133,7 +133,6 @@ std::string map_key_to_json_string(const CborValue& key) {
   }
   std::string inline_json;
   to_json(key, inline_json, 0);
-  // Collapse to one line for use as a key string.
   std::string compact;
   compact.reserve(inline_json.size());
   bool in_string = false;

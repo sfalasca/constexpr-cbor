@@ -6,9 +6,8 @@
 using namespace ConstexprCbor;
 using namespace CompileTimeUnitTesting;
 
-// Brace-init round-trips through encode_value/decode_value to RFC 8949's
-// own canonical bytes, plus the array()/object() escape hatches that
-// bypass the array-vs-map heuristic.
+// Brace-init round-trips to RFC 8949's canonical bytes; array()/object() bypass
+// the heuristic.
 constexpr bool array_literal_matches_canonical_bytes() {
   constexpr std::uint8_t expected[] = {0x83, 0x01, 0x02, 0x03};  // [1,2,3]
   const CborValue v = {1, 2, 3};
@@ -17,7 +16,6 @@ constexpr bool array_literal_matches_canonical_bytes() {
 }
 
 constexpr bool map_literal_matches_canonical_bytes() {
-  // {1:2, 3:4} -> 0xa2 01 02 03 04 (RFC 8949 Appendix A).
   constexpr std::uint8_t expected[] = {0xa2, 0x01, 0x02, 0x03, 0x04};
   const CborValue v = {{1, 2}, {3, 4}};
   const auto encoded = encode_value(v);
@@ -32,9 +30,7 @@ constexpr bool object_with_non_string_key_round_trips() {
   return decoded->first[CborValue::array({1, 2})].get<std::string>() == "composite";
 }
 
-// CborValue::array({...}) must bypass the heuristic for an
-// array-of-2-element-sub-arrays case the plain heuristic would misread as
-// a map -- the single most important disambiguation property here.
+// array({...}) bypasses the heuristic for arrays of 2-element sub-arrays.
 constexpr bool forced_array_of_pairs_stays_an_array() {
   const CborValue plain_heuristic = {{1, 2}, {3, 4}};  // heuristic sees 2 pairs -> Map
   const CborValue forced = CborValue::array({CborValue::array({1, 2}), CborValue::array({3, 4})});
@@ -47,10 +43,8 @@ constexpr bool empty_array_and_object_distinguishable() {
   return empty_arr.is_array() && empty_arr.empty() && empty_obj.is_map() && empty_obj.empty();
 }
 
-// Mutating assignment: auto-promote Undefined -> Map/Array on first []
-// assignment, null-padding on array growth, overwrite-in-place (keep-last)
-// on repeated key assignment -- independent of whatever KeyPolicy a given
-// decode_value<...> call used (the builder isn't policy-templated).
+// Mutating assignment: auto-promote Undefined to Map/Array, null-pad array growth,
+// overwrite on repeated keys. Independent of any KeyPolicy.
 constexpr bool assignment_auto_promotes_and_grows() {
   CborValue built;
   built["x"] = std::uint64_t{42};

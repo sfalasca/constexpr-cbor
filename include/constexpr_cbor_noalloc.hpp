@@ -5,35 +5,20 @@
 
 #include "constexpr_cbor.hpp"
 
-// assert() is used deliberately: it never throws (so it works with
-// -fno-exceptions), NDEBUG strips it, and a failing assert() inside constant
-// evaluation makes the expression non-constant, which compilers report as an
-// ordinary error. It never fires on the legitimate decode path; it exists for
-// the misuse case NodePool::owns() documents.
+// assert() is used deliberately: it never throws, NDEBUG strips it, and a failing
+// assert() in constant evaluation is a compile error.
 #define NOALLOC_ASSERT(cond) assert(cond)
 
-// ---------------------------------------------------------------------------
-// No-malloc counterpart of constexpr_cbor.hpp, for environments without a heap.
-// CborValue relies on std::vector permitting an incomplete element type for its
-// recursive alternatives; std::array does not, so some indirection is
-// unavoidable. Here every decoded value is a Node in caller-supplied storage,
-// and a node refers to other nodes only by pointer.
+// No-malloc counterpart of constexpr_cbor.hpp. Every decoded value is a Node in
+// caller-supplied storage, and nodes refer to each other by pointer.
 //
 // The caller owns three buffers: a Node[] (scalar and composite nodes), a
-// Node*[] (reference slots; see ArrayRef/MapRef), and a byte[] (string and
-// bignum content). NodePool is a non-owning, trivially copyable view over them,
-// like std::span, so it can be copied freely while the storage stays an
-// ordinary object whose lifetime the caller controls.
+// Node*[] (reference slots, see ArrayRef/MapRef), and a byte[] (string and
+// bignum content). NodePool is a non-owning view over them.
 //
-// The caller must keep those buffers alive and in place for as long as any
-// decoded tree points into them. NodePool::owns() is a best-effort check for a
-// different mistake (a Node* that never belonged to this pool); no runtime
-// check can establish the lifetime precondition.
-//
-// This file includes constexpr_cbor.hpp and reuses its primitives and
-// duplicate-key policy types, so one policy type works with both
-// ConstexprCbor::decode_value and NoAlloc::decode_value. Everything here is a
-// template, so including only constexpr_cbor.hpp costs nothing.
+// The caller must keep those buffers alive and in place while any decoded tree
+// points into them. NodePool::owns() only catches a Node* that never belonged to
+// this pool.
 namespace ConstexprCbor::NoAlloc {
 
 struct StringRef {
@@ -75,13 +60,9 @@ struct Node {
   friend constexpr bool operator==(const Node&, const Node&) = default;
 };
 
-// Non-owning view over three caller-owned spans (see the top-of-file comment for
-// the ownership rules).
-//
-// node_storage holds every Node the decoded tree needs; ref_storage holds the
-// Node* slots that array/map children are indexed through (see ArrayRef/MapRef);
-// byte_storage backs string and bignum content. Running out of any of them is
-// an error, not a crash.
+// Non-owning view over caller-owned storage: node_storage for Nodes,
+// ref_storage for the Node* slots behind ArrayRef/MapRef, byte_storage for
+// string and bignum content. Running out of any of them is an error.
 struct NodePool {
   Node* nodes_ = nullptr;
   std::size_t node_capacity_ = 0;
@@ -162,10 +143,8 @@ struct NodePool {
   }
 };
 
-// Owning storage for a NodePool (NodePool is the view, this is the buffer).
-// MaxRefs is tunable independently of MaxNodes: every array/map child needs one
-// reference slot, so MaxRefs == MaxNodes is a safe default, but shallow,
-// mostly-scalar data can use far fewer.
+// Owning storage for a NodePool. MaxRefs is independent of MaxNodes; every
+// array/map child needs one slot, so MaxRefs == MaxNodes is a safe default.
 template <std::size_t MaxNodes, std::size_t MaxRefs, std::size_t MaxBytes>
 struct NoAllocStorage {
   std::array<Node, MaxNodes> nodes{};
@@ -175,9 +154,6 @@ struct NoAllocStorage {
   constexpr NodePool make_pool() { return NodePool(nodes, refs, bytes); }
 };
 
-// skip_item lives in constexpr_cbor.hpp (shared with the SAX decoder). This file
-// adds the pre-counting of indefinite-length containers, needed because the
-// reference slots must be reserved before any child is decoded.
 namespace detail {
 
 // Counts the items before the 0xff break in an indefinite-length array, without
@@ -214,13 +190,9 @@ constexpr Expected<std::uint64_t, Error> count_indefinite_map_pairs(std::span<co
   }
 }
 
-// A CBOR count is a uint64_t, but reference slots are indexed with size_t, which
-// is 32 bits on common embedded targets. decode_value reserves slots for all
-// items before decoding any, so a truncating cast would be the libcbor PR #387
-// bug: a huge count wraps small, the reservation succeeds, and the loop (which
-// still runs the real count) writes past it.
-// `multiplier` also guards the *2 the map case needs for key+value slots.
-// Returns nullopt instead of truncating.
+// Converts a CBOR count (uint64_t) to size_t, times `multiplier`, or nullopt on
+// overflow. A truncating cast would reserve too few slots for a loop that still
+// runs the full count (libcbor PR #387).
 constexpr Expected<std::size_t, Error> checked_node_count(std::uint64_t count, std::size_t multiplier = 1) {
   const std::uint64_t size_max = std::numeric_limits<std::size_t>::max();
   const std::uint64_t wide_multiplier = multiplier;
@@ -277,7 +249,7 @@ constexpr bool node_equal(const NodePool& pool, const Node* a_ptr, const Node* b
               } else if constexpr (std::is_same_v<TA, TagRef>) {
                 return va.number == vb.number && node_equal(pool, va.child, vb.child);
               } else {
-                return va == vb;  // uint64_t, NegativeInt, double, bool, nullptr_t, monostate, SimpleValue
+                return va == vb;
               }
             },
             b.data);
@@ -306,9 +278,8 @@ struct DecodedNode {
   std::size_t bytes_consumed;
 };
 
-// No-alloc counterpart of ConstexprCbor::decode_value: a pure function over an
-// immutable span that returns nullopt on any failure. Allocations come from the
-// caller-supplied `pool`, and running out of capacity is just another failure.
+// No-alloc counterpart of ConstexprCbor::decode_value. Returns nullopt on any
+// failure, including running out of pool capacity.
 template <std::size_t MaxDepth = 32, typename Utf8Policy = NoUtf8Validation, typename KeyPolicy = RejectDuplicateKeys>
 constexpr Expected<DecodedNode, Error> decode_value(NodePool& pool, std::span<const std::uint8_t> bytes,
                                                       std::size_t depth = 0) {
@@ -557,8 +528,6 @@ constexpr bool append_bytes_into(std::span<std::uint8_t> out, std::size_t& pos, 
   return true;
 }
 
-// Mirrors ConstexprCbor::encode_float, sharing its non-allocating half/single
-// candidate search (try_encode_half_float, try_encode_single_float).
 constexpr bool append_float_into(std::span<std::uint8_t> out, std::size_t& pos, double value) {
   if (const auto h = ConstexprCbor::detail::try_encode_half_float(value)) {
     if (out.size() < pos + 3) return false;
@@ -664,7 +633,7 @@ constexpr Expected<std::size_t, Error> encode_value(const NodePool& pool, const 
             pos = *value_written;
           }
           return pos;
-        } else {  // TagRef
+        } else {
           if (!detail::append_header_into(out, pos, 6, v.number)) {
             return unexpected(Error{ErrorReason::OutputBufferTooSmall, pos});
           }
@@ -685,7 +654,6 @@ namespace ConstexprCbor {
 constexpr bool KeepLastDuplicateKey::on_duplicate(NoAlloc::NodePool&, NoAlloc::Node** first_pair,
                                                    std::size_t existing_pair_index, NoAlloc::Node* /*new_key*/,
                                                    NoAlloc::Node* new_value) {
-  // Overwrite the existing pair's value reference; the pair keeps its position.
   first_pair[2 * existing_pair_index + 1] = new_value;
   return true;
 }

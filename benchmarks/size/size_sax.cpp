@@ -1,5 +1,3 @@
-// See size_cc.cpp's comment -- same fairness fix, SAX mode: decodes AND
-// fully walks every event, not just the first one.
 #include "constexpr_cbor_sax.hpp"
 
 namespace {

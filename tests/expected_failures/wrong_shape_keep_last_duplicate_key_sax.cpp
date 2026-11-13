@@ -1,9 +1,5 @@
-// KeepLastDuplicateKey has no SAX-shaped on_duplicate() overload by design
-// (see its own comment in constexpr_cbor.hpp): "keep the last value for
-// this key" means retroactively overwriting an already-emitted event, which
-// a push-forward event stream cannot do without buffering the whole map
-// first. Selecting it with SaxRange must fail to compile, not silently
-// misbehave or silently fall back to some other policy's semantics.
+// KeepLastDuplicateKey has no SAX overload (it would overwrite an already-emitted
+// event); selecting it with SaxRange must fail to compile.
 #include "constexpr_cbor_sax.hpp"
 
 using namespace ConstexprCbor;
