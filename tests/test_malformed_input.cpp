@@ -191,4 +191,21 @@ constexpr bool test_nesting_depth_bound_holds_at_a_depth_past_the_simple_case() 
 }
 static_assert(test_nesting_depth_bound_holds_at_a_depth_past_the_simple_case());
 
+// skip_item and decode_value share one walk, so they must agree on whether an
+// input is well-formed and how many bytes it spans.
+consteval bool test_skip_item_agrees_with_decode_value() {
+  using namespace CompileTimeUnitTesting;
+  constexpr std::uint8_t bstr_with_text_chunk[] = {0x5f, 0x61, 0x61, 0xff};
+  constexpr std::uint8_t tstr_with_indefinite_chunk[] = {0x7f, 0x7f, 0x61, 0x61, 0xff, 0xff};
+  constexpr std::uint8_t good_nested[] = {0xa2, 0x01, 0x9f, 0x01, 0x5f, 0x41, 0x00, 0xff, 0xff, 0x02, 0xc2, 0x41, 0x01};
+  constexpr std::uint8_t duplicate_keys[] = {0xa2, 0x01, 0x02, 0x01, 0x03};
+  expect_eq<skip_item(bstr_with_text_chunk).has_value(), false>();
+  expect_eq<skip_item(tstr_with_indefinite_chunk).has_value(), false>();
+  expect_eq<skip_item(good_nested).value_or(0), decode_value(good_nested)->second>();
+  // Duplicate keys are a decode policy, not a structural error.
+  expect_eq<skip_item(duplicate_keys).value_or(0), duplicate_keys[0] == 0xa2 ? 5u : 0u>();
+  return true;
+}
+static_assert(test_skip_item_agrees_with_decode_value());
+
 int main() { return 0; }

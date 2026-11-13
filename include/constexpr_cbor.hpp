@@ -491,111 +491,6 @@ constexpr Error rebase_error(Error e, std::size_t base) {
   return e;
 }
 
-// Measures one CBOR item (definite or indefinite) without building a value.
-// The no-alloc decoder uses it to pre-count indefinite containers, and the SAX
-// decoder to skip items. It deliberately duplicates decode_value's structure
-// instead of unifying the two walks.
-template <std::size_t MaxDepth = 32>
-constexpr Expected<std::size_t, Error> skip_item(std::span<const std::uint8_t> bytes, std::size_t depth = 0) {
-  if (bytes.empty()) return unexpected(Error{ErrorReason::TruncatedInput});
-  const std::uint8_t major_type = bytes[0] >> 5;
-  switch (major_type) {
-    case 0:
-    case 1: {
-      const auto len = decode_length(bytes);
-      if (!len) return unexpected(len.error());
-      return len->bytes_consumed;
-    }
-    case 2:
-    case 3: {
-      if (is_indefinite_or_break(bytes)) {
-        std::size_t consumed = 1;
-        while (true) {
-          if (consumed >= bytes.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
-          if (bytes[consumed] == 0xff) return consumed + 1;
-          const auto chunk_len = decode_length(bytes.subspan(consumed));
-          if (!chunk_len) return unexpected(rebase_error(chunk_len.error(), consumed));
-          if (bytes.size() < consumed + chunk_len->bytes_consumed + chunk_len->value) {
-            return unexpected(Error{ErrorReason::TruncatedPayload, consumed});
-          }
-          // Bounds-checked above, so the narrowing is lossless.
-          consumed += chunk_len->bytes_consumed + detail::narrow<std::size_t>(chunk_len->value);
-        }
-      }
-      const auto len = decode_length(bytes);
-      if (!len) return unexpected(len.error());
-      if (bytes.size() < len->bytes_consumed + len->value) return unexpected(Error{ErrorReason::TruncatedPayload});
-      // Bounds-checked above.
-      return len->bytes_consumed + detail::narrow<std::size_t>(len->value);
-    }
-    case 4: {
-      if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
-      std::size_t consumed = 1;
-      if (is_indefinite_or_break(bytes)) {
-        while (true) {
-          if (consumed >= bytes.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
-          if (bytes[consumed] == 0xff) return consumed + 1;
-          const auto item_len = skip_item<MaxDepth>(bytes.subspan(consumed), depth + 1);
-          if (!item_len) return unexpected(rebase_error(item_len.error(), consumed));
-          consumed += *item_len;
-        }
-      }
-      const auto len = decode_length(bytes);
-      if (!len) return unexpected(len.error());
-      consumed = len->bytes_consumed;
-      for (std::uint64_t i = 0; i < len->value; ++i) {
-        if (consumed > bytes.size()) return unexpected(Error{ErrorReason::TruncatedPayload, consumed});
-        const auto item_len = skip_item<MaxDepth>(bytes.subspan(consumed), depth + 1);
-        if (!item_len) return unexpected(rebase_error(item_len.error(), consumed));
-        consumed += *item_len;
-      }
-      return consumed;
-    }
-    case 5: {
-      if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
-      std::size_t consumed = 1;
-      const bool indefinite = is_indefinite_or_break(bytes);
-      std::optional<std::uint64_t> pair_count;
-      if (!indefinite) {
-        const auto len = decode_length(bytes);
-        if (!len) return unexpected(len.error());
-        consumed = len->bytes_consumed;
-        pair_count = len->value;
-      }
-      std::uint64_t pairs_read = 0;
-      while (indefinite ? true : pairs_read < *pair_count) {
-        if (indefinite) {
-          if (consumed >= bytes.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
-          if (bytes[consumed] == 0xff) return consumed + 1;
-        }
-        const auto key_len = skip_item<MaxDepth>(bytes.subspan(consumed), depth + 1);
-        if (!key_len) return unexpected(rebase_error(key_len.error(), consumed));
-        consumed += *key_len;
-        const auto value_len = skip_item<MaxDepth>(bytes.subspan(consumed), depth + 1);
-        if (!value_len) return unexpected(rebase_error(value_len.error(), consumed));
-        consumed += *value_len;
-        ++pairs_read;
-      }
-      return consumed;
-    }
-    case 6: {
-      if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
-      const auto len = decode_length(bytes);
-      if (!len) return unexpected(len.error());
-      const auto nested_len = skip_item<MaxDepth>(bytes.subspan(len->bytes_consumed), depth + 1);
-      if (!nested_len) return unexpected(rebase_error(nested_len.error(), len->bytes_consumed));
-      return len->bytes_consumed + *nested_len;
-    }
-    case 7: {
-      const auto s = decode_simple(bytes);
-      if (!s) return unexpected(s.error());
-      return s->bytes_consumed;
-    }
-    default:
-      return unexpected(Error{ErrorReason::MalformedHeader});
-  }
-}
-
 // Forward declaration: CborValue falls back to CborSerializer<T> (ADL hook
 // dispatch, defined below) for types that are not built-in alternatives.
 template <typename T, typename = void>
@@ -1231,13 +1126,31 @@ template <typename P>
 inline constexpr bool is_sax_duplicate_key_policy_v = is_sax_duplicate_key_policy<P>::value;
 
 
+namespace detail {
+
 // ---------------------------------------------------------------------------
-// The recursive decoder behind every major type. MaxDepth caps container nesting,
-// the most common hazard across surveyed CBOR implementations (QCBOR, tinycbor,
-// several CVEs). Exceeding it is an error, not a crash.
-template <std::size_t MaxDepth = 32, typename Utf8Policy = NoUtf8Validation, typename KeyPolicy = RejectDuplicateKeys>
-constexpr Expected<std::pair<CborValue, std::size_t>, Error> decode_value(std::span<const std::uint8_t> bytes,
-                                                                           std::size_t depth = 0) {
+// The one structural walk behind every tree-shaped decode and skip. It owns
+// everything about well-formedness: headers, definite and indefinite forms,
+// chunk checking, depth, truncation, and error offsets. What it produces is
+// delegated to a Builder:
+//
+//   using Value;                      // result for one item
+//   Value make_uint(uint64_t);
+//   Value make_negint(NegativeInt);
+//   Value make_simple(const DecodedSimple&);
+//   Value make_string(StringKind, span<const uint8_t>);   // definite length
+//   Value make_tag(uint64_t number, Value nested);
+//   struct StringAcc { void append(span<const uint8_t>); Value finish(StringKind); };
+//   struct ArrayAcc  { void push(Value); Value finish(); };
+//   struct MapAcc    { bool add(Value key, Value value); Value finish(); };
+//
+// MapAcc::add returns false to reject the map (reported as DuplicateKey).
+// Walking with a Builder that builds nothing is how skip_item measures an item.
+template <std::size_t MaxDepth, typename Utf8Policy, typename Builder>
+constexpr Expected<std::pair<typename Builder::Value, std::size_t>, Error> walk(std::span<const std::uint8_t> bytes,
+                                                                               std::size_t depth = 0) {
+  using Value = typename Builder::Value;
+  using Result = std::pair<Value, std::size_t>;
   if (bytes.empty()) {
     return unexpected(Error{ErrorReason::TruncatedInput});
   }
@@ -1247,53 +1160,54 @@ constexpr Expected<std::pair<CborValue, std::size_t>, Error> decode_value(std::s
     case 0: {
       const auto u = decode_uint(bytes);
       if (!u) return unexpected(u.error());
-      return std::pair{CborValue(u->value), u->bytes_consumed};
+      return Result{Builder::make_uint(u->value), u->bytes_consumed};
     }
     case 1: {
       const auto n = decode_negint(bytes);
       if (!n) return unexpected(n.error());
-      return std::pair{CborValue(n->value), n->bytes_consumed};
+      return Result{Builder::make_negint(n->value), n->bytes_consumed};
     }
     case 2:
     case 3: {
       const auto kind = (major_type == 2) ? CborValue::StringKind::Bytes : CborValue::StringKind::Text;
       if (is_indefinite_or_break(bytes)) {
-        std::vector<std::uint8_t> content;
+        typename Builder::StringAcc acc;
         std::size_t consumed = 1;
         while (true) {
           if (consumed >= bytes.size()) {
-            return unexpected(Error{ErrorReason::TruncatedInput, consumed});  // ran out of buffer before a break
+            return unexpected(Error{ErrorReason::TruncatedInput, consumed});
           }
           if (bytes[consumed] == 0xff) {
             ++consumed;
             break;
           }
+          // Each chunk must itself be definite-length and of the same major type.
           const auto chunk = (major_type == 2) ? decode_byte_string(bytes.subspan(consumed))
                                                 : decode_text_string<Utf8Policy>(bytes.subspan(consumed));
-          if (!chunk) return unexpected(rebase_error(chunk.error(), consumed));  // chunk must itself be definite-length, same major type
-          content.insert(content.end(), chunk->bytes.begin(), chunk->bytes.end());
+          if (!chunk) return unexpected(rebase_error(chunk.error(), consumed));
+          acc.append(chunk->bytes);
           consumed += chunk->bytes_consumed;
         }
-        return std::pair{CborValue(CborValue::OwnedString{.kind = kind, .content = std::move(content)}), consumed};
+        return Result{acc.finish(kind), consumed};
       }
-      const auto result =
-          (major_type == 2) ? decode_byte_string(bytes) : decode_text_string<Utf8Policy>(bytes);
+      const auto result = (major_type == 2) ? decode_byte_string(bytes) : decode_text_string<Utf8Policy>(bytes);
       if (!result) return unexpected(result.error());
-      return std::pair{
-          CborValue(CborValue::OwnedString{.kind = kind, .content = {result->bytes.begin(), result->bytes.end()}}),
-          result->bytes_consumed};
+      return Result{Builder::make_string(kind, result->bytes), result->bytes_consumed};
     }
     case 4: {
       if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
-      std::vector<CborValue> items;
+      typename Builder::ArrayAcc acc;
       std::size_t consumed = 1;
       if (is_indefinite_or_break(bytes)) {
         while (true) {
           if (consumed >= bytes.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
-          if (bytes[consumed] == 0xff) { ++consumed; break; }
-          const auto item = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(bytes.subspan(consumed), depth + 1);
+          if (bytes[consumed] == 0xff) {
+            ++consumed;
+            break;
+          }
+          auto item = walk<MaxDepth, Utf8Policy, Builder>(bytes.subspan(consumed), depth + 1);
           if (!item) return unexpected(rebase_error(item.error(), consumed));
-          items.push_back(std::move(item->first));
+          acc.push(std::move(item->first));
           consumed += item->second;
         }
       } else {
@@ -1302,20 +1216,17 @@ constexpr Expected<std::pair<CborValue, std::size_t>, Error> decode_value(std::s
         consumed = len->bytes_consumed;
         for (std::uint64_t i = 0; i < len->value; ++i) {
           if (consumed > bytes.size()) return unexpected(Error{ErrorReason::TruncatedPayload, consumed});
-          const auto item = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(bytes.subspan(consumed), depth + 1);
+          auto item = walk<MaxDepth, Utf8Policy, Builder>(bytes.subspan(consumed), depth + 1);
           if (!item) return unexpected(rebase_error(item.error(), consumed));
-          items.push_back(std::move(item->first));
+          acc.push(std::move(item->first));
           consumed += item->second;
         }
       }
-      return std::pair{CborValue(std::move(items)), consumed};
+      return Result{acc.finish(), consumed};
     }
     case 5: {
       if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
-      static_assert(is_duplicate_key_policy_v<KeyPolicy>,
-                    "KeyPolicy must provide static bool on_duplicate(vector<pair<CborValue,CborValue>>&, "
-                    "CborValue, CborValue)");
-      std::vector<std::pair<CborValue, CborValue>> entries;
+      typename Builder::MapAcc acc;
       std::size_t consumed = 1;
       const bool indefinite = is_indefinite_or_break(bytes);
       std::optional<std::uint64_t> pair_count;
@@ -1329,75 +1240,152 @@ constexpr Expected<std::pair<CborValue, std::size_t>, Error> decode_value(std::s
       while (indefinite ? true : pairs_read < *pair_count) {
         if (indefinite) {
           if (consumed >= bytes.size()) return unexpected(Error{ErrorReason::TruncatedInput, consumed});
-          if (bytes[consumed] == 0xff) { ++consumed; break; }
-        }
-        const auto key_result = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(bytes.subspan(consumed), depth + 1);
-        if (!key_result) return unexpected(rebase_error(key_result.error(), consumed));
-        consumed += key_result->second;
-        const auto value_result = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(bytes.subspan(consumed), depth + 1);
-        if (!value_result) return unexpected(rebase_error(value_result.error(), consumed));
-        consumed += value_result->second;
-
-        bool is_duplicate = false;
-        for (auto& [existing_key, existing_value] : entries) {
-          if (existing_key.data == key_result->first.data) {
-            is_duplicate = true;
+          if (bytes[consumed] == 0xff) {
+            ++consumed;
             break;
           }
         }
-        if (is_duplicate) {
-          if (!KeyPolicy::on_duplicate(entries, key_result->first, value_result->first)) {
-            return unexpected(Error{ErrorReason::DuplicateKey, consumed});
-          }
-        } else {
-          entries.emplace_back(key_result->first, value_result->first);
+        auto key = walk<MaxDepth, Utf8Policy, Builder>(bytes.subspan(consumed), depth + 1);
+        if (!key) return unexpected(rebase_error(key.error(), consumed));
+        consumed += key->second;
+        auto value = walk<MaxDepth, Utf8Policy, Builder>(bytes.subspan(consumed), depth + 1);
+        if (!value) return unexpected(rebase_error(value.error(), consumed));
+        consumed += value->second;
+        if (!acc.add(std::move(key->first), std::move(value->first))) {
+          return unexpected(Error{ErrorReason::DuplicateKey, consumed});
         }
         ++pairs_read;
       }
-      return std::pair{CborValue(std::move(entries)), consumed};
+      return Result{acc.finish(), consumed};
     }
     case 6: {
       if (depth >= MaxDepth) return unexpected(Error{ErrorReason::MaxDepthExceeded});
       const auto len = decode_length(bytes);
       if (!len) return unexpected(len.error());
-      const auto nested = decode_value<MaxDepth, Utf8Policy, KeyPolicy>(bytes.subspan(len->bytes_consumed), depth + 1);
+      auto nested = walk<MaxDepth, Utf8Policy, Builder>(bytes.subspan(len->bytes_consumed), depth + 1);
       if (!nested) return unexpected(rebase_error(nested.error(), len->bytes_consumed));
-      if (len->value == 2 || len->value == 3) {
-        if (const auto* bytes_value = std::get_if<CborValue::OwnedString>(&nested->first.data);
-            bytes_value && bytes_value->kind == CborValue::StringKind::Bytes) {
-          return std::pair{
-              CborValue(CborValue::BigNum{.negative = (len->value == 3), .magnitude = bytes_value->content}),
-              len->bytes_consumed + nested->second};
-        }
-      }
-      std::vector<CborValue> wrapped;
-      wrapped.push_back(std::move(nested->first));
-      return std::pair{CborValue(CborValue::Tag{.number = len->value, .value = std::move(wrapped)}),
-                        len->bytes_consumed + nested->second};
+      return Result{Builder::make_tag(len->value, std::move(nested->first)), len->bytes_consumed + nested->second};
     }
     case 7: {
       const auto s = decode_simple(bytes);
       if (!s) return unexpected(s.error());
-      using K = DecodedSimple::Kind;
-      switch (s->kind) {
-        case K::False:
-          return std::pair{CborValue(false), s->bytes_consumed};
-        case K::True:
-          return std::pair{CborValue(true), s->bytes_consumed};
-        case K::Null:
-          return std::pair{CborValue(nullptr), s->bytes_consumed};
-        case K::Undefined:
-          return std::pair{CborValue(std::monostate{}), s->bytes_consumed};
-        case K::Float:
-          return std::pair{CborValue(s->as_double), s->bytes_consumed};
-        case K::Simple:
-          return std::pair{CborValue(CborValue::SimpleValue{.number = s->simple_value}), s->bytes_consumed};
-      }
-      return unexpected(Error{ErrorReason::MalformedHeader});
+      return Result{Builder::make_simple(*s), s->bytes_consumed};
     }
     default:
       return unexpected(Error{ErrorReason::MalformedHeader});
   }
+}
+
+// Builder that builds nothing, for skip_item.
+struct SkipBuilder {
+  struct Value {};
+  static constexpr Value make_uint(std::uint64_t) { return {}; }
+  static constexpr Value make_negint(NegativeInt) { return {}; }
+  static constexpr Value make_simple(const DecodedSimple&) { return {}; }
+  static constexpr Value make_string(CborValue::StringKind, std::span<const std::uint8_t>) { return {}; }
+  static constexpr Value make_tag(std::uint64_t, Value) { return {}; }
+  struct StringAcc {
+    constexpr void append(std::span<const std::uint8_t>) {}
+    constexpr Value finish(CborValue::StringKind) { return {}; }
+  };
+  struct ArrayAcc {
+    constexpr void push(Value) {}
+    constexpr Value finish() { return {}; }
+  };
+  struct MapAcc {
+    constexpr bool add(Value, Value) { return true; }
+    constexpr Value finish() { return {}; }
+  };
+};
+
+// Builder producing CborValue trees. Duplicate keys are resolved by KeyPolicy.
+template <typename KeyPolicy>
+struct HeapBuilder {
+  static_assert(is_duplicate_key_policy_v<KeyPolicy>,
+                "KeyPolicy must provide static bool on_duplicate(vector<pair<CborValue,CborValue>>&, "
+                "CborValue, CborValue)");
+  using Value = CborValue;
+  static constexpr Value make_uint(std::uint64_t v) { return CborValue(v); }
+  static constexpr Value make_negint(NegativeInt v) { return CborValue(v); }
+  static constexpr Value make_string(CborValue::StringKind kind, std::span<const std::uint8_t> content) {
+    return CborValue(CborValue::OwnedString{.kind = kind, .content = {content.begin(), content.end()}});
+  }
+  static constexpr Value make_simple(const DecodedSimple& s) {
+    using K = DecodedSimple::Kind;
+    switch (s.kind) {
+      case K::False:
+        return CborValue(false);
+      case K::True:
+        return CborValue(true);
+      case K::Null:
+        return CborValue(nullptr);
+      case K::Undefined:
+        return CborValue(std::monostate{});
+      case K::Float:
+        return CborValue(s.as_double);
+      case K::Simple:
+        break;
+    }
+    return CborValue(CborValue::SimpleValue{.number = s.simple_value});
+  }
+  static constexpr Value make_tag(std::uint64_t number, Value nested) {
+    if (number == 2 || number == 3) {
+      if (const auto* bytes_value = std::get_if<CborValue::OwnedString>(&nested.data);
+          bytes_value && bytes_value->kind == CborValue::StringKind::Bytes) {
+        return CborValue(CborValue::BigNum{.negative = (number == 3), .magnitude = bytes_value->content});
+      }
+    }
+    std::vector<CborValue> wrapped;
+    wrapped.push_back(std::move(nested));
+    return CborValue(CborValue::Tag{.number = number, .value = std::move(wrapped)});
+  }
+  struct StringAcc {
+    std::vector<std::uint8_t> content;
+    constexpr void append(std::span<const std::uint8_t> chunk) { content.insert(content.end(), chunk.begin(), chunk.end()); }
+    constexpr Value finish(CborValue::StringKind kind) {
+      return CborValue(CborValue::OwnedString{.kind = kind, .content = std::move(content)});
+    }
+  };
+  struct ArrayAcc {
+    std::vector<CborValue> items;
+    constexpr void push(Value v) { items.push_back(std::move(v)); }
+    constexpr Value finish() { return CborValue(std::move(items)); }
+  };
+  struct MapAcc {
+    std::vector<std::pair<CborValue, CborValue>> entries;
+    constexpr bool add(Value key, Value value) {
+      for (const auto& entry : entries) {
+        if (entry.first.data == key.data) {
+          return KeyPolicy::on_duplicate(entries, std::move(key), std::move(value));
+        }
+      }
+      entries.emplace_back(std::move(key), std::move(value));
+      return true;
+    }
+    constexpr Value finish() { return CborValue(std::move(entries)); }
+  };
+};
+
+}  // namespace detail
+
+// Measures one CBOR item (definite or indefinite) without building a value, and
+// checks it exactly as decode_value does (minus UTF-8 and duplicate-key policy).
+// The no-alloc decoder uses it to pre-count indefinite containers, and the SAX
+// decoder to skip items.
+template <std::size_t MaxDepth = 32>
+constexpr Expected<std::size_t, Error> skip_item(std::span<const std::uint8_t> bytes, std::size_t depth = 0) {
+  const auto result = detail::walk<MaxDepth, NoUtf8Validation, detail::SkipBuilder>(bytes, depth);
+  if (!result) return unexpected(result.error());
+  return result->second;
+}
+
+// The recursive decoder behind every major type. MaxDepth caps container nesting,
+// the most common hazard across surveyed CBOR implementations (QCBOR, tinycbor,
+// several CVEs). Exceeding it is an error, not a crash.
+template <std::size_t MaxDepth = 32, typename Utf8Policy = NoUtf8Validation, typename KeyPolicy = RejectDuplicateKeys>
+constexpr Expected<std::pair<CborValue, std::size_t>, Error> decode_value(std::span<const std::uint8_t> bytes,
+                                                                           std::size_t depth = 0) {
+  return detail::walk<MaxDepth, Utf8Policy, detail::HeapBuilder<KeyPolicy>>(bytes, depth);
 }
 
 // ---------------------------------------------------------------------------
